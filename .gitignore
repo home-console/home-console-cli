@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzz
+*.pywzz
+*.pyzzz
+*.pywzzz
+
+# cache files
+*.egg-info/
+*.egg-info/*
+
+# venv
+.venv/
+venv/
+env/
