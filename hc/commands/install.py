@@ -8,8 +8,7 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
-from hc.client import HCClient
-from hc.config import Config
+from hc.commands._client_helpers import require_client
 
 
 def register(app: typer.Typer) -> None:
@@ -19,14 +18,7 @@ def register(app: typer.Typer) -> None:
         version: str | None = typer.Option(None, "--version", help="Желаемая версия"),
     ) -> None:
         console = Console()
-        cfg = Config.load()
-        token = os.getenv("HC_TOKEN") or cfg.core.token
-        if not cfg.core.host.strip() or not token.strip():
-            console.print("[red]Ошибка: Сначала подключись: hc connect <host>[/red]")
-            raise typer.Exit(code=1)
-
-        base_url = f"http://{cfg.core.host}:{cfg.core.port}"
-        client = HCClient(base_url=base_url, token=token, verify_ssl=cfg.core.verify_ssl)
+        client = require_client(console)
 
         async def _precheck() -> dict | None:
             idx = await client.get_marketplace_index()

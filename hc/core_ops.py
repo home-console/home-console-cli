@@ -8,8 +8,10 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from hc.config import Config
 from hc.core_source import CoreSource
 from hc.env_bootstrap import ensure_core_env
+from hc.errors import DockerNotFoundError, HcCliError
 
 
 @dataclass(slots=True)
@@ -23,16 +25,24 @@ class ComposeProject:
 
 def require_docker(console: Console) -> None:
     if shutil.which("docker") is None:
-        console.print("[red]Ошибка: docker не найден. Установи Docker и повтори.[/red]")
-        raise typer.Exit(code=1)
+        raise DockerNotFoundError(
+            message="docker не найден.",
+            exit_code=1,
+            hint="Установи Docker/OrbStack и проверь, что `docker ps` работает.",
+        )
 
 
-def compose_project_from_source(console: Console, src: CoreSource) -> ComposeProject:
+def compose_project_from_source(console: Console, src: CoreSource, mode: str | None = None) -> ComposeProject:
     ensure_core_env(console, src.path)
-    compose = src.compose_file()
+    if mode is None:
+        mode = Config.load().recovery.mode
+    compose = src.compose_file(mode=mode)
     if not compose.exists():
-        console.print(f"[red]Ошибка: не найден docker-compose: {compose}[/red]")
-        raise typer.Exit(code=1)
+        raise HcCliError(
+            message=f"Не найден docker-compose файл: {compose}",
+            exit_code=1,
+            hint="Проверь `--mode` и наличие `deploy/dev/docker-compose*.yml` в исходниках Core.",
+        )
     return ComposeProject(compose_file=compose)
 
 

@@ -8,32 +8,14 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from hc.client import HCClient
-from hc.config import Config
-
-
-def _require_config(console: Console) -> Config:
-    cfg = Config.load()
-    token = os.getenv("HC_TOKEN") or cfg.core.token
-    if not cfg.core.host.strip() or not token.strip():
-        console.print("[red]Ошибка: Сначала подключись: hc connect <host>[/red]")
-        raise typer.Exit(code=1)
-    return cfg
+from hc.commands._client_helpers import require_client
 
 
 def register(app: typer.Typer) -> None:
     @app.command("status")
     def status() -> None:
         console = Console()
-        cfg = _require_config(console)
-        base_url = f"http://{cfg.core.host}:{cfg.core.port}"
-        token = os.getenv("HC_TOKEN") or cfg.core.token
-        client = HCClient(
-            base_url=base_url,
-            token=token,
-            verify_ssl=cfg.core.verify_ssl,
-            auth=cfg.core.auth,
-        )
+        client = require_client(console)
 
         async def _run() -> tuple[dict | None, int | None, tuple[int, int] | None]:
             health = await client.admin_status()

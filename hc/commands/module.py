@@ -10,6 +10,7 @@ from rich.text import Text
 
 from hc.client import HCClient
 from hc.config import Config
+from hc.commands._client_helpers import require_client
 
 
 def _status_cell(status: str) -> Text:
@@ -31,13 +32,7 @@ def register(app: typer.Typer) -> None:
     )
 
     def _client(console: Console) -> HCClient:
-        cfg = Config.load()
-        token = os.getenv("HC_TOKEN") or cfg.core.token
-        if not cfg.core.host.strip() or not token.strip():
-            console.print("[red]Ошибка: Сначала подключись: hc connect <host>[/red]")
-            raise typer.Exit(code=1)
-        base_url = f"http://{cfg.core.host}:{cfg.core.port}"
-        return HCClient(base_url=base_url, token=token, verify_ssl=cfg.core.verify_ssl)
+        return require_client(console)
 
     @module_app.command("list")
     def list_modules() -> None:
@@ -72,6 +67,37 @@ def register(app: typer.Typer) -> None:
         total = len(modules)
         ok = sum(1 for m in modules if str(m.get("status", "")).lower() in {"running", "ok"})
         console.print(f"[green]✓[/green] Модулей: {ok} / {total}")
+
+    def _require_supported(console: Console, res: object | None) -> None:
+        # Если endpoint не существует, `_request_json_optional` вернёт None без ошибок.
+        if res is None:
+            console.print("[red]Ошибка:[/red] текущая версия Core не поддерживает управление модулями через API.")
+            console.print("[dim]Подсказка:[/dim] обнови Core или используй локальный docker-режим для рестартов.")
+            raise typer.Exit(code=1)
+
+    @module_app.command("start")
+    def start(name: str = typer.Argument(..., help="Имя модуля")) -> None:
+        console = Console()
+        client = _client(console)
+        res = anyio.run(client.start_module, name)
+        _require_supported(console, res)
+        console.print(f"[green]✓[/green] {name} запущен")
+
+    @module_app.command("stop")
+    def stop(name: str = typer.Argument(..., help="Имя модуля")) -> None:
+        console = Console()
+        client = _client(console)
+        res = anyio.run(client.stop_module, name)
+        _require_supported(console, res)
+        console.print(f"[green]✓[/green] {name} остановлен")
+
+    @module_app.command("restart")
+    def restart(name: str = typer.Argument(..., help="Имя модуля")) -> None:
+        console = Console()
+        client = _client(console)
+        res = anyio.run(client.restart_module, name)
+        _require_supported(console, res)
+        console.print(f"[green]✓[/green] {name} перезапущен")
 
     app.add_typer(module_app, name="module")
 

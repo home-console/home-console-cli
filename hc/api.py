@@ -33,6 +33,9 @@ PLUGIN_STOP = "/plugins/{name}/stop"
 
 # Modules
 MODULES = "/modules"
+MODULE_START = "/modules/{name}/start"
+MODULE_STOP = "/modules/{name}/stop"
+MODULE_RESTART = "/modules/{name}/restart"
 
 # Logs
 LOGS = "/logs"

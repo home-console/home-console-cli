@@ -9,6 +9,7 @@ from rich.table import Table
 
 from hc.client import HCClient
 from hc.config import Config
+from hc.commands._client_helpers import require_client
 
 
 def register(app: typer.Typer) -> None:
@@ -106,15 +107,7 @@ def register(app: typer.Typer) -> None:
     def whoami() -> None:
         """Проверить текущий токен и показать пользователя."""
         console = Console()
-        cfg = Config.load()
-        if not cfg.is_configured():
-            console.print("[red]Ошибка: Сначала подключись: hc connect <host>[/red]")
-            raise typer.Exit(code=1)
-
-        base_url = f"http://{cfg.core.host}:{cfg.core.port}"
-        client = HCClient(
-            base_url=base_url, token=cfg.core.token, verify_ssl=cfg.core.verify_ssl, auth=cfg.core.auth
-        )
+        client = require_client(console)
         data = anyio.run(client.auth_me)
         if not data:
             console.print("[red]Ошибка: не удалось получить /auth/v1/me[/red]")
@@ -131,16 +124,7 @@ def register(app: typer.Typer) -> None:
     def check() -> None:
         """Проверить, что токен валиден (exit code 0/1)."""
         console = Console()
-        cfg = Config.load()
-        if not cfg.is_configured():
-            console.print("[red]Ошибка: токен не настроен. Сделай `hc auth login` или `hc connect`[/red]")
-            raise typer.Exit(code=1)
-        client = HCClient(
-            base_url=f"http://{cfg.core.host}:{cfg.core.port}",
-            token=cfg.core.token,
-            verify_ssl=cfg.core.verify_ssl,
-            auth=cfg.core.auth,
-        )
+        client = require_client(console)
         me = anyio.run(client.auth_me)
         if not me:
             console.print("[red]Ошибка: не авторизован (401/403).[/red]")
@@ -158,12 +142,7 @@ def register(app: typer.Typer) -> None:
             raise typer.Exit(code=1)
 
         if cfg.core.token.strip():
-            client = HCClient(
-                base_url=f"http://{cfg.core.host}:{cfg.core.port}",
-                token=cfg.core.token,
-                verify_ssl=cfg.core.verify_ssl,
-                auth=cfg.core.auth,
-            )
+            client = require_client(console)
             # Cookie-based logout может быть best-effort; если не получилось — всё равно чистим конфиг.
             _ = anyio.run(client.auth_logout)
 
@@ -176,16 +155,7 @@ def register(app: typer.Typer) -> None:
     @api_app.command("list")
     def api_list() -> None:
         console = Console()
-        cfg = Config.load()
-        if not cfg.is_configured():
-            console.print("[red]Ошибка: Сначала подключись: hc connect <host>[/red]")
-            raise typer.Exit(code=1)
-        client = HCClient(
-            base_url=f"http://{cfg.core.host}:{cfg.core.port}",
-            token=cfg.core.token,
-            verify_ssl=cfg.core.verify_ssl,
-            auth=cfg.core.auth,
-        )
+        client = require_client(console)
         data = anyio.run(client.api_keys_list)
         if not data:
             console.print("[red]Ошибка: API keys недоступны в этой версии Core[/red]")
@@ -215,16 +185,8 @@ def register(app: typer.Typer) -> None:
         save: bool = typer.Option(False, "--save", help="Сохранить ключ в config.toml и переключиться на X-API-Key"),
     ) -> None:
         console = Console()
+        client = require_client(console)
         cfg = Config.load()
-        if not cfg.is_configured():
-            console.print("[red]Ошибка: Сначала подключись: hc connect <host>[/red]")
-            raise typer.Exit(code=1)
-        client = HCClient(
-            base_url=f"http://{cfg.core.host}:{cfg.core.port}",
-            token=cfg.core.token,
-            verify_ssl=cfg.core.verify_ssl,
-            auth=cfg.core.auth,
-        )
         data = anyio.run(client.api_keys_create, name)
         if not data:
             console.print("[red]Ошибка: API keys недоступны в этой версии Core[/red]")
@@ -244,16 +206,7 @@ def register(app: typer.Typer) -> None:
     @api_app.command("revoke")
     def api_revoke(key_id: str = typer.Argument(..., help="ID ключа")) -> None:
         console = Console()
-        cfg = Config.load()
-        if not cfg.is_configured():
-            console.print("[red]Ошибка: Сначала подключись: hc connect <host>[/red]")
-            raise typer.Exit(code=1)
-        client = HCClient(
-            base_url=f"http://{cfg.core.host}:{cfg.core.port}",
-            token=cfg.core.token,
-            verify_ssl=cfg.core.verify_ssl,
-            auth=cfg.core.auth,
-        )
+        client = require_client(console)
         data = anyio.run(client.api_keys_revoke, key_id)
         if not data:
             console.print("[red]Ошибка: не удалось revoke (или API keys недоступны)[/red]")
@@ -266,16 +219,8 @@ def register(app: typer.Typer) -> None:
         save: bool = typer.Option(False, "--save", help="Сохранить новый ключ в конфиг и переключиться на X-API-Key"),
     ) -> None:
         console = Console()
+        client = require_client(console)
         cfg = Config.load()
-        if not cfg.is_configured():
-            console.print("[red]Ошибка: Сначала подключись: hc connect <host>[/red]")
-            raise typer.Exit(code=1)
-        client = HCClient(
-            base_url=f"http://{cfg.core.host}:{cfg.core.port}",
-            token=cfg.core.token,
-            verify_ssl=cfg.core.verify_ssl,
-            auth=cfg.core.auth,
-        )
         data = anyio.run(client.api_keys_rotate, key_id)
         if not data:
             console.print("[red]Ошибка: не удалось rotate (или API keys недоступны)[/red]")

@@ -168,20 +168,28 @@ def register(app: typer.Typer) -> None:
         core_down(console, project, volumes=volumes)
         console.print("[green]✓[/green] CoreRuntime остановлен.")
 
-    @core_app.command("status")
-    def status(mode: str = typer.Option("docker", "--mode", help="docker|native")) -> None:
-        console = Console()
-        if mode != "docker":
-            console.print("[red]Ошибка: режим native пока не реализован.[/red]")
-            raise typer.Exit(code=1)
-
+    def _docker_ps(console: Console) -> None:
         require_docker(console)
         src = _resolve_source(console)
         project = compose_project_from_source(console, src)
         core_status(console, project)
 
-    @core_app.command("logs")
-    def logs(
+    def _docker_logs(console: Console, *, follow: bool, tail: int) -> None:
+        require_docker(console)
+        src = _resolve_source(console)
+        project = compose_project_from_source(console, src)
+        core_logs(console, project, follow=follow, tail=tail)
+
+    @core_app.command("ps")
+    def ps(mode: str = typer.Option("docker", "--mode", help="docker|native")) -> None:
+        console = Console()
+        if mode != "docker":
+            console.print("[red]Ошибка: режим native пока не реализован.[/red]")
+            raise typer.Exit(code=1)
+        _docker_ps(console)
+
+    @core_app.command("docker-logs")
+    def docker_logs(
         mode: str = typer.Option("docker", "--mode", help="docker|native"),
         follow: bool = typer.Option(False, "-f", "--follow", help="Следить за логами"),
         tail: int = typer.Option(200, "--tail", help="Сколько строк показать"),
@@ -190,11 +198,30 @@ def register(app: typer.Typer) -> None:
         if mode != "docker":
             console.print("[red]Ошибка: режим native пока не реализован.[/red]")
             raise typer.Exit(code=1)
+        _docker_logs(console, follow=follow, tail=tail)
 
-        require_docker(console)
-        src = _resolve_source(console)
-        project = compose_project_from_source(console, src)
-        core_logs(console, project, follow=follow, tail=tail)
+    # Backward-compatible aliases (раньше назывались так же, как API команды на верхнем уровне).
+    @core_app.command("status")
+    def status(mode: str = typer.Option("docker", "--mode", help="docker|native")) -> None:
+        console = Console()
+        console.print("[dim]Подсказка:[/dim] `hc core status` переехала в `hc core ps`.")
+        if mode != "docker":
+            console.print("[red]Ошибка: режим native пока не реализован.[/red]")
+            raise typer.Exit(code=1)
+        _docker_ps(console)
+
+    @core_app.command("logs")
+    def logs(
+        mode: str = typer.Option("docker", "--mode", help="docker|native"),
+        follow: bool = typer.Option(False, "-f", "--follow", help="Следить за логами"),
+        tail: int = typer.Option(200, "--tail", help="Сколько строк показать"),
+    ) -> None:
+        console = Console()
+        console.print("[dim]Подсказка:[/dim] `hc core logs` переехала в `hc core docker-logs`.")
+        if mode != "docker":
+            console.print("[red]Ошибка: режим native пока не реализован.[/red]")
+            raise typer.Exit(code=1)
+        _docker_logs(console, follow=follow, tail=tail)
 
     app.add_typer(core_app, name="core")
 

@@ -69,11 +69,14 @@ def register(app: typer.Typer) -> None:
         console.print("[green]✓[/green] Конфиг и логи удалены.")
 
     @reset_app.command("all")
-    def reset_all() -> None:
+    def reset_all(
+        yes: bool = typer.Option(False, "--yes", help="Не спрашивать подтверждение"),
+    ) -> None:
         """Удалить всё, что создавала утилита (конфиг + кэш Core)."""
         console = Console()
-        if not typer.confirm("Удалить ВСЁ (конфиг hc + кэш Core)?", default=False):
-            raise typer.Exit(code=0)
+        if not yes:
+            if not typer.confirm("Удалить ВСЁ (конфиг hc + кэш Core)?", default=False):
+                raise typer.Exit(code=0)
         for p in [CORE_SRC_DIR, DATA_DIR, CONFIG_PATH, HISTORY_PATH, SETUP_LOG_PATH, SETUP_PID_PATH, CONFIG_DIR]:
             try:
                 _rm(p)

@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 import anyio
 
-from hc.client import HCClient
 from hc.config import Config
+from hc.commands._client_helpers import client_from_config
 
 
 @dataclass(slots=True)
@@ -19,25 +19,9 @@ class Capabilities:
 
 
 def probe(cfg: Config) -> Capabilities:
-    base_url = f"http://{cfg.core.host}:{cfg.core.port}"
-    client = HCClient(
-        base_url=base_url, token=cfg.core.token, verify_ssl=cfg.core.verify_ssl, auth=cfg.core.auth
-    )
+    silent = client_from_config(cfg, silent=True)
 
     async def _run() -> Capabilities:
-        # Capabilities probe должен быть "тихим": не спамим подсказками при 401/403.
-        silent = HCClient(
-            base_url=client.base_url,
-            token=client.token,
-            verify_ssl=client.verify_ssl,
-            auth=client.auth,
-        )
-
-        def _mute_hint() -> None:
-            return None
-
-        silent._auth_hint = lambda *_args, **_kwargs: _mute_hint()  # type: ignore[attr-defined]
-
         mh = await silent.health()
         ab = await silent.auth_bootstrap()
         am = await silent.auth_me()

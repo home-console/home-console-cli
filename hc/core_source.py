@@ -15,7 +15,17 @@ from hc.constants import CORE_SRC_DIR, DATA_DIR, DEFAULT_CORE_REF, DEFAULT_CORE_
 class CoreSource:
     path: Path
 
-    def compose_file(self) -> Path:
+    def compose_file(self, mode: str | None = None) -> Path:
+        """
+        Возвращает compose-файл для CoreRuntime.
+
+        mode:
+        - dev: build из исходников (docker-compose.yml)
+        - image: prod-like запуск из image (docker-compose.image.yml)
+        """
+        m = (mode or "dev").strip().lower()
+        if m == "image":
+            return self.path / "deploy" / "dev" / "docker-compose.image.yml"
         return self.path / "deploy" / "dev" / "docker-compose.yml"
 
 

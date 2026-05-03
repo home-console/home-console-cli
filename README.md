@@ -71,7 +71,43 @@ hc plugin list
 - `hc logs [--follow] [--module <name>] [--level debug|info|warning|error]`
 - `hc search <query>`
 - `hc setup`
+- `hc deploy` (по умолчанию: build+push+rollout+wait) и `hc deploy ...` (тонкие подкоманды)
+- `hc update core ...` (обновление core-runtime до нового image:tag)
 - `hc shell`
+
+### Deploy “одной командой”
+
+По умолчанию `hc deploy` делает полный жизненный цикл:
+
+- **build**: `docker build -t <image>:<tag>`
+- **push**: `docker push <image>:<tag>`
+- **rollout**: `docker compose pull core-runtime && docker compose up -d`
+- **wait**: ждёт **healthy** (проверка `curl` внутри контейнера)
+
+Полезные флаги:
+
+- `--no-build`, `--no-push`, `--no-rollout`
+- `--wait/--no-wait` (по умолчанию `--wait`)
+- `--timeout 180` (сек), `--interval 1.0` (сек)
+- `--health-url http://localhost:8000/monitor/health` (внутри контейнера)
+- `--quiet` (минимальный вывод)
+- `--json` (машинный вывод; удобно для CI/скриптов)
+
+Логи core-runtime (для диагностики таймаута):
+
+- `hc deploy core logs -f`
+
+## Если “нет команды `hc deploy`”
+
+Почти всегда это означает, что в окружении стоит **не тот пакет**, который предоставляет команду `hc`.
+
+Проверка (в активированном venv):
+
+```bash
+python -c "import hc, inspect; print(hc.__file__)"
+```
+
+Должно указывать на `.../home-console-cli/hc/__init__.py` (или site-packages `homeconsole-cli`).
 
 ## Ошибки и UX
 

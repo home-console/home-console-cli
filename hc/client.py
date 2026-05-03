@@ -315,6 +315,18 @@ class HCClient:
         data = await self._request_json_optional("GET", endpoints.MODULES)
         return data if isinstance(data, list) else None
 
+    async def start_module(self, name: str) -> dict[str, Any] | None:
+        data = await self._request_json_optional("POST", endpoints.MODULE_START.format(name=name))
+        return data if isinstance(data, dict) else None
+
+    async def stop_module(self, name: str) -> dict[str, Any] | None:
+        data = await self._request_json_optional("POST", endpoints.MODULE_STOP.format(name=name))
+        return data if isinstance(data, dict) else None
+
+    async def restart_module(self, name: str) -> dict[str, Any] | None:
+        data = await self._request_json_optional("POST", endpoints.MODULE_RESTART.format(name=name))
+        return data if isinstance(data, dict) else None
+
     async def stream_logs(self, module: str | None, follow: bool) -> AsyncGenerator[str, None]:
         params: dict[str, Any] = {"follow": str(follow).lower()}
         if module:

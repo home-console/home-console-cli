@@ -16,11 +16,13 @@ from hc.commands.remove import register as register_remove
 from hc.commands.search import register as register_search
 from hc.commands.setup import register as register_setup
 from hc.commands.status import register as register_status
+from hc.commands.deploy import register as register_deploy
+from hc.commands.update import register as register_update
 from hc.shell import run_shell
 
 app = typer.Typer(
     add_completion=False,
-    no_args_is_help=True,
+    no_args_is_help=False,
     pretty_exceptions_enable=False,
     pretty_exceptions_show_locals=False,
     context_settings={"help_option_names": ["-h", "--help"]},
@@ -29,6 +31,23 @@ app = typer.Typer(
 
 @app.command("shell")
 def shell(args: list[str] = typer.Argument(None)) -> None:
+    """Интерактивный режим (REPL) или однократный запуск команды."""
+    console = Console()
+    console.print("[dim]Подсказка:[/dim] команда переезжает в `hc repl` (но `hc shell` пока работает).")
+    if args:
+        try:
+            app(prog_name="hc", args=args, standalone_mode=False)
+        except typer.Exit:
+            raise
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[red]Ошибка: {e}[/red]")
+            raise typer.Exit(code=1)
+        return
+    run_shell(app)
+
+
+@app.command("repl")
+def repl(args: list[str] = typer.Argument(None)) -> None:
     """Интерактивный режим (REPL) или однократный запуск команды."""
     console = Console()
     if args:
@@ -43,10 +62,11 @@ def shell(args: list[str] = typer.Argument(None)) -> None:
     run_shell(app)
 
 
-@app.callback()
-def _root() -> None:
+@app.callback(invoke_without_command=True)
+def _root(ctx: typer.Context) -> None:
     # Русский UX: без лишних исключений и traceback.
-    pass
+    if ctx.invoked_subcommand is None:
+        run_shell(app)
 
 
 def _register_all() -> None:
@@ -63,6 +83,8 @@ def _register_all() -> None:
     register_logs(app)
     register_search(app)
     register_setup(app)
+    register_deploy(app)
+    register_update(app)
 
 
 _register_all()

@@ -7,22 +7,14 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from hc.client import HCClient
-from hc.config import Config
+from hc.commands._client_helpers import require_client
 
 
 def register(app: typer.Typer) -> None:
     @app.command("search")
     def search(query: str = typer.Argument(..., help="Строка поиска в marketplace")) -> None:
         console = Console()
-        cfg = Config.load()
-        token = os.getenv("HC_TOKEN") or cfg.core.token
-        if not cfg.core.host.strip() or not token.strip():
-            console.print("[red]Ошибка: Сначала подключись: hc connect <host>[/red]")
-            raise typer.Exit(code=1)
-
-        base_url = f"http://{cfg.core.host}:{cfg.core.port}"
-        client = HCClient(base_url=base_url, token=token, verify_ssl=cfg.core.verify_ssl)
+        client = require_client(console)
 
         async def _run() -> list[dict] | None:
             return await client.search_marketplace(query)

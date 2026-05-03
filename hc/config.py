@@ -24,9 +24,27 @@ class DisplayConfig:
 
 
 @dataclass(slots=True)
+class RecoveryConfig:
+    # dev: compose c build (docker-compose.yml)
+    # image: compose c image (docker-compose.image.yml)
+    mode: str = "dev"
+
+
+@dataclass(slots=True)
+class DeployConfig:
+    # defaults for `hc deploy core ...`
+    core_image: str = "dev-core-runtime"
+    core_mode: str = "image"  # dev|image
+    ssh: str = ""  # user@host
+    path: str = ""  # remote path with compose
+
+
+@dataclass(slots=True)
 class Config:
     core: CoreConfig = field(default_factory=CoreConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
+    recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
+    deploy: DeployConfig = field(default_factory=DeployConfig)
 
     @classmethod
     def load(cls) -> Self:
@@ -35,6 +53,8 @@ class Config:
         data = parse(CONFIG_PATH.read_text(encoding="utf-8"))
         core = data.get("core", {})
         display = data.get("display", {})
+        recovery = data.get("recovery", {})
+        deploy = data.get("deploy", {})
         return cls(
             core=CoreConfig(
                 host=str(core.get("host", DEFAULT_HOST)),
@@ -46,6 +66,15 @@ class Config:
             display=DisplayConfig(
                 color=bool(display.get("color", True)),
                 emoji=bool(display.get("emoji", True)),
+            ),
+            recovery=RecoveryConfig(
+                mode=str(recovery.get("mode", "dev")),
+            ),
+            deploy=DeployConfig(
+                core_image=str(deploy.get("core_image", "dev-core-runtime")),
+                core_mode=str(deploy.get("core_mode", "image")),
+                ssh=str(deploy.get("ssh", "")),
+                path=str(deploy.get("path", "")),
             ),
         )
 
@@ -60,6 +89,13 @@ class Config:
             "verify_ssl": self.core.verify_ssl,
         }
         doc["display"] = {"color": self.display.color, "emoji": self.display.emoji}
+        doc["recovery"] = {"mode": self.recovery.mode}
+        doc["deploy"] = {
+            "core_image": self.deploy.core_image,
+            "core_mode": self.deploy.core_mode,
+            "ssh": self.deploy.ssh,
+            "path": self.deploy.path,
+        }
         CONFIG_PATH.write_text(doc.as_string(), encoding="utf-8")
 
     def is_configured(self) -> bool:

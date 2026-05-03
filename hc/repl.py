@@ -15,9 +15,10 @@ from rich.console import Console
 from hc.client import HCClient
 from hc.config import Config
 from hc.constants import APP_NAME, HISTORY_PATH
+from hc.commands._client_helpers import require_client
 
 
-_GROUPS = {"core", "auth", "setup", "plugin", "module", "reset", "recovery"}
+_GROUPS = {"core", "auth", "setup", "plugin", "module", "reset", "recovery", "deploy", "update"}
 
 
 class _HCCompleter(Completer):
@@ -96,8 +97,7 @@ def run_repl(app: typer.Typer) -> None:
 
     plugins: list[str] = []
     if connected:
-        base_url = f"http://{hostport}"
-        client = HCClient(base_url=base_url, token=token, verify_ssl=cfg.core.verify_ssl, auth=cfg.core.auth)
+        client = require_client(console)
 
         async def _get_names() -> list[str]:
             # Пытаемся получить имена плагинов из inspector (админский источник истины).
@@ -133,7 +133,10 @@ def run_repl(app: typer.Typer) -> None:
         "module",
         "setup",
         "recovery",
+        "deploy",
+        "update",
         "shell",
+        "repl",
         "help",
         "?",
         "exit",

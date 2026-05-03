@@ -11,9 +11,9 @@ import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from hc.client import HCClient
 from hc.config import Config
 from hc.commands.connect import connect_and_save
+from hc.commands._client_helpers import require_client
 from hc.core_source import get_core_source_from_repo, get_core_source_local
 from hc.core_ops import compose_project_from_source, core_up, require_docker
 from hc.setup_runner import SetupProcess, start_background
@@ -135,7 +135,7 @@ def run_setup(background: bool) -> None:
     health = connect_and_save(host=host, port=port, token=token)
     if not health:
         raise typer.Exit(code=1)
-    client = HCClient(base_url=base_url, token=token, verify_ssl=cfg.core.verify_ssl)
+    client = require_client(console)
 
     if typer.confirm("Установить базовые плагины (ui, automation)?", default=True):
         async def _install_base() -> None:
