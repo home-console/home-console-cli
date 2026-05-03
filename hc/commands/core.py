@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import typer
@@ -22,6 +24,7 @@ from hc.core_ops import (
     require_docker,
 )
 from hc.env_bootstrap import core_env_path, ensure_core_env
+from hc.native_core import native_down, native_logs, native_ps, native_up
 
 def _find_repo_root() -> Path | None:
     here = Path(__file__).resolve()
@@ -69,8 +72,9 @@ def register(app: typer.Typer) -> None:
         src = init_core_source(console, repo_url=repo, ref=ref)
         console.print(f"[green]✓[/green] Core исходники готовы: {src.path}")
 
-    @core_app.command("update")
-    def update() -> None:
+    @core_app.command("pull-sources")
+    def pull_sources() -> None:
+        """Обновить локальную копию исходников Core (git pull). Раньше: `hc core update` только для git."""
         console = Console()
         src = update_core_source(console)
         console.print(f"[green]✓[/green] Обновлено: {src.path}")
@@ -140,10 +144,20 @@ def register(app: typer.Typer) -> None:
     def up(
         mode: str = typer.Option("docker", "--mode", help="docker|native"),
         no_ui: bool = typer.Option(True, "--no-ui/--with-ui", help="Запустить без UI"),
+        use_hc_python: bool = typer.Option(
+            False,
+            "--use-hc-python",
+            help="Native: запускать Core тем же интерпретатором, что и `hc`",
+        ),
     ) -> None:
         console = Console()
-        if mode != "docker":
-            console.print("[red]Ошибка: режим native пока не реализован.[/red]")
+        m = mode.lower().strip()
+        if m == "native":
+            src = _resolve_source(console)
+            native_up(console, src, use_hc_python=use_hc_python, no_ui=no_ui)
+            return
+        if m != "docker":
+            console.print("[red]Ошибка: --mode должен быть docker или native.[/red]")
             raise typer.Exit(code=1)
 
         require_docker(console)
@@ -158,8 +172,12 @@ def register(app: typer.Typer) -> None:
         volumes: bool = typer.Option(False, "-v", "--volumes", help="Удалить volumes (аналог down -v)"),
     ) -> None:
         console = Console()
-        if mode != "docker":
-            console.print("[red]Ошибка: режим native пока не реализован.[/red]")
+        m = mode.lower().strip()
+        if m == "native":
+            native_down(console, volumes=volumes)
+            return
+        if m != "docker":
+            console.print("[red]Ошибка: --mode должен быть docker или native.[/red]")
             raise typer.Exit(code=1)
 
         require_docker(console)
@@ -183,8 +201,13 @@ def register(app: typer.Typer) -> None:
     @core_app.command("ps")
     def ps(mode: str = typer.Option("docker", "--mode", help="docker|native")) -> None:
         console = Console()
-        if mode != "docker":
-            console.print("[red]Ошибка: режим native пока не реализован.[/red]")
+        m = mode.lower().strip()
+        if m == "native":
+            src = _resolve_source(console)
+            native_ps(console, src)
+            return
+        if m != "docker":
+            console.print("[red]Ошибка: --mode должен быть docker или native.[/red]")
             raise typer.Exit(code=1)
         _docker_ps(console)
 
@@ -195,8 +218,12 @@ def register(app: typer.Typer) -> None:
         tail: int = typer.Option(200, "--tail", help="Сколько строк показать"),
     ) -> None:
         console = Console()
-        if mode != "docker":
-            console.print("[red]Ошибка: режим native пока не реализован.[/red]")
+        m = mode.lower().strip()
+        if m == "native":
+            native_logs(console, follow=follow, tail=tail)
+            return
+        if m != "docker":
+            console.print("[red]Ошибка: --mode должен быть docker или native.[/red]")
             raise typer.Exit(code=1)
         _docker_logs(console, follow=follow, tail=tail)
 
@@ -205,8 +232,13 @@ def register(app: typer.Typer) -> None:
     def status(mode: str = typer.Option("docker", "--mode", help="docker|native")) -> None:
         console = Console()
         console.print("[dim]Подсказка:[/dim] `hc core status` переехала в `hc core ps`.")
-        if mode != "docker":
-            console.print("[red]Ошибка: режим native пока не реализован.[/red]")
+        m = mode.lower().strip()
+        if m == "native":
+            src = _resolve_source(console)
+            native_ps(console, src)
+            return
+        if m != "docker":
+            console.print("[red]Ошибка: --mode должен быть docker или native.[/red]")
             raise typer.Exit(code=1)
         _docker_ps(console)
 
@@ -218,10 +250,28 @@ def register(app: typer.Typer) -> None:
     ) -> None:
         console = Console()
         console.print("[dim]Подсказка:[/dim] `hc core logs` переехала в `hc core docker-logs`.")
-        if mode != "docker":
-            console.print("[red]Ошибка: режим native пока не реализован.[/red]")
+        m = mode.lower().strip()
+        if m == "native":
+            native_logs(console, follow=follow, tail=tail)
+            return
+        if m != "docker":
+            console.print("[red]Ошибка: --mode должен быть docker или native.[/red]")
             raise typer.Exit(code=1)
         _docker_logs(console, follow=follow, tail=tail)
+
+    @core_app.command("update")
+    def core_runtime_update(
+        tag: str = typer.Option("latest", "--tag", help="Тег образа"),
+        wait: bool = typer.Option(True, "--wait/--no-wait"),
+        quiet: bool = typer.Option(False, "--quiet"),
+    ) -> None:
+        """Обновить core-runtime до образа (алиас для `hc update core`)."""
+        cmd = [sys.executable, "-m", "hc.main", "update", "core", "--tag", tag]
+        if not wait:
+            cmd.append("--no-wait")
+        if quiet:
+            cmd.append("--quiet")
+        raise SystemExit(subprocess.run(cmd, check=False).returncode)
 
     app.add_typer(core_app, name="core")
 

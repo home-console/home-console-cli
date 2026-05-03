@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import typer
 from rich.console import Console
 
@@ -18,6 +20,8 @@ from hc.commands.setup import register as register_setup
 from hc.commands.status import register as register_status
 from hc.commands.deploy import register as register_deploy
 from hc.commands.update import register as register_update
+from hc.commands.ping import register as register_ping
+from hc.commands.marketplace import register as register_marketplace
 from hc.shell import run_shell
 
 app = typer.Typer(
@@ -27,23 +31,6 @@ app = typer.Typer(
     pretty_exceptions_show_locals=False,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
-
-
-@app.command("shell")
-def shell(args: list[str] = typer.Argument(None)) -> None:
-    """Интерактивный режим (REPL) или однократный запуск команды."""
-    console = Console()
-    console.print("[dim]Подсказка:[/dim] команда переезжает в `hc repl` (но `hc shell` пока работает).")
-    if args:
-        try:
-            app(prog_name="hc", args=args, standalone_mode=False)
-        except typer.Exit:
-            raise
-        except Exception as e:  # noqa: BLE001
-            console.print(f"[red]Ошибка: {e}[/red]")
-            raise typer.Exit(code=1)
-        return
-    run_shell(app)
 
 
 @app.command("repl")
@@ -64,8 +51,10 @@ def repl(args: list[str] = typer.Argument(None)) -> None:
 
 @app.callback(invoke_without_command=True)
 def _root(ctx: typer.Context) -> None:
-    # Русский UX: без лишних исключений и traceback.
     if ctx.invoked_subcommand is None:
+        if not sys.stdin.isatty():
+            Console().print("[red]Ошибка:[/red] укажи команду. Пример: `hc status`")
+            raise typer.Exit(code=1)
         run_shell(app)
 
 
@@ -85,6 +74,8 @@ def _register_all() -> None:
     register_setup(app)
     register_deploy(app)
     register_update(app)
+    register_ping(app)
+    register_marketplace(app)
 
 
 _register_all()

@@ -13,7 +13,12 @@ SETUP_LOG_PATH = CONFIG_DIR / "setup.log"
 SETUP_PID_PATH = CONFIG_DIR / "setup.pid"
 
 DATA_DIR = Path.home() / ".local" / "share" / "hc"
+STATE_DIR = Path.home() / ".local" / "state" / "hc"
 CORE_SRC_DIR = DATA_DIR / "core-runtime-service"
+
+# Нативный `hc core up --mode native`: PID и лог процесса `python main.py`.
+NATIVE_CORE_PID_PATH = STATE_DIR / "native-core.pid"
+NATIVE_CORE_LOG_PATH = STATE_DIR / "native-core.log"
 
 DEFAULT_CORE_REPO = "https://github.com/home-console/core-runtime-service"
 DEFAULT_CORE_REF = "master"

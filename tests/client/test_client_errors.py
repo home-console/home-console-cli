@@ -39,7 +39,7 @@ def test_client_401_prints_token_expired(monkeypatch) -> None:
 
     health = anyio.run(c.health)
     assert health is None
-    assert any("токен истёк" in line.lower() for line in rec.lines)
+    assert any("сессия истекла" in line.lower() for line in rec.lines)
 
 
 def test_client_autodetects_api_prefix(monkeypatch) -> None:

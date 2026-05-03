@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 
 import anyio
@@ -97,6 +96,7 @@ def register(app: typer.Typer) -> None:
 
     @plugin_app.command("restart")
     def restart(name: str = typer.Argument(..., help="Имя плагина")) -> None:
+        """Перезапустить плагин (stop → start). Для hot-reload без остановки используй `reload`."""
         console = Console()
         client = require_client(console)
         stop_res = anyio.run(client.stop_plugin, name)
@@ -106,6 +106,26 @@ def register(app: typer.Typer) -> None:
         if start_res is None:
             raise typer.Exit(code=1)
         console.print(f"[green]✓[/green] {name} перезапущен")
+
+    @plugin_app.command("reload")
+    def reload(name: str = typer.Argument(..., help="Имя плагина")) -> None:
+        """Hot-reload плагина в памяти (без перезапуска контейнера)."""
+        console = Console()
+        client = require_client(console)
+        data = anyio.run(client.reload_plugin, name)
+        if data is None:
+            raise typer.Exit(code=1)
+        console.print(f"[green]✓[/green] {name} перезагружен (hot-reload)")
+
+    @plugin_app.command("restart-container")
+    def restart_container(name: str = typer.Argument(..., help="Имя плагина")) -> None:
+        """Перезапустить контейнер плагина (полный рестарт Docker-контейнера)."""
+        console = Console()
+        client = require_client(console)
+        data = anyio.run(client.restart_plugin_container, name)
+        if data is None:
+            raise typer.Exit(code=1)
+        console.print(f"[green]✓[/green] {name} — контейнер перезапущен")
 
     @plugin_app.command("logs")
     def logs(
@@ -134,12 +154,41 @@ def register(app: typer.Typer) -> None:
 
     @plugin_app.command("info")
     def info(name: str = typer.Argument(..., help="Имя плагина")) -> None:
+        """Показать детали плагина."""
         console = Console()
         client = require_client(console)
         data = anyio.run(client.get_plugin_info, name)
         if data is None:
             raise typer.Exit(code=1)
-        console.print(Panel.fit(Pretty(data, expand_all=True), title=f"Plugin: {name}"))
+
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("Поле", style="bold dim", width=18)
+        table.add_column("Значение", overflow="fold")
+
+        primary_keys = [
+            "name",
+            "version",
+            "status",
+            "mode",
+            "execution_mode",
+            "uptime",
+            "description",
+            "author",
+        ]
+        for key in primary_keys:
+            val = data.get(key)
+            if val is not None:
+                if key == "status":
+                    color = "green" if str(val).lower() in {"running", "ok"} else "yellow"
+                    table.add_row(key, f"[{color}]{val}[/{color}]")
+                else:
+                    table.add_row(key, str(val))
+
+        extra = {k: v for k, v in data.items() if k not in primary_keys and v is not None}
+
+        console.print(Panel(table, title=f"[bold]Plugin: {name}[/bold]", expand=False))
+        if extra:
+            console.print(Panel(Pretty(extra, expand_all=True), title="metadata", expand=False))
 
     app.add_typer(plugin_app, name="plugin")
 

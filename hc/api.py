@@ -15,6 +15,10 @@ ADMIN_INSPECTOR_PLUGINS = "/admin/v1/inspector/plugins"
 ADMIN_AUTH_API_KEYS = "/admin/v1/auth/api-keys"
 ADMIN_AUTH_API_KEYS_REVOKE = "/admin/v1/auth/api-keys/revoke"
 ADMIN_AUTH_API_KEYS_ROTATE = "/admin/v1/auth/api-keys/rotate"
+ADMIN_AUTH_USERS = "/admin/v1/auth/users"
+ADMIN_AUTH_SESSIONS = "/admin/v1/auth/sessions"
+ADMIN_AUTH_SESSIONS_REVOKE = "/admin/v1/auth/sessions/revoke"
+ADMIN_AUTH_SESSIONS_REVOKE_ALL = "/admin/v1/auth/sessions/revoke-all"
 
 # Auth v1
 AUTH_BOOTSTRAP = "/auth/v1/bootstrap"
@@ -30,6 +34,8 @@ PLUGIN = "/plugins/{name}"
 PLUGIN_INSTALL = "/plugins/{name}/install"
 PLUGIN_START = "/plugins/{name}/start"
 PLUGIN_STOP = "/plugins/{name}/stop"
+PLUGIN_RELOAD = "/admin/v1/plugins/{name}/reload"
+PLUGIN_RESTART_CONTAINER = "/admin/v1/plugins/{name}/restart-container"
 
 # Modules
 MODULES = "/modules"

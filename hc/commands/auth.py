@@ -35,7 +35,7 @@ def register(app: typer.Typer) -> None:
 
         base_url = f"http://{host}:{port}"
         client = HCClient(base_url=base_url, token="", auth="bearer")
-        data = anyio.run(client.auth_login, user_id, password)
+        data, session_cookie = anyio.run(client.auth_login_full, user_id, password)
         payload = (data.get("result") if isinstance(data, dict) else None) or data
         if not isinstance(payload, dict) or "access_token" not in payload:
             console.print("[red]Ошибка: не удалось выполнить login[/red]")
@@ -46,6 +46,7 @@ def register(app: typer.Typer) -> None:
         cfg.core.host = host
         cfg.core.port = port
         cfg.core.token = token
+        cfg.core.refresh_token = session_cookie
         cfg.core.auth = "bearer"
         cfg.save()
         console.print("[green]✓[/green] Вошёл. Токен сохранён в конфиг.")
@@ -147,8 +148,136 @@ def register(app: typer.Typer) -> None:
             _ = anyio.run(client.auth_logout)
 
         cfg.core.token = ""
+        cfg.core.refresh_token = ""
         cfg.save()
         console.print("[green]✓[/green] Токен очищен из конфига.")
+
+    user_app = typer.Typer(help="Управление пользователями")
+
+    @user_app.command("list")
+    def user_list() -> None:
+        """Список всех пользователей."""
+        console = Console()
+        client = require_client(console)
+        data = anyio.run(client.list_users)
+        if data is None:
+            console.print("[red]Ошибка: не удалось получить список пользователей[/red]")
+            raise typer.Exit(code=1)
+        if isinstance(data, list):
+            raw = None
+        else:
+            raw = data.get("users") or data.get("items")
+        if raw is None and isinstance(data, list):
+            users = data
+        elif isinstance(raw, list):
+            users = raw
+        else:
+            users = []
+        table = Table(title="Пользователи")
+        table.add_column("user_id", style="bold")
+        table.add_column("username")
+        table.add_column("admin")
+        table.add_column("scopes")
+        table.add_column("created_at")
+        for u in users:
+            if not isinstance(u, dict):
+                continue
+            scopes_val = u.get("scopes") or []
+            if isinstance(scopes_val, list):
+                scopes_str = ", ".join(str(x) for x in scopes_val)
+            else:
+                scopes_str = str(scopes_val)
+            table.add_row(
+                str(u.get("user_id", "")),
+                str(u.get("username", "")),
+                "[red]да[/red]" if u.get("is_admin") else "нет",
+                scopes_str,
+                str(u.get("created_at", "")),
+            )
+        console.print(table)
+
+    @user_app.command("create")
+    def user_create(
+        user_id: str = typer.Option(..., "--user-id", help="Уникальный ID пользователя"),
+        username: str = typer.Option(..., "--username", help="Отображаемое имя"),
+        is_admin: bool = typer.Option(False, "--admin", help="Сделать администратором"),
+    ) -> None:
+        """Создать нового пользователя."""
+        console = Console()
+        password = getpass.getpass("Password: ").strip()
+        if not password:
+            console.print("[red]Ошибка: пароль не задан[/red]")
+            raise typer.Exit(code=1)
+        client = require_client(console)
+        data = anyio.run(client.create_user, user_id, username, password, is_admin)
+        if data is None:
+            console.print("[red]Ошибка: не удалось создать пользователя[/red]")
+            raise typer.Exit(code=1)
+        console.print(f"[green]✓[/green] Пользователь [bold]{user_id}[/bold] создан.")
+
+    sessions_app = typer.Typer(help="Управление активными сессиями")
+
+    @sessions_app.command("list")
+    def sessions_list() -> None:
+        """Список активных сессий."""
+        console = Console()
+        client = require_client(console)
+        data = anyio.run(client.list_sessions)
+        if data is None:
+            console.print("[red]Ошибка: не удалось получить сессии[/red]")
+            raise typer.Exit(code=1)
+        if isinstance(data, list):
+            raw = None
+        else:
+            raw = data.get("sessions") or data.get("items")
+        if raw is None and isinstance(data, list):
+            sessions = data
+        elif isinstance(raw, list):
+            sessions = raw
+        else:
+            sessions = []
+        table = Table(title="Активные сессии")
+        table.add_column("session_id", style="bold")
+        table.add_column("user_id")
+        table.add_column("created_at")
+        table.add_column("expires_at")
+        for s in sessions:
+            if not isinstance(s, dict):
+                continue
+            table.add_row(
+                str(s.get("session_id", s.get("id", ""))),
+                str(s.get("user_id", "")),
+                str(s.get("created_at", "")),
+                str(s.get("expires_at", "")),
+            )
+        console.print(table)
+
+    @sessions_app.command("revoke")
+    def sessions_revoke(
+        session_id: str = typer.Argument(..., help="ID сессии для отзыва"),
+    ) -> None:
+        """Отозвать конкретную сессию."""
+        console = Console()
+        client = require_client(console)
+        data = anyio.run(client.revoke_session, session_id)
+        if data is None:
+            console.print("[red]Ошибка: не удалось отозвать сессию[/red]")
+            raise typer.Exit(code=1)
+        console.print(f"[green]✓[/green] Сессия {session_id} отозвана.")
+
+    @sessions_app.command("revoke-all")
+    def sessions_revoke_all() -> None:
+        """Отозвать все активные сессии (кроме текущей)."""
+        console = Console()
+        client = require_client(console)
+        data = anyio.run(client.revoke_all_sessions)
+        if data is None:
+            console.print("[red]Ошибка: не удалось отозвать сессии[/red]")
+            raise typer.Exit(code=1)
+        console.print("[green]✓[/green] Все сессии отозваны.")
+
+    auth_app.add_typer(user_app, name="user")
+    auth_app.add_typer(sessions_app, name="sessions")
 
     api_app = typer.Typer(help="API keys (если доступны в этой версии Core)")
 

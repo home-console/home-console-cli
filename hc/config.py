@@ -13,6 +13,7 @@ class CoreConfig:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     token: str = ""
+    refresh_token: str = ""  # session_id cookie from login, used for token refresh
     auth: str = "auto"  # auto|bearer|api-key
     verify_ssl: bool = True
 
@@ -60,6 +61,7 @@ class Config:
                 host=str(core.get("host", DEFAULT_HOST)),
                 port=int(core.get("port", DEFAULT_PORT)),
                 token=str(core.get("token", "")),
+                refresh_token=str(core.get("refresh_token", "")),
                 auth=str(core.get("auth", "auto")),
                 verify_ssl=bool(core.get("verify_ssl", True)),
             ),
@@ -85,6 +87,7 @@ class Config:
             "host": self.core.host,
             "port": self.core.port,
             "token": self.core.token,
+            "refresh_token": self.core.refresh_token,
             "auth": self.core.auth,
             "verify_ssl": self.core.verify_ssl,
         }
