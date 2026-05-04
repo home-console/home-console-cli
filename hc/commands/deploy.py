@@ -1,24 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
-from pathlib import Path
-import os
 import time
+from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.panel import Panel
 
 from hc.config import Config
-from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local
 from hc.core_ops import compose_project_from_source, require_docker
+from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local
 from hc.errors import (
     CoreSourcesNotFoundError,
-    HealthyTimeoutError,
     HcCliError,
+    HealthyTimeoutError,
     InvalidModeError,
     json_error_payload,
 )
@@ -88,6 +88,7 @@ def _ssh_cmd(ssh: str, remote_cmd: str) -> list[str]:
     # deliberately no shell=True
     return ["ssh", ssh, remote_cmd]
 
+
 def _is_compose_running(ps_stdout: str) -> bool:
     out = (ps_stdout or "").strip()
     lines = [ln for ln in out.splitlines() if ln.strip()]
@@ -132,7 +133,16 @@ def _wait_core_healthy_local(
         console.print(f"[cyan]→[/cyan] Wait healthy (внутри контейнера, timeout={timeout_s}s)")
     while time.time() < deadline:
         ps = subprocess.run(  # noqa: S603
-            ["docker", "compose", "-f", str(compose_file), "ps", "--status", "running", "core-runtime"],
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "ps",
+                "--status",
+                "running",
+                "core-runtime",
+            ],
             cwd=str(compose_file.parent),
             text=True,
             capture_output=True,
@@ -189,7 +199,9 @@ def _wait_core_healthy_remote(
     started = time.monotonic()
     next_tick = 0.0
     if not quiet:
-        console.print(f"[cyan]→[/cyan] Wait healthy remote (timeout={timeout_s}s) на [bold]{ssh}[/bold]")
+        console.print(
+            f"[cyan]→[/cyan] Wait healthy remote (timeout={timeout_s}s) на [bold]{ssh}[/bold]"
+        )
     while time.time() < deadline:
         remote = (
             f"cd {shlex.quote(path)} && "
@@ -227,14 +239,28 @@ def register(app: typer.Typer) -> None:
     def _deploy_root(
         ctx: typer.Context,
         tag: str = typer.Option("latest", "--tag", help="Тег (по умолчанию latest)"),
-        image: str | None = typer.Option(None, "--image", help="Имя image без тега (по умолчанию из config)"),
+        image: str | None = typer.Option(
+            None, "--image", help="Имя image без тега (по умолчанию из config)"
+        ),
         mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
-        ssh: str | None = typer.Option(None, "--ssh", help="user@host для удалённого rollout (по умолчанию из config)"),
-        path: str | None = typer.Option(None, "--path", help="remote path с compose (для --ssh, по умолчанию из config)"),
-        build: bool = typer.Option(True, "--build/--no-build", help="Собрать image локально (по умолчанию да)"),
-        push: bool = typer.Option(True, "--push/--no-push", help="Запушить image в registry (по умолчанию да)"),
-        rollout: bool = typer.Option(True, "--rollout/--no-rollout", help="Сделать compose pull+up (по умолчанию да)"),
-        wait: bool = typer.Option(True, "--wait/--no-wait", help="Дождаться healthy после rollout (по умолчанию да)"),
+        ssh: str | None = typer.Option(
+            None, "--ssh", help="user@host для удалённого rollout (по умолчанию из config)"
+        ),
+        path: str | None = typer.Option(
+            None, "--path", help="remote path с compose (для --ssh, по умолчанию из config)"
+        ),
+        build: bool = typer.Option(
+            True, "--build/--no-build", help="Собрать image локально (по умолчанию да)"
+        ),
+        push: bool = typer.Option(
+            True, "--push/--no-push", help="Запушить image в registry (по умолчанию да)"
+        ),
+        rollout: bool = typer.Option(
+            True, "--rollout/--no-rollout", help="Сделать compose pull+up (по умолчанию да)"
+        ),
+        wait: bool = typer.Option(
+            True, "--wait/--no-wait", help="Дождаться healthy после rollout (по умолчанию да)"
+        ),
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
         interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),
         health_url: str = typer.Option(
@@ -275,7 +301,9 @@ def register(app: typer.Typer) -> None:
             steps: list[dict[str, object]] = []
 
             if not quiet and not json_out:
-                console.print(Panel.fit(f"{full}\nmode={resolved_mode}\ntarget={target}", title="hc deploy"))
+                console.print(
+                    Panel.fit(f"{full}\nmode={resolved_mode}\ntarget={target}", title="hc deploy")
+                )
 
             if build:
                 src = _resolve_source(console)
@@ -365,16 +393,71 @@ def register(app: typer.Typer) -> None:
 
     @deploy_app.command("platform")
     def deploy_platform(
-        platform_path: str | None = typer.Option(None, "--platform-path", help="Путь к platform-home-console"),
-        core_path: str | None = typer.Option(None, "--core-path", help="Путь к core-runtime-service"),
-        build: bool = typer.Option(True, "--build/--no-build", help="Собрать platform web перед копированием"),
-        start: bool = typer.Option(True, "--start/--no-start", help="Запустить dev stage core после копирования"),
+        platform_path: str | None = typer.Option(
+            None, "--platform-path", help="Путь к platform-home-console"
+        ),
+        core_path: str | None = typer.Option(
+            None, "--core-path", help="Путь к core-runtime-service"
+        ),
+        mode: str = typer.Option("dev", "--mode", help="dev|image (по умолчанию dev)"),
+        image: str = typer.Option(
+            "ghcr.io/home-console/platform-home-console",
+            "--image",
+            help="Имя platform image без тега",
+        ),
+        tag: str = typer.Option("latest", "--tag", help="Тег image"),
+        build: bool = typer.Option(
+            True, "--build/--no-build", help="Собрать platform web перед копированием"
+        ),
+        start: bool = typer.Option(
+            True, "--start/--no-start", help="Запустить dev stage core после копирования"
+        ),
     ) -> None:
-        """Собрать platform web и синхронизировать dist в core-runtime-service/deploy/dev/frontend."""
+        """Локально собрать platform web или запустить platform image из GHCR."""
         console = Console()
 
-        platform_root = Path(platform_path).expanduser().resolve() if platform_path else _resolve_platform_root(console)
-        core_root = Path(core_path).expanduser().resolve() if core_path else _resolve_source(console).path
+        resolved_mode = mode.strip().lower()
+        if resolved_mode not in {"dev", "image"}:
+            console.print("[red]Ошибка:[/red] --mode должен быть dev или image")
+            raise typer.Exit(code=2)
+
+        platform_root = (
+            Path(platform_path).expanduser().resolve()
+            if platform_path
+            else _resolve_platform_root(console)
+        )
+
+        if resolved_mode == "image":
+            require_docker(console)
+            compose_file = platform_root / "docker-compose.image.yml"
+            if not compose_file.exists():
+                console.print(
+                    f"[red]Ошибка:[/red] не найден compose для image mode: {compose_file}"
+                )
+                raise typer.Exit(code=1)
+
+            full_image = f"{image}:{tag}"
+            env = {**os.environ, "PLATFORM_IMAGE": full_image}
+            console.print(f"[cyan]→[/cyan] Deploy platform image [bold]{full_image}[/bold]")
+            if start:
+                _run_env(
+                    ["docker", "compose", "-f", str(compose_file), "pull", "platform-web"],
+                    cwd=platform_root,
+                    env=env,
+                )
+                _run_env(
+                    ["docker", "compose", "-f", str(compose_file), "up", "-d"],
+                    cwd=platform_root,
+                    env=env,
+                )
+                console.print("[green]✓[/green] platform image deployed")
+            else:
+                console.print("[green]✓[/green] platform image ready (start skipped)")
+            return
+
+        core_root = (
+            Path(core_path).expanduser().resolve() if core_path else _resolve_source(console).path
+        )
         dist_dir = platform_root / "apps" / "web" / "dist"
         frontend_dir = core_root / "deploy" / "dev" / "frontend"
 
@@ -429,7 +512,9 @@ def register(app: typer.Typer) -> None:
 
     @cfg_app.command("set")
     def cfg_set(
-        core_image: str | None = typer.Option(None, "--core-image", help="Напр. ghcr.io/org/core-runtime"),
+        core_image: str | None = typer.Option(
+            None, "--core-image", help="Напр. ghcr.io/org/core-runtime"
+        ),
         core_mode: str | None = typer.Option(None, "--core-mode", help="dev|image"),
         ssh: str | None = typer.Option(None, "--ssh", help="user@host"),
         path: str | None = typer.Option(None, "--path", help="remote path с compose"),
@@ -469,7 +554,9 @@ def register(app: typer.Typer) -> None:
 
     @core_app.command("build")
     def core_build(
-        image: str | None = typer.Option(None, "--image", help="Имя image без тега (по умолчанию из config)"),
+        image: str | None = typer.Option(
+            None, "--image", help="Имя image без тега (по умолчанию из config)"
+        ),
         tag: str = typer.Option("latest", "--tag", help="Тег"),
         push: bool = typer.Option(False, "--push", help="Сразу push в registry"),
     ) -> None:
@@ -489,7 +576,9 @@ def register(app: typer.Typer) -> None:
 
     @core_app.command("push")
     def core_push(
-        image: str | None = typer.Option(None, "--image", help="Имя image без тега (по умолчанию из config)"),
+        image: str | None = typer.Option(
+            None, "--image", help="Имя image без тега (по умолчанию из config)"
+        ),
         tag: str = typer.Option("latest", "--tag", help="Тег"),
     ) -> None:
         """Запушить docker image в registry."""
@@ -504,10 +593,16 @@ def register(app: typer.Typer) -> None:
 
     @core_app.command("rollout")
     def core_rollout(
-        image: str | None = typer.Option(None, "--image", help="Имя image без тега (по умолчанию из config)"),
+        image: str | None = typer.Option(
+            None, "--image", help="Имя image без тега (по умолчанию из config)"
+        ),
         tag: str = typer.Option("latest", "--tag", help="Тег"),
-        ssh: str | None = typer.Option(None, "--ssh", help="user@host для удалённого rollout (по умолчанию из config)"),
-        path: str | None = typer.Option(None, "--path", help="remote path с compose (по умолчанию из config)"),
+        ssh: str | None = typer.Option(
+            None, "--ssh", help="user@host для удалённого rollout (по умолчанию из config)"
+        ),
+        path: str | None = typer.Option(
+            None, "--path", help="remote path с compose (по умолчанию из config)"
+        ),
         mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
         wait: bool = typer.Option(True, "--wait/--no-wait", help="Дождаться healthy после rollout"),
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
@@ -574,7 +669,11 @@ def register(app: typer.Typer) -> None:
             cwd=project.cwd,
             env=env,
         )
-        _run_env(["docker", "compose", "-f", str(project.compose_file), "up", "-d"], cwd=project.cwd, env=env)
+        _run_env(
+            ["docker", "compose", "-f", str(project.compose_file), "up", "-d"],
+            cwd=project.cwd,
+            env=env,
+        )
         console.print("[green]✓[/green] local rollout ok")
         if wait:
             _wait_core_healthy_local(
@@ -588,10 +687,16 @@ def register(app: typer.Typer) -> None:
 
     @core_app.command("wait")
     def core_wait(
-        image: str | None = typer.Option(None, "--image", help="Имя image без тега (по умолчанию из config)"),
+        image: str | None = typer.Option(
+            None, "--image", help="Имя image без тега (по умолчанию из config)"
+        ),
         tag: str = typer.Option("latest", "--tag", help="Тег"),
-        ssh: str | None = typer.Option(None, "--ssh", help="user@host для удалённого rollout (по умолчанию из config)"),
-        path: str | None = typer.Option(None, "--path", help="remote path с compose (по умолчанию из config)"),
+        ssh: str | None = typer.Option(
+            None, "--ssh", help="user@host для удалённого rollout (по умолчанию из config)"
+        ),
+        path: str | None = typer.Option(
+            None, "--path", help="remote path с compose (по умолчанию из config)"
+        ),
         mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
         interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),
@@ -646,8 +751,12 @@ def register(app: typer.Typer) -> None:
     def core_logs(
         follow: bool = typer.Option(False, "-f", "--follow", help="Следить за логами"),
         tail: int = typer.Option(200, "--tail", help="Сколько строк показать"),
-        ssh: str | None = typer.Option(None, "--ssh", help="user@host для удалённых логов (по умолчанию из config)"),
-        path: str | None = typer.Option(None, "--path", help="remote path с compose (по умолчанию из config)"),
+        ssh: str | None = typer.Option(
+            None, "--ssh", help="user@host для удалённых логов (по умолчанию из config)"
+        ),
+        path: str | None = typer.Option(
+            None, "--path", help="remote path с compose (по умолчанию из config)"
+        ),
         mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
     ) -> None:
         """Логи core-runtime (docker compose logs)."""
@@ -663,7 +772,15 @@ def register(app: typer.Typer) -> None:
         path = path if path is not None else (cfg.deploy.path or None)
         compose_file = "docker-compose.image.yml" if mode == "image" else "docker-compose.yml"
 
-        args = ["docker", "compose", "-f", f"deploy/dev/{compose_file}", "logs", "--tail", str(tail)]
+        args = [
+            "docker",
+            "compose",
+            "-f",
+            f"deploy/dev/{compose_file}",
+            "logs",
+            "--tail",
+            str(tail),
+        ]
         if follow:
             args.append("-f")
         args.append("core-runtime")
@@ -677,7 +794,15 @@ def register(app: typer.Typer) -> None:
             return
 
         project = compose_project_from_source(console, src, mode=mode)
-        local_args = ["docker", "compose", "-f", str(project.compose_file), "logs", "--tail", str(tail)]
+        local_args = [
+            "docker",
+            "compose",
+            "-f",
+            str(project.compose_file),
+            "logs",
+            "--tail",
+            str(tail),
+        ]
         if follow:
             local_args.append("-f")
         local_args.append("core-runtime")
@@ -686,9 +811,13 @@ def register(app: typer.Typer) -> None:
     @core_app.command("release")
     def core_release(
         tag: str = typer.Argument(..., help="Новый тег (напр. v0.1.0)"),
-        image: str | None = typer.Option(None, "--image", help="Имя image без тега (по умолчанию из config)"),
+        image: str | None = typer.Option(
+            None, "--image", help="Имя image без тега (по умолчанию из config)"
+        ),
         ssh: str | None = typer.Option(None, "--ssh", help="user@host (по умолчанию из config)"),
-        path: str | None = typer.Option(None, "--path", help="remote path (по умолчанию из config)"),
+        path: str | None = typer.Option(
+            None, "--path", help="remote path (по умолчанию из config)"
+        ),
         mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
         wait: bool = typer.Option(True, "--wait/--no-wait", help="Дождаться healthy после rollout"),
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
@@ -715,4 +844,3 @@ def register(app: typer.Typer) -> None:
     deploy_app.add_typer(cfg_app, name="config")
     deploy_app.add_typer(core_app, name="core")
     app.add_typer(deploy_app, name="deploy")
-

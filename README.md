@@ -72,7 +72,8 @@ hc plugin list
 - `hc search <query>`
 - `hc setup`
 - `hc deploy` (по умолчанию: build+push+rollout+wait) и `hc deploy ...` (тонкие подкоманды)
-- `hc deploy platform` (собрать platform web, скопировать dist в core, запустить dev stage)
+- `hc deploy platform` (локальный dev flow)
+- `hc deploy platform --mode image --image ghcr.io/home-console/platform-home-console --tag latest` (image-only deploy)
 - `hc update core ...` (обновление core-runtime до нового image:tag)
 - `hc shell`
 
@@ -97,6 +98,28 @@ hc plugin list
 Логи core-runtime (для диагностики таймаута):
 
 - `hc deploy core logs -f`
+
+### Deploy платформы
+
+Локальный dev flow:
+
+```bash
+hc deploy platform
+```
+
+Только подготовить статику, без запуска стека:
+
+```bash
+hc deploy platform --no-start
+```
+
+Image-only deploy через GHCR:
+
+```bash
+hc deploy platform --mode image --image ghcr.io/home-console/platform-home-console --tag latest
+```
+
+Этот вариант использует `platform-home-console/docker-compose.image.yml` и `PLATFORM_IMAGE`.
 
 ## Если “нет команды `hc deploy`”
 
