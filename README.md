@@ -72,6 +72,7 @@ hc plugin list
 - `hc search <query>`
 - `hc setup`
 - `hc deploy` (по умолчанию: build+push+rollout+wait) и `hc deploy ...` (тонкие подкоманды)
+- `hc deploy platform` (собрать platform web, скопировать dist в core, запустить dev stage)
 - `hc update core ...` (обновление core-runtime до нового image:tag)
 - `hc shell`
 

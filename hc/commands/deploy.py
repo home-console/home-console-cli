@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 import os
@@ -31,6 +32,15 @@ def _find_repo_root() -> Path | None:
     return None
 
 
+def _find_platform_root() -> Path | None:
+    here = Path(__file__).resolve()
+    for p in [here, *here.parents]:
+        candidate = p / "platform-home-console"
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _resolve_source(console: Console) -> CoreSource:
     repo_root = _find_repo_root()
     if repo_root:
@@ -47,6 +57,15 @@ def _resolve_source(console: Console) -> CoreSource:
     )
 
 
+def _resolve_platform_root(console: Console) -> Path:
+    platform_root = _find_platform_root()
+    if platform_root:
+        return platform_root
+    console.print("[red]Ошибка:[/red] platform-home-console не найден.")
+    console.print("Запусти из монорепы HomeConsole или укажи `--platform-path`.")
+    raise typer.Exit(code=1)
+
+
 def _run(cmd: list[str], cwd: Path | None = None) -> None:
     p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=False)  # noqa: S603
     if p.returncode != 0:
@@ -57,6 +76,12 @@ def _run_env(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | N
     p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=False)  # noqa: S603
     if p.returncode != 0:
         raise typer.Exit(code=p.returncode)
+
+
+def _copy_dir_contents(src: Path, dst: Path) -> None:
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
 
 
 def _ssh_cmd(ssh: str, remote_cmd: str) -> list[str]:
@@ -194,7 +219,7 @@ def _wait_core_healthy_remote(
 
 def register(app: typer.Typer) -> None:
     deploy_app = typer.Typer(
-        help="Деплой: build/tag/push/rollout (docker compose)",
+        help="Деплой: build/tag/push/rollout и sync platform frontend в core",
         context_settings={"help_option_names": ["-h", "--help"]},
     )
 
@@ -337,6 +362,52 @@ def register(app: typer.Typer) -> None:
                 print(json.dumps(json_error_payload("deploy", e), ensure_ascii=False))
                 raise typer.Exit(code=1)
             raise
+
+    @deploy_app.command("platform")
+    def deploy_platform(
+        platform_path: str | None = typer.Option(None, "--platform-path", help="Путь к platform-home-console"),
+        core_path: str | None = typer.Option(None, "--core-path", help="Путь к core-runtime-service"),
+        build: bool = typer.Option(True, "--build/--no-build", help="Собрать platform web перед копированием"),
+        start: bool = typer.Option(True, "--start/--no-start", help="Запустить dev stage core после копирования"),
+    ) -> None:
+        """Собрать platform web и синхронизировать dist в core-runtime-service/deploy/dev/frontend."""
+        console = Console()
+
+        platform_root = Path(platform_path).expanduser().resolve() if platform_path else _resolve_platform_root(console)
+        core_root = Path(core_path).expanduser().resolve() if core_path else _resolve_source(console).path
+        dist_dir = platform_root / "apps" / "web" / "dist"
+        frontend_dir = core_root / "deploy" / "dev" / "frontend"
+
+        if build:
+            if shutil.which("pnpm") is None:
+                console.print("[red]Ошибка:[/red] pnpm не найден.")
+                console.print("Установи pnpm или добавь его в PATH и повтори.")
+                raise typer.Exit(code=1)
+            console.print(f"[cyan]→[/cyan] Build platform web in [bold]{platform_root}[/bold]")
+            _run(["pnpm", "--filter=web", "build"], cwd=platform_root)
+            console.print("[green]✓[/green] platform web build ok")
+
+        if not dist_dir.exists():
+            console.print(f"[red]Ошибка:[/red] dist не найден: {dist_dir}")
+            console.print("Сначала собери platform web: `pnpm --filter=web build`")
+            raise typer.Exit(code=1)
+
+        frontend_dir.parent.mkdir(parents=True, exist_ok=True)
+        _copy_dir_contents(dist_dir, frontend_dir)
+        console.print(f"[green]✓[/green] frontend synced to [bold]{frontend_dir}[/bold]")
+
+        if not start:
+            return
+
+        require_docker(console)
+        start_script = core_root / "deploy" / "dev" / "start.sh"
+        if not start_script.exists():
+            console.print(f"[red]Ошибка:[/red] не найден start.sh: {start_script}")
+            raise typer.Exit(code=1)
+
+        console.print(f"[cyan]→[/cyan] Start core dev stage in [bold]{core_root}[/bold]")
+        _run(["bash", str(start_script)], cwd=core_root)
+        console.print("[green]✓[/green] platform deployed to core")
 
     cfg_app = typer.Typer(
         help="Дефолты для deploy (ssh/path/image/mode)",
