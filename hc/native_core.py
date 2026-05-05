@@ -140,15 +140,19 @@ def resolve_core_python(console: Console, core_root: Path, *, use_hc_python: boo
 
 
 def wait_for_health(base_url: str, *, timeout: float = 60.0, interval: float = 0.5) -> bool:
-    url = base_url.rstrip("/") + "/monitor/health"
+    urls = [
+        base_url.rstrip("/") + "/api/v1/monitor/health",
+        base_url.rstrip("/") + "/monitor/health",
+    ]
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            r = httpx.get(url, timeout=2.0, verify=True)
-            if r.status_code == 200:
-                return True
-        except httpx.HTTPError:
-            pass
+        for url in urls:
+            try:
+                r = httpx.get(url, timeout=2.0, verify=True)
+                if r.status_code == 200:
+                    return True
+            except httpx.HTTPError:
+                continue
         time.sleep(interval)
     return False
 
@@ -223,10 +227,10 @@ def native_up(
     base_url = f"http://{display_host}:{port}"
 
     if wait_health:
-        console.print(f"[dim]Ожидаю health: {base_url}/monitor/health …[/dim]")
+        console.print(f"[dim]Ожидаю health: {base_url}/api/v1/monitor/health …[/dim]")
         if not wait_for_health(base_url, timeout=health_timeout):
             console.print(
-                "[red]Ошибка: Core не ответил на /monitor/health за отведённое время.[/red] "
+                "[red]Ошибка: Core не ответил на health за отведённое время.[/red] "
                 f"Смотри лог: {log_path}"
             )
             _terminate_process_tree(proc.pid, grace=2.0)
@@ -311,7 +315,7 @@ def native_ps(console: Console, src: CoreSource) -> None:
 
     console.print(f"native core-runtime  PID={pid}  API={base_url}")
     try:
-        r = httpx.get(base_url.rstrip("/") + "/monitor/health", timeout=3.0)
+        r = httpx.get(base_url.rstrip("/") + "/api/v1/monitor/health", timeout=3.0)
         if r.status_code == 200:
             console.print("[green]health: OK[/green]")
         else:

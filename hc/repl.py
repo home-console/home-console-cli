@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import os
 import shlex
-from typing import Iterable
+from typing import Iterable, Iterator, Sequence
 
 import anyio
 import click
 import typer
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import Completer, WordCompleter
+from prompt_toolkit.completion import Completion, Completer, WordCompleter
 from prompt_toolkit.history import FileHistory
 from rich.console import Console
 
-from hc.client import HCClient
+from typer.main import get_command as _typer_get_command
+
 from hc.config import Config
 from hc.constants import APP_NAME, HISTORY_PATH
 from hc.commands._client_helpers import require_client
@@ -22,23 +23,159 @@ _GROUPS = {"core", "auth", "setup", "plugin", "module", "reset", "recovery", "de
 
 
 class _HCCompleter(Completer):
-    def __init__(self, commands: Iterable[str], plugins: Iterable[str]) -> None:
+    def __init__(
+        self,
+        *,
+        app: typer.Typer | None = None,
+        commands: Iterable[str],
+        plugins: Iterable[str],
+        get_group_ctx: callable | None = None,
+    ) -> None:
+        self._app = app
+        self._root: click.Command | None = None
+        if app is not None:
+            try:
+                self._root = _typer_get_command(app)
+            except RuntimeError:
+                # In tests we may get an empty Typer() without commands.
+                self._root = None
         self._cmd = WordCompleter(list(commands), ignore_case=True)
         self._plg = WordCompleter(list(plugins), ignore_case=True)
+        self._get_group_ctx = get_group_ctx or (lambda: None)
+
+    def _iter_options(self, cmd: click.Command) -> Iterator[str]:
+        for p in getattr(cmd, "params", []) or []:
+            if isinstance(p, click.Option):
+                for opt in (p.opts or []) + (p.secondary_opts or []):
+                    if opt.startswith("-"):
+                        yield opt
+
+    def _find_command(self, argv: Sequence[str]) -> tuple[click.Command, list[str]]:
+        """
+        Walk click command tree, consuming group/subcommands.
+        Returns (current_command, remaining_args_after_command_path).
+        """
+        if self._root is None:
+            return click.Command("hc"), list(argv)
+        cmd: click.Command = self._root
+        rest = list(argv)
+        while rest:
+            if not isinstance(cmd, click.Group):
+                break
+            token = rest[0]
+            nxt = cmd.commands.get(token) if token else None
+            if nxt is None:
+                break
+            cmd = nxt
+            rest = rest[1:]
+        return cmd, rest
+
+    def _completions_for_tokens(self, parts: list[str], raw_text: str, cursor_pos: int) -> Iterator[Completion]:
+        """
+        Context-aware completion:
+        - root commands or group subcommands if in group context
+        - options for the current resolved command
+        - plugin names for install/remove and plugin start/stop/info/restart/reload/restart-container/logs
+        """
+        group_ctx: str | None = self._get_group_ctx()
+
+        # Special meta command: `use <group>`
+        if parts and parts[0] == "use":
+            if len(parts) <= 2:
+                word = parts[1] if len(parts) == 2 else ""
+                start = raw_text.rfind(word)
+                for g in sorted(_GROUPS):
+                    if g.lower().startswith(word.lower()):
+                        yield Completion(g, start_position=-len(word))
+            return
+
+        # Resolve effective argv taking group context into account (like execution path does).
+        argv = parts[:]
+        if group_ctx and (not argv or argv[0] not in _GROUPS):
+            argv = [group_ctx, *argv]
+
+        cmd, _rest = self._find_command(argv)
+
+        # If we are at a group and about to type a subcommand → suggest subcommands.
+        if isinstance(cmd, click.Group):
+            # Determine which token is being completed (last token).
+            last = parts[-1] if parts else ""
+            # If cursor is after a space, last token is empty.
+            if raw_text.endswith(" "):
+                last = ""
+            # If user is typing an option, don't suggest subcommands here.
+            if last.startswith("-"):
+                for opt in sorted(set(self._iter_options(cmd))):
+                    if opt.startswith(last):
+                        yield Completion(opt, start_position=-len(last))
+                return
+
+            # Suggest group subcommands by the *visible* context.
+            for name in sorted(cmd.commands.keys()):
+                if name.lower().startswith(last.lower()):
+                    yield Completion(name, start_position=-len(last))
+            # Also suggest group options.
+            for opt in sorted(set(self._iter_options(cmd))):
+                if opt.startswith(last):
+                    yield Completion(opt, start_position=-len(last))
+            return
+
+        # Leaf command: suggest options
+        last = parts[-1] if parts else ""
+        if raw_text.endswith(" "):
+            last = ""
+        if last.startswith("-") or True:
+            opts = sorted(set(self._iter_options(cmd)))
+            for opt in opts:
+                if not last or opt.startswith(last):
+                    yield Completion(opt, start_position=-len(last))
+
+        # Plugin name completion (simple but useful)
+        if parts:
+            # Complete plugin as the next token.
+            def _complete_from_list(values: list[str]) -> Iterator[Completion]:
+                word = "" if raw_text.endswith(" ") else (parts[-1] if parts else "")
+                for v in sorted(set(values)):
+                    if not word or v.lower().startswith(word.lower()):
+                        yield Completion(v, start_position=-len(word))
+
+            if parts[0] in {"install", "remove"} and len(parts) <= 2:
+                yield from _complete_from_list(list(getattr(self._plg, "words", [])))
+                return
+            if parts[0] == "plugin" and len(parts) >= 2 and parts[1] in {
+                "start",
+                "stop",
+                "info",
+                "restart",
+                "reload",
+                "restart-container",
+                "logs",
+            }:
+                # Complete plugin name as the 3rd token.
+                if len(parts) <= 3:
+                    yield from _complete_from_list(list(getattr(self._plg, "words", [])))
+                return
 
     def get_completions(self, document, complete_event):
-        text = document.text_before_cursor.lstrip()
-        parts = shlex.split(text, posix=True) if text else []
-        if not parts:
+        raw = document.text_before_cursor
+        text = raw.lstrip()
+        try:
+            parts = shlex.split(text, posix=True) if text else []
+        except ValueError:
+            # Unclosed quote etc. → fallback to root completer
             yield from self._cmd.get_completions(document, complete_event)
             return
-        if parts[0] in {"install", "remove"} and len(parts) <= 2:
-            yield from self._plg.get_completions(document, complete_event)
+
+        if not parts and not raw.endswith(" "):
+            yield from self._cmd.get_completions(document, complete_event)
             return
-        if parts[0] == "plugin" and len(parts) >= 2 and parts[1] in {"start", "stop", "info"}:
-            yield from self._plg.get_completions(document, complete_event)
-            return
-        yield from self._cmd.get_completions(document, complete_event)
+
+        yielded = False
+        for c in self._completions_for_tokens(parts, raw_text=raw, cursor_pos=document.cursor_position):
+            yielded = True
+            yield c
+        if not yielded:
+            yield from self._cmd.get_completions(document, complete_event)
 
 
 def _prompt(prefix: str | None) -> str:
@@ -146,15 +283,18 @@ def run_repl(app: typer.Typer) -> None:
         "history",
         "clear",
     ]
-    completer = _HCCompleter(commands=commands, plugins=plugins)
+    group_ctx: str | None = None
+
+    def _get_ctx() -> str | None:
+        return group_ctx
+
+    completer = _HCCompleter(app=app, commands=commands, plugins=plugins, get_group_ctx=_get_ctx)
 
     console.print(f"{APP_NAME} 0.0.1 | " + (f"connected to {hostport}" if connected else "not connected"))
     console.print("Type 'help' or '?' for commands, 'exit' to quit")
 
     HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     session = PromptSession(_prompt(None), history=FileHistory(str(HISTORY_PATH)), completer=completer)
-
-    group_ctx: str | None = None
 
     while True:
         try:

@@ -91,7 +91,7 @@ hc plugin list
 - `--no-build`, `--no-push`, `--no-rollout`
 - `--wait/--no-wait` (по умолчанию `--wait`)
 - `--timeout 180` (сек), `--interval 1.0` (сек)
-- `--health-url http://localhost:8000/monitor/health` (внутри контейнера)
+- `--health-url http://localhost:8000/api/v1/monitor/health` (внутри контейнера)
 - `--quiet` (минимальный вывод)
 - `--json` (машинный вывод; удобно для CI/скриптов)
 

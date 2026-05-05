@@ -20,13 +20,16 @@ def register(app: typer.Typer) -> None:
 
     @auth_app.command("login")
     def login(
-        host: str = typer.Option("localhost", "--host", help="Хост CoreRuntime"),
-        port: int = typer.Option(18000, "--port", help="Порт CoreRuntime"),
+        host: str | None = typer.Option(None, "--host", help="Хост CoreRuntime (по умолчанию из config)"),
+        port: int | None = typer.Option(None, "--port", help="Порт CoreRuntime (по умолчанию из config)"),
         user_id: str = typer.Option(..., "--user-id", "-u", help="User ID (например admin)"),
         password: str | None = typer.Option(None, "--password", "-p", help="Пароль (не рекомендуется)"),
     ) -> None:
         """Логин по паролю и сохранение JWT в конфиг."""
         console = Console()
+        cfg = Config.load()
+        host = (host or cfg.core.host or "localhost").strip()
+        port = int(port if port is not None else cfg.core.port)
         if password is None:
             password = getpass.getpass("Password: ").strip()
         if not password:
@@ -53,9 +56,15 @@ def register(app: typer.Typer) -> None:
         console.print("Проверка: `hc status`")
 
     @auth_app.command("bootstrap")
-    def bootstrap(host: str = typer.Option("localhost", "--host"), port: int = typer.Option(18000, "--port")) -> None:
+    def bootstrap(
+        host: str | None = typer.Option(None, "--host", help="Хост CoreRuntime (по умолчанию из config)"),
+        port: int | None = typer.Option(None, "--port", help="Порт CoreRuntime (по умолчанию из config)"),
+    ) -> None:
         """Проверить initialized (первый запуск)."""
         console = Console()
+        cfg = Config.load()
+        host = (host or cfg.core.host or "localhost").strip()
+        port = int(port if port is not None else cfg.core.port)
         client = HCClient(base_url=f"http://{host}:{port}", token="", auth="bearer")
         data = anyio.run(client.auth_bootstrap)
         if not data:

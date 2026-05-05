@@ -176,7 +176,7 @@ def register(app: typer.Typer) -> None:
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
         interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),
         health_url: str = typer.Option(
-            "http://localhost:8000/monitor/health",
+            "http://localhost:8000/api/v1/monitor/health",
             "--health-url",
             help="URL health внутри контейнера core-runtime",
         ),
@@ -214,7 +214,7 @@ def register(app: typer.Typer) -> None:
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
         interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),
         health_url: str = typer.Option(
-            "http://localhost:8000/monitor/health",
+            "http://localhost:8000/api/v1/monitor/health",
             "--health-url",
             help="URL health внутри контейнера core-runtime",
         ),

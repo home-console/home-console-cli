@@ -149,7 +149,10 @@ class HCClient:
 
         if last_resp is not None and last_resp.status_code == 404:
             console.print("[red]Ошибка: API endpoint не найден (проверь версию Core)[/red]")
-            console.print("Подсказка: у некоторых сборок health на `/monitor/health` (без `/api`).")
+            console.print(
+                "Подсказка: в актуальных сборках health на `/api/v1/monitor/health`, "
+                "в старых — `/monitor/health`."
+            )
         return None
 
     async def _request_json_optional(self, method: str, path: str, **kwargs: Any) -> Any:

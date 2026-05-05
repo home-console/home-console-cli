@@ -136,7 +136,7 @@ def build_app(ctx: RecoveryContext) -> typer.Typer:
                         "core-runtime",
                         "sh",
                         "-lc",
-                        "curl -fsS http://localhost:8000/monitor/health >/dev/null && echo ok || echo no",
+                        "curl -fsS http://localhost:8000/api/v1/monitor/health >/dev/null && echo ok || echo no",
                     ],
                 ).strip()
                 if res == "ok":

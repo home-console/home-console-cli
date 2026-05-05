@@ -104,6 +104,148 @@ def _fmt_s(seconds: float) -> str:
     return f"{m}m{s:02d}s"
 
 
+def _normalize_edge_health_path(p: str) -> str:
+    v = (p or "").strip()
+    if not v:
+        return "/api/v1/monitor/health"
+    if not v.startswith("/"):
+        v = "/" + v
+    return v
+
+
+def _wait_http_ok(
+    *,
+    url: str,
+    timeout_s: int,
+    interval_s: float,
+    insecure_tls: bool,
+    quiet: bool,
+    console: Console,
+) -> None:
+    deadline = time.time() + timeout_s
+    started = time.monotonic()
+    next_tick = 0.0
+    if not quiet:
+        console.print(f"[cyan]→[/cyan] External check: GET {url} (timeout={timeout_s}s)")
+    while time.time() < deadline:
+        cmd = ["curl", "-fsS", url]
+        if insecure_tls:
+            cmd.insert(1, "-k")
+        p = subprocess.run(cmd, text=True, capture_output=True, check=False)  # noqa: S603
+        if p.returncode == 0:
+            if not quiet:
+                console.print(
+                    f"[green]✓[/green] external ok ([dim]{_fmt_s(time.monotonic() - started)}[/dim])"
+                )
+            return
+        now = time.monotonic()
+        if not quiet and now >= next_tick:
+            console.print(f"[dim]… external ждём: {_fmt_s(now - started)} / {timeout_s}s[/dim]")
+            next_tick = now + 5.0
+        time.sleep(interval_s)
+    raise HealthyTimeoutError(
+        message="external check не прошёл за отведённое время.",
+        exit_code=1,
+        hint=f"Проверь доступность снаружи: {url}",
+    )
+
+
+def _wait_http_contains(
+    *,
+    url: str,
+    must_contain: str,
+    timeout_s: int,
+    interval_s: float,
+    insecure_tls: bool,
+    quiet: bool,
+    console: Console,
+) -> None:
+    deadline = time.time() + timeout_s
+    started = time.monotonic()
+    next_tick = 0.0
+    if not quiet:
+        console.print(f"[cyan]→[/cyan] External check: GET {url} contains {must_contain!r} (timeout={timeout_s}s)")
+    while time.time() < deadline:
+        cmd = ["curl", "-fsS", url]
+        if insecure_tls:
+            cmd.insert(1, "-k")
+        p = subprocess.run(cmd, text=True, capture_output=True, check=False)  # noqa: S603
+        body = (p.stdout or "") if p.returncode == 0 else ""
+        if p.returncode == 0 and must_contain in body:
+            if not quiet:
+                console.print(
+                    f"[green]✓[/green] external content ok ([dim]{_fmt_s(time.monotonic() - started)}[/dim])"
+                )
+            return
+        now = time.monotonic()
+        if not quiet and now >= next_tick:
+            console.print(f"[dim]… external ждём content: {_fmt_s(now - started)} / {timeout_s}s[/dim]")
+            next_tick = now + 5.0
+        time.sleep(interval_s)
+    raise HealthyTimeoutError(
+        message="external content check не прошёл за отведённое время.",
+        exit_code=1,
+        hint=f"Проверь выдачу контента снаружи: {url}",
+    )
+
+
+def _normalize_db_mode(db: str | None) -> str | None:
+    if db is None:
+        return None
+    v = db.strip().lower()
+    if v in {"sqlite", "sqlite3"}:
+        return "sqlite"
+    if v in {"pg", "postgres", "postgresql"}:
+        return "postgres"
+    return v
+
+
+def _normalize_cache_mode(cache: str | None) -> str | None:
+    if cache is None:
+        return None
+    v = cache.strip().lower()
+    if v in {"mem", "memory"}:
+        return "memory"
+    if v in {"redis"}:
+        return "redis"
+    return v
+
+
+def _compose_env_overrides(*, db: str | None, cache: str | None) -> dict[str, str]:
+    """
+    Environment overrides for docker compose rollout.
+
+    Notes:
+    - `db` currently maps to vault backend (`RUNTIME_VAULT_STORAGE_TYPE`).
+    - `cache` maps to event bus backend; redis container may still run even in memory mode.
+    """
+    env: dict[str, str] = {}
+    dbn = _normalize_db_mode(db)
+    if dbn == "sqlite":
+        env["RUNTIME_VAULT_STORAGE_TYPE"] = "sqlite"
+    elif dbn == "postgres":
+        env["RUNTIME_VAULT_STORAGE_TYPE"] = "postgresql"
+    elif dbn is not None:
+        raise InvalidModeError(
+            message="--db должен быть sqlite или postgres.",
+            exit_code=2,
+            hint="Пример: `hc deploy --db sqlite` или `hc deploy --db postgres`.",
+        )
+
+    cn = _normalize_cache_mode(cache)
+    if cn == "memory":
+        env["EVENT_BUS_BACKEND"] = "memory"
+    elif cn == "redis":
+        env["EVENT_BUS_BACKEND"] = "redis"
+    elif cn is not None:
+        raise InvalidModeError(
+            message="--cache должен быть memory или redis.",
+            exit_code=2,
+            hint="Пример: `hc deploy --cache redis` или `hc deploy --cache memory`.",
+        )
+    return env
+
+
 def _step_start(console: Console, title: str, *, quiet: bool) -> float:
     if not quiet:
         console.print(f"[cyan]→[/cyan] {title}")
@@ -243,6 +385,16 @@ def register(app: typer.Typer) -> None:
             None, "--image", help="Имя image без тега (по умолчанию из config)"
         ),
         mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
+        db: str | None = typer.Option(
+            None,
+            "--db",
+            help="Vault DB backend: sqlite|postgres (пробрасывает env в compose)",
+        ),
+        cache: str | None = typer.Option(
+            None,
+            "--cache",
+            help="Cache/event bus backend: memory|redis (пробрасывает env в compose)",
+        ),
         ssh: str | None = typer.Option(
             None, "--ssh", help="user@host для удалённого rollout (по умолчанию из config)"
         ),
@@ -264,7 +416,7 @@ def register(app: typer.Typer) -> None:
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
         interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),
         health_url: str = typer.Option(
-            "http://localhost:8000/monitor/health",
+            "http://localhost:8000/api/v1/monitor/health",
             "--health-url",
             help="URL health внутри контейнера core-runtime",
         ),
@@ -326,6 +478,8 @@ def register(app: typer.Typer) -> None:
                     ssh=resolved_ssh,
                     path=resolved_path,
                     mode=resolved_mode,
+                    db=db,
+                    cache=cache,
                     wait=False,
                 )  # type: ignore[misc]
                 dt = _step_ok(console, "Rollout", t0, quiet=quiet or json_out)
@@ -339,6 +493,8 @@ def register(app: typer.Typer) -> None:
                         ssh=resolved_ssh,
                         path=resolved_path,
                         mode=resolved_mode,
+                        db=db,
+                        cache=cache,
                         timeout=timeout,
                         interval=interval,
                         health_url=health_url,
@@ -399,6 +555,12 @@ def register(app: typer.Typer) -> None:
         core_path: str | None = typer.Option(
             None, "--core-path", help="Путь к core-runtime-service"
         ),
+        ssh: str | None = typer.Option(
+            None, "--ssh", help="user@host для remote sync (копия dist на сервер)"
+        ),
+        path: str | None = typer.Option(
+            None, "--path", help="remote path к core-runtime-service (для --ssh)"
+        ),
         mode: str = typer.Option("dev", "--mode", help="dev|image (по умолчанию dev)"),
         image: str = typer.Option(
             "ghcr.io/home-console/platform-home-console",
@@ -411,6 +573,11 @@ def register(app: typer.Typer) -> None:
         ),
         start: bool = typer.Option(
             True, "--start/--no-start", help="Запустить dev stage core после копирования"
+        ),
+        restart_remote: bool = typer.Option(
+            True,
+            "--restart-remote/--no-restart-remote",
+            help="После remote sync перезапустить caddy (docker compose restart)",
         ),
     ) -> None:
         """Локально собрать platform web или запустить platform image из GHCR."""
@@ -479,6 +646,35 @@ def register(app: typer.Typer) -> None:
         _copy_dir_contents(dist_dir, frontend_dir)
         console.print(f"[green]✓[/green] frontend synced to [bold]{frontend_dir}[/bold]")
 
+        if ssh:
+            if not path:
+                console.print("[red]Ошибка:[/red] для --ssh нужен --path (к core-runtime-service на сервере)")
+                raise typer.Exit(code=2)
+            if shutil.which("rsync") is None:
+                console.print("[red]Ошибка:[/red] rsync не найден.")
+                console.print("Установи rsync и повтори (на macOS: `brew install rsync`).")
+                raise typer.Exit(code=1)
+            remote_frontend = f"{path.rstrip('/')}/deploy/dev/frontend/"
+            console.print(f"[cyan]→[/cyan] Remote sync dist → [bold]{ssh}[/bold]:{remote_frontend}")
+            p = subprocess.run(  # noqa: S603
+                ["rsync", "-az", "--delete", f"{str(dist_dir).rstrip('/')}/", f"{ssh}:{remote_frontend}"],
+                text=True,
+                check=False,
+            )
+            if p.returncode != 0:
+                console.print(f"[red]Ошибка:[/red] rsync завершился с кодом {p.returncode}")
+                raise typer.Exit(code=p.returncode)
+            console.print("[green]✓[/green] remote frontend synced")
+            if restart_remote:
+                remote = (
+                    f"cd {shlex.quote(path)} && "
+                    f"docker compose -f deploy/dev/docker-compose.yml restart caddy || "
+                    f"docker compose -f deploy/dev/docker-compose.yml up -d caddy"
+                )
+                _run(_ssh_cmd(ssh, remote))
+                console.print("[green]✓[/green] remote caddy restarted")
+            return
+
         if not start:
             return
 
@@ -491,6 +687,362 @@ def register(app: typer.Typer) -> None:
         console.print(f"[cyan]→[/cyan] Start core dev stage in [bold]{core_root}[/bold]")
         _run(["bash", str(start_script)], cwd=core_root)
         console.print("[green]✓[/green] platform deployed to core")
+
+    @deploy_app.command("stack")
+    def deploy_stack(
+        core_image: str | None = typer.Option(
+            None, "--core-image", help="Core image без тега (по умолчанию из deploy.core_image)"
+        ),
+        core_tag: str = typer.Option("latest", "--core-tag", help="Тег core image"),
+        platform_image: str = typer.Option(
+            "ghcr.io/home-console/platform-home-console",
+            "--platform-image",
+            help="Platform image без тега",
+        ),
+        platform_tag: str = typer.Option("latest", "--platform-tag", help="Тег platform image"),
+        ssh: str | None = typer.Option(
+            None, "--ssh", help="user@host для удалённого rollout (по умолчанию из deploy.ssh)"
+        ),
+        path: str | None = typer.Option(
+            None,
+            "--path",
+            help="remote path к core-runtime-service (по умолчанию из deploy.path)",
+        ),
+        compose_rel: str = typer.Option(
+            "deploy/prod/docker-compose.image.yml",
+            "--compose",
+            help="Путь к compose (относительно core-runtime-service на сервере)",
+        ),
+        core_runtime_url: str = typer.Option(
+            "http://core-runtime:8000",
+            "--core-runtime-url",
+            help="CORE_RUNTIME_URL для platform-web (внутри docker сети)",
+        ),
+        secure_cookies: bool = typer.Option(
+            True, "--secure-cookies/--insecure-cookies", help="Флаги cookie для platform-web"
+        ),
+        pull: bool = typer.Option(
+            True,
+            "--pull/--no-pull",
+            help="Делать `docker compose pull` перед up (для локальных image ставь --no-pull)",
+        ),
+        domain: str = typer.Option(
+            "localhost",
+            "--domain",
+            help="Домен для edge (DOMAIN в compose/Caddy). Для прод: реальный домен.",
+        ),
+        http_port: int = typer.Option(
+            80,
+            "--http-port",
+            help="Порт, который edge публикует наружу (HTTP_PORT в compose)",
+        ),
+        https_port: int = typer.Option(
+            443,
+            "--https-port",
+            help="Порт, который edge публикует наружу (HTTPS_PORT в compose)",
+        ),
+        edge_health_path: str = typer.Option(
+            "/api/v1/monitor/health",
+            "--edge-health-path",
+            help="Путь health на edge (проверяется через edge внутри контейнера)",
+        ),
+        external_base_url: str = typer.Option(
+            "",
+            "--external-url",
+            help="Опционально: проверка доступности С НАРУЖИ (напр. https://example.com или http://host:8088).",
+        ),
+        external_insecure_tls: bool = typer.Option(
+            False,
+            "--external-insecure-tls",
+            help="Для внешней проверки: отключить проверку TLS сертификата (curl -k).",
+        ),
+        external_path: str = typer.Option(
+            "/api/v1/monitor/health",
+            "--external-path",
+            help="Путь для внешней проверки (добавляется к --external-url, если он без path).",
+        ),
+        external_ui: bool = typer.Option(
+            False,
+            "--external-ui/--no-external-ui",
+            help="Дополнительно проверить, что фронт реально отдаётся через edge (HTML).",
+        ),
+        external_ui_path: str = typer.Option(
+            "/",
+            "--external-ui-path",
+            help="Путь для внешней проверки UI (по умолчанию /).",
+        ),
+        wait: bool = typer.Option(True, "--wait/--no-wait", help="Дождаться healthy core и UI"),
+        timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
+        interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),
+        quiet: bool = typer.Option(False, "--quiet", help="Минимальный вывод"),
+        json_out: bool = typer.Option(False, "--json", help="Машинный вывод в JSON"),
+    ) -> None:
+        """
+        Деплой всего стека (core-runtime + platform-web) из image’ов.
+
+        Локально: читает compose из исходников core-runtime-service.
+        Удалённо: `--ssh user@host --path /srv/core-runtime-service` применит compose на сервере.
+        """
+        console = Console()
+        try:
+            require_docker(console)
+            cfg = Config.load()
+            src = _resolve_source(console)
+
+            resolved_core_image = (core_image or cfg.deploy.core_image).strip()
+            full_core = f"{resolved_core_image}:{core_tag}"
+            full_platform = f"{platform_image}:{platform_tag}"
+
+            resolved_ssh = ssh if ssh is not None else (cfg.deploy.ssh or None)
+            resolved_path = path if path is not None else (cfg.deploy.path or None)
+
+            env_pairs = {
+                "CORE_RUNTIME_IMAGE": full_core,
+                "PLATFORM_IMAGE": full_platform,
+                "CORE_RUNTIME_URL": core_runtime_url,
+                "SECURE_COOKIES": "true" if secure_cookies else "false",
+                "DOMAIN": (domain or "localhost").strip(),
+                "HTTP_PORT": str(int(http_port)),
+                "HTTPS_PORT": str(int(https_port)),
+            }
+
+            edge_health_path = _normalize_edge_health_path(edge_health_path)
+
+            total_t0 = time.monotonic()
+            steps: list[dict[str, object]] = []
+
+            if not quiet and not json_out:
+                console.print(
+                    Panel.fit(
+                        f"core={full_core}\nplatform={full_platform}\ncompose={compose_rel}\n"
+                        f"target={'remote ' + resolved_ssh if resolved_ssh else 'local'}",
+                        title="hc deploy stack",
+                    )
+                )
+
+            if resolved_ssh:
+                if not resolved_path:
+                    raise HcCliError(
+                        message="для --ssh нужен --path",
+                        exit_code=2,
+                        hint="Пример: `hc deploy stack --ssh user@host --path /srv/core-runtime-service`",
+                    )
+                t0 = _step_start(
+                    console, "Rollout stack remote (compose pull + up -d)", quiet=quiet or json_out
+                )
+                exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env_pairs.items())
+                remote = f"cd {shlex.quote(resolved_path)} && "
+                if pull:
+                    remote += (
+                        f"{exports} docker compose -f {shlex.quote(compose_rel)} pull core-runtime platform-web edge && "
+                    )
+                remote += f"{exports} docker compose -f {shlex.quote(compose_rel)} up -d"
+                _run(_ssh_cmd(resolved_ssh, remote))
+                dt = _step_ok(console, "Rollout", t0, quiet=quiet or json_out)
+                steps.append({"name": "rollout", "ok": True, "duration_s": dt})
+
+                if wait:
+                    t0 = _step_start(
+                        console, "Wait healthy (edge routes to core + UI) remote", quiet=quiet or json_out
+                    )
+                    deadline = time.time() + timeout
+                    started = time.monotonic()
+                    next_tick = 0.0
+                    while time.time() < deadline:
+                        chk = (
+                            f"cd {shlex.quote(resolved_path)} && "
+                            f"docker compose -f {shlex.quote(compose_rel)} exec -T edge sh -lc "
+                            f"{shlex.quote(f'curl -fsS http://127.0.0.1{edge_health_path} >/dev/null && echo edge_core_ok || echo edge_core_no')} && "
+                            f"docker compose -f {shlex.quote(compose_rel)} exec -T edge sh -lc "
+                            f"{shlex.quote('wget -qO- http://127.0.0.1/ >/dev/null && echo edge_ui_ok || echo edge_ui_no')}"
+                        )
+                        p = subprocess.run(_ssh_cmd(resolved_ssh, chk), text=True, capture_output=True, check=False)  # noqa: S603
+                        out = (p.stdout or "").strip()
+                        if p.returncode == 0 and "edge_core_ok" in out and "edge_ui_ok" in out:
+                            break
+                        now = time.monotonic()
+                        if not quiet and not json_out and now >= next_tick:
+                            console.print(f"[dim]… жду healthy: {_fmt_s(now - started)} / {timeout}s[/dim]")
+                            next_tick = now + 5.0
+                        time.sleep(interval)
+                    else:
+                        raise HealthyTimeoutError(
+                            message="stack не вышел в healthy за отведённое время (remote).",
+                            exit_code=1,
+                            hint="Смотри логи: `docker compose -f ... logs -f edge core-runtime platform-web` (на сервере).",
+                        )
+                    dt = _step_ok(console, "Wait healthy", t0, quiet=quiet or json_out)
+                    steps.append({"name": "wait", "ok": True, "duration_s": dt})
+            else:
+                # local: apply compose from repo source (core-runtime-service)
+                compose_file = src.path / compose_rel
+                if not compose_file.exists():
+                    raise HcCliError(
+                        message=f"Не найден compose файл: {compose_file}",
+                        exit_code=1,
+                        hint="Проверь путь `--compose` и наличие deploy/prod/docker-compose.image.yml в core-runtime-service.",
+                    )
+                env = {**os.environ, **env_pairs}
+                t0 = _step_start(console, "Rollout stack local (compose pull + up -d)", quiet=quiet or json_out)
+                if pull:
+                    _run_env(
+                        [
+                            "docker",
+                            "compose",
+                            "-f",
+                            str(compose_file),
+                            "pull",
+                            "core-runtime",
+                            "platform-web",
+                            "edge",
+                        ],
+                        cwd=compose_file.parent,
+                        env=env,
+                    )
+                _run_env(
+                    ["docker", "compose", "-f", str(compose_file), "up", "-d"],
+                    cwd=compose_file.parent,
+                    env=env,
+                )
+                dt = _step_ok(console, "Rollout", t0, quiet=quiet or json_out)
+                steps.append({"name": "rollout", "ok": True, "duration_s": dt})
+
+                if wait:
+                    t0 = _step_start(
+                        console, "Wait healthy (edge routes to core + UI)", quiet=quiet or json_out
+                    )
+                    deadline = time.time() + timeout
+                    started = time.monotonic()
+                    next_tick = 0.0
+                    while time.time() < deadline:
+                        core_chk = subprocess.run(  # noqa: S603
+                            [
+                                "docker",
+                                "compose",
+                                "-f",
+                                str(compose_file),
+                                "exec",
+                                "-T",
+                                "edge",
+                                "sh",
+                                "-lc",
+                                f"curl -fsS http://127.0.0.1{edge_health_path} >/dev/null && echo ok || echo no",
+                            ],
+                            cwd=str(compose_file.parent),
+                            text=True,
+                            capture_output=True,
+                        )
+                        ui_chk = subprocess.run(  # noqa: S603
+                            [
+                                "docker",
+                                "compose",
+                                "-f",
+                                str(compose_file),
+                                "exec",
+                                "-T",
+                                "edge",
+                                "sh",
+                                "-lc",
+                                "wget -qO- http://127.0.0.1/ >/dev/null && echo ok || echo no",
+                            ],
+                            cwd=str(compose_file.parent),
+                            text=True,
+                            capture_output=True,
+                        )
+                        if (
+                            core_chk.returncode == 0
+                            and (core_chk.stdout or "").strip() == "ok"
+                            and ui_chk.returncode == 0
+                            and (ui_chk.stdout or "").strip() == "ok"
+                        ):
+                            break
+                        now = time.monotonic()
+                        if not quiet and not json_out and now >= next_tick:
+                            console.print(f"[dim]… жду healthy: {_fmt_s(now - started)} / {timeout}s[/dim]")
+                            next_tick = now + 5.0
+                        time.sleep(interval)
+                    else:
+                        raise HealthyTimeoutError(
+                            message="stack не вышел в healthy за отведённое время.",
+                            exit_code=1,
+                            hint="Смотри логи: `docker compose -f ... logs -f edge core-runtime platform-web`.",
+                        )
+                    dt = _step_ok(console, "Wait healthy", t0, quiet=quiet or json_out)
+                    steps.append({"name": "wait", "ok": True, "duration_s": dt})
+
+            # Optional external check from the machine running `hc`.
+            external = (external_base_url or "").strip()
+            if external and not json_out:
+                # if external doesn't include scheme, assume http
+                if "://" not in external:
+                    external = "http://" + external
+                # if external has no path, append external_path
+                if "/" not in external.split("://", 1)[1]:
+                    external = external.rstrip("/") + _normalize_edge_health_path(external_path)
+                t0 = _step_start(console, "External check (caller → edge)", quiet=quiet)
+                _wait_http_ok(
+                    url=external,
+                    timeout_s=timeout,
+                    interval_s=interval,
+                    insecure_tls=external_insecure_tls,
+                    quiet=quiet,
+                    console=console,
+                )
+                _step_ok(console, "External check", t0, quiet=quiet)
+
+                if external_ui:
+                    base = external_base_url.strip()
+                    if "://" not in base:
+                        base = "http://" + base
+                    ui_url = base.rstrip("/") + _normalize_edge_health_path(external_ui_path)
+                    t0 = _step_start(console, "External UI check (caller → edge)", quiet=quiet)
+                    _wait_http_contains(
+                        url=ui_url,
+                        must_contain="<!doctype html",
+                        timeout_s=timeout,
+                        interval_s=interval,
+                        insecure_tls=external_insecure_tls,
+                        quiet=quiet,
+                        console=console,
+                    )
+                    _step_ok(console, "External UI check", t0, quiet=quiet)
+
+            total_dt = time.monotonic() - total_t0
+            if json_out:
+                payload = {
+                    "ok": True,
+                    "command": "deploy.stack",
+                    "core": full_core,
+                    "platform": full_platform,
+                    "compose": compose_rel,
+                    "target": f"remote {resolved_ssh}" if resolved_ssh else "local",
+                    "wait": bool(wait),
+                    "timeout_s": int(timeout),
+                    "interval_s": float(interval),
+                    "secure_cookies": bool(secure_cookies),
+                    "core_runtime_url": core_runtime_url,
+                    "edge_health_path": edge_health_path,
+                    "domain": env_pairs["DOMAIN"],
+                    "http_port": int(http_port),
+                    "https_port": int(https_port),
+                    "steps": steps,
+                    "duration_s": total_dt,
+                }
+                print(json.dumps(payload, ensure_ascii=False))
+                return
+
+            if quiet:
+                console.print("[green]✓[/green] Stack deploy ok")
+                return
+            console.print(f"[green]✓[/green] Stack deploy done ([dim]{_fmt_s(total_dt)}[/dim])")
+        except HcCliError as e:
+            if json_out:
+                print(json.dumps(json_error_payload("deploy.stack", e), ensure_ascii=False))
+                raise typer.Exit(code=int(e.exit_code or 1))
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
 
     cfg_app = typer.Typer(
         help="Дефолты для deploy (ssh/path/image/mode)",
@@ -604,11 +1156,13 @@ def register(app: typer.Typer) -> None:
             None, "--path", help="remote path с compose (по умолчанию из config)"
         ),
         mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
+        db: str | None = typer.Option(None, "--db", help="Vault DB backend: sqlite|postgres"),
+        cache: str | None = typer.Option(None, "--cache", help="Cache backend: memory|redis"),
         wait: bool = typer.Option(True, "--wait/--no-wait", help="Дождаться healthy после rollout"),
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
         interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),
         health_url: str = typer.Option(
-            "http://localhost:8000/monitor/health",
+            "http://localhost:8000/api/v1/monitor/health",
             "--health-url",
             help="URL health внутри контейнера core-runtime",
         ),
@@ -639,9 +1193,23 @@ def register(app: typer.Typer) -> None:
                 raise typer.Exit(code=2)
             remote = (
                 f"cd {shlex.quote(path)} && "
-                f"CORE_RUNTIME_IMAGE={shlex.quote(full)} "
+                + " ".join(
+                    f"{k}={shlex.quote(v)}"
+                    for k, v in {
+                        "CORE_RUNTIME_IMAGE": full,
+                        **_compose_env_overrides(db=db, cache=cache),
+                    }.items()
+                )
+                + " "
                 f"docker compose -f deploy/dev/{compose_file} pull core-runtime && "
-                f"CORE_RUNTIME_IMAGE={shlex.quote(full)} "
+                + " ".join(
+                    f"{k}={shlex.quote(v)}"
+                    for k, v in {
+                        "CORE_RUNTIME_IMAGE": full,
+                        **_compose_env_overrides(db=db, cache=cache),
+                    }.items()
+                )
+                + " "
                 f"docker compose -f deploy/dev/{compose_file} up -d"
             )
             console.print(f"Remote rollout on [bold]{ssh}[/bold]")
@@ -663,7 +1231,7 @@ def register(app: typer.Typer) -> None:
         # local rollout
         project = compose_project_from_source(console, src, mode=mode)
         console.print(f"Local rollout: [bold]{full}[/bold]")
-        env = {**os.environ, "CORE_RUNTIME_IMAGE": full}
+        env = {**os.environ, "CORE_RUNTIME_IMAGE": full, **_compose_env_overrides(db=db, cache=cache)}
         _run_env(
             ["docker", "compose", "-f", str(project.compose_file), "pull", "core-runtime"],
             cwd=project.cwd,
@@ -698,10 +1266,12 @@ def register(app: typer.Typer) -> None:
             None, "--path", help="remote path с compose (по умолчанию из config)"
         ),
         mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
+        db: str | None = typer.Option(None, "--db", help="Vault DB backend: sqlite|postgres"),
+        cache: str | None = typer.Option(None, "--cache", help="Cache backend: memory|redis"),
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
         interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),
         health_url: str = typer.Option(
-            "http://localhost:8000/monitor/health",
+            "http://localhost:8000/api/v1/monitor/health",
             "--health-url",
             help="URL health внутри контейнера core-runtime",
         ),
@@ -726,6 +1296,7 @@ def register(app: typer.Typer) -> None:
             if not path:
                 console.print("[red]Ошибка:[/red] для --ssh нужен --path")
                 raise typer.Exit(code=2)
+            # db/cache are passed to compose via env in rollout; for wait we only need the URL.
             _wait_core_healthy_remote(
                 console,
                 ssh=ssh,
@@ -823,7 +1394,7 @@ def register(app: typer.Typer) -> None:
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
         interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),
         health_url: str = typer.Option(
-            "http://localhost:8000/monitor/health",
+            "http://localhost:8000/api/v1/monitor/health",
             "--health-url",
             help="URL health внутри контейнера core-runtime",
         ),

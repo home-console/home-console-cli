@@ -25,7 +25,7 @@ from hc.commands.marketplace import register as register_marketplace
 from hc.shell import run_shell
 
 app = typer.Typer(
-    add_completion=False,
+    add_completion=True,
     no_args_is_help=False,
     pretty_exceptions_enable=False,
     pretty_exceptions_show_locals=False,
@@ -46,6 +46,12 @@ def repl(args: list[str] = typer.Argument(None)) -> None:
             console.print(f"[red]Ошибка: {e}[/red]")
             raise typer.Exit(code=1)
         return
+    run_shell(app)
+
+
+@app.command("shell")
+def shell() -> None:
+    """Алиас для REPL (как `hc repl` без аргументов)."""
     run_shell(app)
 
 

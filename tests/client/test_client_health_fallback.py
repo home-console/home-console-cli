@@ -11,8 +11,10 @@ def test_health_falls_back_to_prefixed_health_when_monitor_not_dict(monkeypatch)
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.path)
-        if request.url.path.startswith("/monitor/health"):
+        if request.url.path.startswith("/api/v1/monitor/health"):
             return httpx.Response(200, json=["not-a-dict"])
+        if request.url.path.startswith("/monitor/health"):
+            return httpx.Response(404, text="no")
         if request.url.path.startswith("/api/health"):
             return httpx.Response(404, text="no")
         if request.url.path.startswith("/api/v1/health"):
@@ -33,6 +35,5 @@ def test_health_falls_back_to_prefixed_health_when_monitor_not_dict(monkeypatch)
     assert isinstance(data, dict)
     assert data.get("via") == "prefixed"
     assert c.api_prefix == "/api/v1"
-    assert any(p.startswith("/monitor/health") for p in calls)
-    assert any(p.startswith("/api/health") for p in calls)
+    assert any(p.startswith("/api/v1/monitor/health") for p in calls)
     assert any(p.startswith("/api/v1/health") for p in calls)
