@@ -22,6 +22,7 @@ from hc.commands.deploy import register as register_deploy
 from hc.commands.update import register as register_update
 from hc.commands.ping import register as register_ping
 from hc.commands.marketplace import register as register_marketplace
+from hc.commands.secrets import register as register_secrets
 from hc.shell import run_shell
 
 app = typer.Typer(
@@ -82,6 +83,7 @@ def _register_all() -> None:
     register_update(app)
     register_ping(app)
     register_marketplace(app)
+    register_secrets(app)
 
 
 _register_all()

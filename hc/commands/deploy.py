@@ -805,6 +805,11 @@ def register(app: typer.Typer) -> None:
                 "HTTP_PORT": str(int(http_port)),
                 "HTTPS_PORT": str(int(https_port)),
             }
+            # Prefer not relying on remote `.env`: if caller provided master key locally,
+            # pass it through to remote compose via `ssh` exports.
+            master_key = (os.getenv("RUNTIME_MASTER_KEY") or "").strip()
+            if master_key:
+                env_pairs["RUNTIME_MASTER_KEY"] = master_key
 
             edge_health_path = _normalize_edge_health_path(edge_health_path)
 
