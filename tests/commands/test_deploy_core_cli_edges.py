@@ -53,6 +53,8 @@ def test_deploy_core_rollout_rejects_bad_mode(runner: CliRunner, isolated_home, 
     _patch_deploy_prereqs(monkeypatch, tmp_path)
     from hc.main import app
 
-    r = runner.invoke(app, ["deploy", "core", "rollout", "--mode", "prod", "--no-wait"])
+    r = runner.invoke(
+        app, ["deploy", "core", "rollout", "--mode", "not-a-deploy-mode", "--no-wait"]
+    )
     assert r.exit_code == 2
     assert "mode" in r.output.lower()

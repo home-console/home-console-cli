@@ -110,5 +110,7 @@ def test_core_status_not_running_exits_1(monkeypatch, tmp_path: Path) -> None:
 def test_core_source_compose_paths_dev_and_image(tmp_path: Path) -> None:
     src = CoreSource(path=tmp_path)
     assert src.compose_file("dev") == tmp_path / "deploy" / "dev" / "docker-compose.yml"
-    assert src.compose_file("image") == tmp_path / "deploy" / "dev" / "docker-compose.image.yml"
+    assert src.compose_file("dev-image") == tmp_path / "deploy" / "dev" / "docker-compose.image.yml"
+    assert src.compose_file("dev-reload") == tmp_path / "deploy" / "dev" / "docker-compose.reload.yml"
+    assert src.compose_file("prod") == tmp_path / "deploy" / "prod" / "docker-compose.image.yml"
     assert src.compose_file(None) == tmp_path / "deploy" / "dev" / "docker-compose.yml"

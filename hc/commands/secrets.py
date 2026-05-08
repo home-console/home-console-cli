@@ -30,7 +30,7 @@ from rich.console import Console
 from rich.table import Table
 
 from hc.config import Config
-from hc.core_source import get_core_source_from_repo, get_core_source_local
+from hc.core_source import COMPOSE_MODES as _COMPOSE_BY_MODE, get_core_source_from_repo, get_core_source_local
 from hc.errors import HcCliError, json_error_payload
 
 
@@ -38,8 +38,6 @@ from hc.errors import HcCliError, json_error_payload
 
 _TOOL = "/app/scripts/secrets_tool.py"
 _SERVICE = "core-runtime"
-
-from hc.core_source import COMPOSE_MODES as _COMPOSE_BY_MODE  # канонический маппинг
 
 
 def _find_repo_root() -> Path | None:

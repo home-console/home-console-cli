@@ -15,8 +15,7 @@ from rich.panel import Panel
 from hc.config import Config
 from hc.core_ops import compose_project_from_source, require_docker
 from hc.core_source import (
-    COMPOSE_MODES,
-    DEPLOY_MODES,
+    IMAGE_MODES,
     VALID_MODES,
     CoreSource,
     get_core_source_from_repo,
@@ -31,7 +30,7 @@ from hc.errors import (
 )
 
 _MODE_HELP = "dev | dev-reload | dev-image | prod  (по умолчанию из config)"
-_DEPLOY_MODE_HELP = "dev-image | prod  (prod = образ из registry; по умолчанию из config)"
+_DEPLOY_MODE_HELP = _MODE_HELP
 
 
 def _find_repo_root() -> Path | None:
@@ -1181,6 +1180,11 @@ def register(app: typer.Typer) -> None:
             "--health-url",
             help="URL health внутри контейнера core-runtime",
         ),
+        pull: bool = typer.Option(
+            True,
+            "--pull/--no-pull",
+            help="docker compose pull core-runtime (только для dev-image и prod; для dev/dev-reload не используется)",
+        ),
     ) -> None:
         """
         Rollout (compose pull + up -d) для core-runtime.
@@ -1203,6 +1207,7 @@ def register(app: typer.Typer) -> None:
         full = f"{image}:{tag}"
 
         compose_rel = src.compose_rel(mode)
+        do_pull = bool(pull and mode in IMAGE_MODES)
         if ssh:
             if not path:
                 console.print("[red]Ошибка:[/red] для --ssh нужен --path")
@@ -1214,9 +1219,14 @@ def register(app: typer.Typer) -> None:
                     **_compose_env_overrides(db=db, cache=cache),
                 }.items()
             )
+            pull_cmd = (
+                f"{env_pairs} docker compose -f {compose_rel} pull core-runtime && "
+                if do_pull
+                else ""
+            )
             remote = (
                 f"cd {shlex.quote(path)} && "
-                f"{env_pairs} docker compose -f {compose_rel} pull core-runtime && "
+                f"{pull_cmd}"
                 f"{env_pairs} docker compose -f {compose_rel} up -d"
             )
             console.print(f"Remote rollout on [bold]{ssh}[/bold]")
@@ -1239,11 +1249,12 @@ def register(app: typer.Typer) -> None:
         project = compose_project_from_source(console, src, mode=mode)
         console.print(f"Local rollout: [bold]{full}[/bold]")
         env = {**os.environ, "CORE_RUNTIME_IMAGE": full, **_compose_env_overrides(db=db, cache=cache)}
-        _run_env(
-            ["docker", "compose", "-f", str(project.compose_file), "pull", "core-runtime"],
-            cwd=project.cwd,
-            env=env,
-        )
+        if do_pull:
+            _run_env(
+                ["docker", "compose", "-f", str(project.compose_file), "pull", "core-runtime"],
+                cwd=project.cwd,
+                env=env,
+            )
         _run_env(
             ["docker", "compose", "-f", str(project.compose_file), "up", "-d"],
             cwd=project.cwd,
@@ -1403,6 +1414,7 @@ def register(app: typer.Typer) -> None:
             "--health-url",
             help="URL health внутри контейнера core-runtime",
         ),
+        pull: bool = typer.Option(True, "--pull/--no-pull", help="передать в rollout ( dev-image/prod )"),
     ) -> None:
         """Короткий шорткат: rollout на конкретный tag."""
         core_rollout(
@@ -1415,6 +1427,7 @@ def register(app: typer.Typer) -> None:
             timeout=timeout,
             interval=interval,
             health_url=health_url,
+            pull=pull,
         )
 
     deploy_app.add_typer(cfg_app, name="config")

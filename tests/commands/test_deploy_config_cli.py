@@ -17,15 +17,22 @@ def test_deploy_config_show_defaults(runner: CliRunner, isolated_home) -> None:
     r = runner.invoke(app, ["deploy", "config", "show"])
     assert r.exit_code == 0
     assert "deploy.core_image" in r.output
-    assert "dev-core-runtime" in r.output
+    assert "ghcr.io/home-console/core-runtime" in r.output
 
 
 def test_deploy_config_set_rejects_bad_core_mode(runner: CliRunner, isolated_home) -> None:
     from hc.main import app
 
-    r = runner.invoke(app, ["deploy", "config", "set", "--core-mode", "prod"])
+    r = runner.invoke(app, ["deploy", "config", "set", "--core-mode", "legacy-image-alias"])
     assert r.exit_code == 2
-    assert "--core-mode" in r.output or "dev" in r.output
+    assert "--core-mode" in r.output or "недопустим" in r.output.lower() or "допустим" in r.output.lower()
+
+
+def test_deploy_config_set_accepts_prod_core_mode(runner: CliRunner, isolated_home) -> None:
+    from hc.main import app
+
+    r = runner.invoke(app, ["deploy", "config", "set", "--core-mode", "prod"])
+    assert r.exit_code == 0
 
 
 def test_deploy_config_set_roundtrip(runner: CliRunner, isolated_home) -> None:
@@ -64,7 +71,7 @@ def test_deploy_root_json_invalid_mode(runner: CliRunner, isolated_home, monkeyp
             "deploy",
             "--json",
             "--mode",
-            "prod",
+            "not-a-valid-mode",
             "--no-build",
             "--no-push",
             "--no-rollout",

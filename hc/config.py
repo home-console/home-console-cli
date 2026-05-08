@@ -5,7 +5,7 @@ from typing import Self
 
 from tomlkit import document, parse
 
-from hc.constants import CONFIG_DIR, CONFIG_PATH, DEFAULT_HOST, DEFAULT_PORT
+from hc.constants import CONFIG_DIR, CONFIG_PATH, DEFAULT_CORE_IMAGE, DEFAULT_HOST, DEFAULT_PORT
 
 
 @dataclass(slots=True)
@@ -41,7 +41,7 @@ class DeployConfig:
     # prod       → deploy/prod/docker-compose.image.yml   (образ из registry, PROD!)
     # dev        → deploy/dev/docker-compose.yml          (build из src; только local)
     # dev-reload → deploy/dev/docker-compose.reload.yml   (hot-reload; только local)
-    core_image: str = "dev-core-runtime"
+    core_image: str = DEFAULT_CORE_IMAGE  # например ghcr.io/home-console/core-runtime
     core_mode: str = "dev-image"  # dev | dev-reload | dev-image | prod
     ssh: str = ""  # user@host
     path: str = ""  # remote path with compose
@@ -80,7 +80,7 @@ class Config:
                 mode=str(recovery.get("mode", "dev")),
             ),
             deploy=DeployConfig(
-                core_image=str(deploy.get("core_image", "dev-core-runtime")),
+                core_image=str(deploy.get("core_image", DEFAULT_CORE_IMAGE)),
                 core_mode=str(deploy.get("core_mode", "dev-image")),
                 ssh=str(deploy.get("ssh", "")),
                 path=str(deploy.get("path", "")),
