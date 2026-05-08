@@ -39,12 +39,7 @@ from hc.errors import HcCliError, json_error_payload
 _TOOL = "/app/scripts/secrets_tool.py"
 _SERVICE = "core-runtime"
 
-# Mapping mode → compose file path relative to core-runtime-service root
-_COMPOSE_BY_MODE: dict[str, str] = {
-    "dev":   "deploy/dev/docker-compose.yml",
-    "image": "deploy/dev/docker-compose.image.yml",
-    "prod":  "deploy/prod/docker-compose.image.yml",
-}
+from hc.core_source import COMPOSE_MODES as _COMPOSE_BY_MODE  # канонический маппинг
 
 
 def _find_repo_root() -> Path | None:
@@ -58,8 +53,9 @@ def _find_repo_root() -> Path | None:
 def _resolve_compose(mode: str) -> str:
     rel = _COMPOSE_BY_MODE.get(mode.lower())
     if rel is None:
+        valid = " | ".join(sorted(_COMPOSE_BY_MODE))
         raise HcCliError(
-            message=f"Неизвестный mode: {mode!r}. Допустимые: dev, image, prod.",
+            message=f"Неизвестный mode: {mode!r}. Допустимые: {valid}",
             exit_code=2,
         )
     return rel
@@ -245,7 +241,7 @@ def register(app: typer.Typer) -> None:
 
     _ssh_opt     = typer.Option(None,   "--ssh",     help="user@host для удалённого доступа")
     _path_opt    = typer.Option(None,   "--path",    help="Путь к core-runtime-service на сервере")
-    _mode_opt    = typer.Option("prod", "--mode",    help="Compose mode: dev | image | prod (default)")
+    _mode_opt    = typer.Option("prod", "--mode",    help="dev | dev-reload | dev-image | prod (default)")
     _compose_opt = typer.Option(None,   "--compose", help="Явный путь к compose-файлу (override --mode)")
     _json_opt    = typer.Option(False,  "--json",    help="Вывод в JSON")
 

@@ -11,22 +11,65 @@ from rich.console import Console
 from hc.constants import CORE_SRC_DIR, DATA_DIR, DEFAULT_CORE_REF, DEFAULT_CORE_REPO
 
 
+# ─── Канонический маппинг режимов → compose-файл ──────────────────────────────
+#
+# Режим         Compose-файл (rel to core-runtime-service)      Когда использовать
+# ──────────────────────────────────────────────────────────────────────────────────
+# dev           deploy/dev/docker-compose.yml                   Сборка из src (разработка)
+# dev-reload    deploy/dev/docker-compose.reload.yml            Как dev + live volume mount +
+#                                                               watchfiles (горячий рестарт)
+# dev-image     deploy/dev/docker-compose.image.yml            Готовый образ, dev-инфра
+#                                                               (caddy+статика); проверка образа
+# prod          deploy/prod/docker-compose.image.yml           Образ из registry + prod-инфра
+#                                                               (edge+platform-web); ТОЛЬКО registry
+# ──────────────────────────────────────────────────────────────────────────────────
+COMPOSE_MODES: dict[str, str] = {
+    "dev":        "deploy/dev/docker-compose.yml",
+    "dev-reload": "deploy/dev/docker-compose.reload.yml",
+    "dev-image":  "deploy/dev/docker-compose.image.yml",
+    "prod":       "deploy/prod/docker-compose.image.yml",
+}
+
+# Удобное множество для валидации
+VALID_MODES: frozenset[str] = frozenset(COMPOSE_MODES)
+
+# Режимы, требующие готовый образ (без build из src)
+IMAGE_MODES: frozenset[str] = frozenset({"dev-image", "prod"})
+
+# Режимы, пригодные для remote rollout через SSH
+DEPLOY_MODES: frozenset[str] = frozenset({"dev-image", "prod"})
+
+
 @dataclass(slots=True)
 class CoreSource:
     path: Path
 
     def compose_file(self, mode: str | None = None) -> Path:
         """
-        Возвращает compose-файл для CoreRuntime.
+        Возвращает абсолютный путь к compose-файлу для данного режима.
 
-        mode:
-        - dev: build из исходников (docker-compose.yml)
-        - image: prod-like запуск из image (docker-compose.image.yml)
+        Допустимые значения mode: dev | dev-reload | dev-image | prod.
+        При mode=None используется "dev".
         """
         m = (mode or "dev").strip().lower()
-        if m == "image":
-            return self.path / "deploy" / "dev" / "docker-compose.image.yml"
-        return self.path / "deploy" / "dev" / "docker-compose.yml"
+        rel = COMPOSE_MODES.get(m)
+        if rel is None:
+            valid = " | ".join(sorted(COMPOSE_MODES))
+            raise ValueError(
+                f"Неизвестный режим {m!r}. Допустимые: {valid}"
+            )
+        return self.path / rel
+
+    def compose_rel(self, mode: str | None = None) -> str:
+        """Путь к compose-файлу относительно корня core-runtime-service (для SSH)."""
+        m = (mode or "dev").strip().lower()
+        rel = COMPOSE_MODES.get(m)
+        if rel is None:
+            valid = " | ".join(sorted(COMPOSE_MODES))
+            raise ValueError(
+                f"Неизвестный режим {m!r}. Допустимые: {valid}"
+            )
+        return rel
 
 
 def get_core_source_from_repo(repo_root: Path) -> CoreSource | None:
@@ -81,4 +124,3 @@ def update_core_source(console: Console) -> CoreSource:
         console.print("[red]Ошибка: не удалось обновить репозиторий Core (git pull).[/red]")
         raise typer.Exit(code=1)
     return src
-

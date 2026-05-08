@@ -14,7 +14,14 @@ from rich.panel import Panel
 
 from hc.config import Config
 from hc.core_ops import compose_project_from_source, require_docker
-from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local
+from hc.core_source import (
+    COMPOSE_MODES,
+    DEPLOY_MODES,
+    VALID_MODES,
+    CoreSource,
+    get_core_source_from_repo,
+    get_core_source_local,
+)
 from hc.errors import (
     CoreSourcesNotFoundError,
     HcCliError,
@@ -22,6 +29,9 @@ from hc.errors import (
     InvalidModeError,
     json_error_payload,
 )
+
+_MODE_HELP = "dev | dev-reload | dev-image | prod  (по умолчанию из config)"
+_DEPLOY_MODE_HELP = "dev-image | prod  (prod = образ из registry; по умолчанию из config)"
 
 
 def _find_repo_root() -> Path | None:
@@ -384,7 +394,7 @@ def register(app: typer.Typer) -> None:
         image: str | None = typer.Option(
             None, "--image", help="Имя image без тега (по умолчанию из config)"
         ),
-        mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
+        mode: str | None = typer.Option(None, "--mode", help=_DEPLOY_MODE_HELP),
         db: str | None = typer.Option(
             None,
             "--db",
@@ -437,11 +447,11 @@ def register(app: typer.Typer) -> None:
 
             resolved_image = (image or cfg.deploy.core_image).strip()
             resolved_mode = (mode or cfg.deploy.core_mode).strip().lower()
-            if resolved_mode not in {"dev", "image"}:
+            if resolved_mode not in VALID_MODES:
                 raise InvalidModeError(
-                    message="--mode должен быть dev или image.",
+                    message=f"--mode {resolved_mode!r} недопустим.",
                     exit_code=2,
-                    hint="Пример: `hc deploy --mode dev` или `hc deploy --mode image`.",
+                    hint=f"Допустимые: {' | '.join(sorted(VALID_MODES))}",
                 )
             resolved_ssh = ssh if ssh is not None else (cfg.deploy.ssh or None)
             resolved_path = path if path is not None else (cfg.deploy.path or None)
@@ -1072,7 +1082,7 @@ def register(app: typer.Typer) -> None:
         core_image: str | None = typer.Option(
             None, "--core-image", help="Напр. ghcr.io/org/core-runtime"
         ),
-        core_mode: str | None = typer.Option(None, "--core-mode", help="dev|image"),
+        core_mode: str | None = typer.Option(None, "--core-mode", help=_MODE_HELP),
         ssh: str | None = typer.Option(None, "--ssh", help="user@host"),
         path: str | None = typer.Option(None, "--path", help="remote path с compose"),
     ) -> None:
@@ -1082,8 +1092,8 @@ def register(app: typer.Typer) -> None:
             cfg.deploy.core_image = core_image.strip()
         if core_mode is not None:
             m = core_mode.strip().lower()
-            if m not in {"dev", "image"}:
-                console.print("[red]Ошибка:[/red] --core-mode должен быть dev или image")
+            if m not in VALID_MODES:
+                console.print(f"[red]Ошибка:[/red] --core-mode {m!r} недопустим. Допустимые: {' | '.join(sorted(VALID_MODES))}")
                 raise typer.Exit(code=2)
             cfg.deploy.core_mode = m
         if ssh is not None:
@@ -1160,7 +1170,7 @@ def register(app: typer.Typer) -> None:
         path: str | None = typer.Option(
             None, "--path", help="remote path с compose (по умолчанию из config)"
         ),
-        mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
+        mode: str | None = typer.Option(None, "--mode", help=_MODE_HELP),
         db: str | None = typer.Option(None, "--db", help="Vault DB backend: sqlite|postgres"),
         cache: str | None = typer.Option(None, "--cache", help="Cache backend: memory|redis"),
         wait: bool = typer.Option(True, "--wait/--no-wait", help="Дождаться healthy после rollout"),
@@ -1175,8 +1185,9 @@ def register(app: typer.Typer) -> None:
         """
         Rollout (compose pull + up -d) для core-runtime.
 
-        Локально: использует compose в core-runtime-service/deploy/dev.
-        Удалённо: `--ssh user@host --path /srv/core-runtime-service` выполнит compose на сервере.
+        Режимы: dev | dev-reload | dev-image | prod
+        Для remote (--ssh): рекомендуется dev-image или prod.
+        prod → deploy/prod/docker-compose.image.yml (образ из registry).
         """
         console = Console()
         require_docker(console)
@@ -1184,38 +1195,29 @@ def register(app: typer.Typer) -> None:
         cfg = Config.load()
         image = (image or cfg.deploy.core_image).strip()
         mode = (mode or cfg.deploy.core_mode).strip().lower()
-        if mode not in {"dev", "image"}:
-            console.print("[red]Ошибка:[/red] --mode должен быть dev или image")
+        if mode not in VALID_MODES:
+            console.print(f"[red]Ошибка:[/red] --mode {mode!r} недопустим. Допустимые: {' | '.join(sorted(VALID_MODES))}")
             raise typer.Exit(code=2)
         ssh = ssh if ssh is not None else (cfg.deploy.ssh or None)
         path = path if path is not None else (cfg.deploy.path or None)
         full = f"{image}:{tag}"
 
-        compose_file = "docker-compose.image.yml" if mode == "image" else "docker-compose.yml"
+        compose_rel = src.compose_rel(mode)
         if ssh:
             if not path:
                 console.print("[red]Ошибка:[/red] для --ssh нужен --path")
                 raise typer.Exit(code=2)
+            env_pairs = " ".join(
+                f"{k}={shlex.quote(v)}"
+                for k, v in {
+                    "CORE_RUNTIME_IMAGE": full,
+                    **_compose_env_overrides(db=db, cache=cache),
+                }.items()
+            )
             remote = (
                 f"cd {shlex.quote(path)} && "
-                + " ".join(
-                    f"{k}={shlex.quote(v)}"
-                    for k, v in {
-                        "CORE_RUNTIME_IMAGE": full,
-                        **_compose_env_overrides(db=db, cache=cache),
-                    }.items()
-                )
-                + " "
-                f"docker compose -f deploy/dev/{compose_file} pull core-runtime && "
-                + " ".join(
-                    f"{k}={shlex.quote(v)}"
-                    for k, v in {
-                        "CORE_RUNTIME_IMAGE": full,
-                        **_compose_env_overrides(db=db, cache=cache),
-                    }.items()
-                )
-                + " "
-                f"docker compose -f deploy/dev/{compose_file} up -d"
+                f"{env_pairs} docker compose -f {compose_rel} pull core-runtime && "
+                f"{env_pairs} docker compose -f {compose_rel} up -d"
             )
             console.print(f"Remote rollout on [bold]{ssh}[/bold]")
             _run(_ssh_cmd(ssh, remote))
@@ -1225,7 +1227,7 @@ def register(app: typer.Typer) -> None:
                     console,
                     ssh=ssh,
                     path=path,
-                    compose_rel=f"deploy/dev/{compose_file}",
+                    compose_rel=compose_rel,
                     timeout_s=timeout,
                     interval_s=interval,
                     health_url=health_url,
@@ -1270,7 +1272,7 @@ def register(app: typer.Typer) -> None:
         path: str | None = typer.Option(
             None, "--path", help="remote path с compose (по умолчанию из config)"
         ),
-        mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
+        mode: str | None = typer.Option(None, "--mode", help=_MODE_HELP),
         db: str | None = typer.Option(None, "--db", help="Vault DB backend: sqlite|postgres"),
         cache: str | None = typer.Option(None, "--cache", help="Cache backend: memory|redis"),
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
@@ -1289,24 +1291,22 @@ def register(app: typer.Typer) -> None:
         cfg = Config.load()
         image = (image or cfg.deploy.core_image).strip()
         mode = (mode or cfg.deploy.core_mode).strip().lower()
-        if mode not in {"dev", "image"}:
-            console.print("[red]Ошибка:[/red] --mode должен быть dev или image")
+        if mode not in VALID_MODES:
+            console.print(f"[red]Ошибка:[/red] --mode {mode!r} недопустим. Допустимые: {' | '.join(sorted(VALID_MODES))}")
             raise typer.Exit(code=2)
         ssh = ssh if ssh is not None else (cfg.deploy.ssh or None)
         path = path if path is not None else (cfg.deploy.path or None)
-        _ = f"{image}:{tag}"  # для UX一致ности, но для wait не обязателен
 
-        compose_file = "docker-compose.image.yml" if mode == "image" else "docker-compose.yml"
+        compose_rel = src.compose_rel(mode)
         if ssh:
             if not path:
                 console.print("[red]Ошибка:[/red] для --ssh нужен --path")
                 raise typer.Exit(code=2)
-            # db/cache are passed to compose via env in rollout; for wait we only need the URL.
             _wait_core_healthy_remote(
                 console,
                 ssh=ssh,
                 path=path,
-                compose_rel=f"deploy/dev/{compose_file}",
+                compose_rel=compose_rel,
                 timeout_s=timeout,
                 interval_s=interval,
                 health_url=health_url,
@@ -1333,7 +1333,7 @@ def register(app: typer.Typer) -> None:
         path: str | None = typer.Option(
             None, "--path", help="remote path с compose (по умолчанию из config)"
         ),
-        mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
+        mode: str | None = typer.Option(None, "--mode", help=_MODE_HELP),
     ) -> None:
         """Логи core-runtime (docker compose logs)."""
         console = Console()
@@ -1341,18 +1341,18 @@ def register(app: typer.Typer) -> None:
         src = _resolve_source(console)
         cfg = Config.load()
         mode = (mode or cfg.deploy.core_mode).strip().lower()
-        if mode not in {"dev", "image"}:
-            console.print("[red]Ошибка:[/red] --mode должен быть dev или image")
+        if mode not in VALID_MODES:
+            console.print(f"[red]Ошибка:[/red] --mode {mode!r} недопустим. Допустимые: {' | '.join(sorted(VALID_MODES))}")
             raise typer.Exit(code=2)
         ssh = ssh if ssh is not None else (cfg.deploy.ssh or None)
         path = path if path is not None else (cfg.deploy.path or None)
-        compose_file = "docker-compose.image.yml" if mode == "image" else "docker-compose.yml"
+        compose_rel = src.compose_rel(mode)
 
         args = [
             "docker",
             "compose",
             "-f",
-            f"deploy/dev/{compose_file}",
+            compose_rel,
             "logs",
             "--tail",
             str(tail),
@@ -1394,7 +1394,7 @@ def register(app: typer.Typer) -> None:
         path: str | None = typer.Option(
             None, "--path", help="remote path (по умолчанию из config)"
         ),
-        mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
+        mode: str | None = typer.Option(None, "--mode", help=_MODE_HELP),
         wait: bool = typer.Option(True, "--wait/--no-wait", help="Дождаться healthy после rollout"),
         timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
         interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),

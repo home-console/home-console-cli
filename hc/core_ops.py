@@ -9,7 +9,7 @@ import typer
 from rich.console import Console
 
 from hc.config import Config
-from hc.core_source import CoreSource
+from hc.core_source import VALID_MODES, CoreSource
 from hc.env_bootstrap import ensure_core_env
 from hc.errors import DockerNotFoundError, HcCliError
 
@@ -36,12 +36,20 @@ def compose_project_from_source(console: Console, src: CoreSource, mode: str | N
     ensure_core_env(console, src.path)
     if mode is None:
         mode = Config.load().recovery.mode
-    compose = src.compose_file(mode=mode)
+    try:
+        compose = src.compose_file(mode=mode)
+    except ValueError as exc:
+        valid = " | ".join(sorted(VALID_MODES))
+        raise HcCliError(
+            message=str(exc),
+            exit_code=2,
+            hint=f"Допустимые режимы: {valid}",
+        ) from exc
     if not compose.exists():
         raise HcCliError(
-            message=f"Не найден docker-compose файл: {compose}",
+            message=f"Не найден compose-файл: {compose}",
             exit_code=1,
-            hint="Проверь `--mode` и наличие `deploy/dev/docker-compose*.yml` в исходниках Core.",
+            hint=f"Режим {mode!r} → {src.compose_rel(mode)}. Проверь наличие файла в core-runtime-service.",
         )
     return ComposeProject(compose_file=compose)
 

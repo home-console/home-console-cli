@@ -26,16 +26,23 @@ class DisplayConfig:
 
 @dataclass(slots=True)
 class RecoveryConfig:
-    # dev: compose c build (docker-compose.yml)
-    # image: compose c image (docker-compose.image.yml)
+    # Режим compose для `hc core up/down/logs` (локальная разработка / recovery).
+    # dev        → deploy/dev/docker-compose.yml          (build из src)
+    # dev-reload → deploy/dev/docker-compose.reload.yml   (build + hot-reload)
+    # dev-image  → deploy/dev/docker-compose.image.yml    (образ + dev-инфра)
+    # prod       → deploy/prod/docker-compose.image.yml   (образ из registry)
     mode: str = "dev"
 
 
 @dataclass(slots=True)
 class DeployConfig:
-    # defaults for `hc deploy core ...`
+    # Режим compose для `hc deploy core ...` (deploy-пайплайн: build→push→rollout).
+    # dev-image  → deploy/dev/docker-compose.image.yml    (образ + dev-инфра)
+    # prod       → deploy/prod/docker-compose.image.yml   (образ из registry, PROD!)
+    # dev        → deploy/dev/docker-compose.yml          (build из src; только local)
+    # dev-reload → deploy/dev/docker-compose.reload.yml   (hot-reload; только local)
     core_image: str = "dev-core-runtime"
-    core_mode: str = "image"  # dev|image
+    core_mode: str = "dev-image"  # dev | dev-reload | dev-image | prod
     ssh: str = ""  # user@host
     path: str = ""  # remote path with compose
 
@@ -74,7 +81,7 @@ class Config:
             ),
             deploy=DeployConfig(
                 core_image=str(deploy.get("core_image", "dev-core-runtime")),
-                core_mode=str(deploy.get("core_mode", "image")),
+                core_mode=str(deploy.get("core_mode", "dev-image")),
                 ssh=str(deploy.get("ssh", "")),
                 path=str(deploy.get("path", "")),
             ),
