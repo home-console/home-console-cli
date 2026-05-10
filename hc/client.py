@@ -203,15 +203,27 @@ class HCClient:
             return None
         return None
 
-    async def _request_json_absolute(self, method: str, path: str, **kwargs: Any) -> Any:
-        """Request by absolute path (no /api prefix)."""
-        resp = await self._do_request(method, path, timeout=10.0, **kwargs)
+    async def _request_json_absolute(
+        self,
+        method: str,
+        path: str,
+        *,
+        http_timeout: float = 10.0,
+        return_error_json: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Request by absolute path (no /api prefix).
+
+        ``http_timeout`` — таймаут HTTP в секундах.
+        Если ``return_error_json`` и тело ошибки JSON-объект — вернуть его (иначе ``None``).
+        """
+        resp = await self._do_request(method, path, timeout=http_timeout, **kwargs)
         if resp is None:
             return None
 
         if resp.status_code == 401:
             if await self._try_refresh():
-                resp = await self._do_request(method, path, timeout=10.0, **kwargs)
+                resp = await self._do_request(method, path, timeout=http_timeout, **kwargs)
                 if resp is None:
                     return None
                 if not resp.is_error:
@@ -226,11 +238,77 @@ class HCClient:
             self._auth_hint(403)
             return None
         if resp.is_error:
+            if return_error_json:
+                try:
+                    err_obj = resp.json()
+                    return err_obj if isinstance(err_obj, dict) else None
+                except ValueError:
+                    return {
+                        "ok": False,
+                        "error": (resp.text or "").strip() or f"HTTP {resp.status_code}",
+                    }
             return None
         try:
             return resp.json()
         except ValueError:
             return {"raw": resp.text}
+
+    async def _post_multipart_absolute(
+        self,
+        path: str,
+        *,
+        files: dict[str, Any],
+        data: dict[str, str] | None,
+        http_timeout: float = 300.0,
+        return_error_json: bool = True,
+    ) -> Any:
+        """POST multipart without forcing JSON Content-Type (для install-upload)."""
+        console = Console()
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(
+                    base_url=self.base_url, timeout=http_timeout, verify=self.verify_ssl
+                ) as client:
+                    resp = await client.post(
+                        path,
+                        headers=dict(self._headers()),
+                        files=files,
+                        data=data,
+                    )
+            except httpx.ConnectError:
+                hostport = self.base_url.replace("http://", "").replace("https://", "")
+                console.print(f"[red]Ошибка: Core недоступен на {hostport}[/red]")
+                return None
+            except httpx.RequestError as e:
+                console.print(f"[red]Ошибка: {e}[/red]")
+                return None
+
+            if resp.status_code == 401 and attempt == 0 and await self._try_refresh():
+                continue
+
+            if resp.status_code == 401:
+                self._expired_session_hint()
+                return None
+            if resp.status_code == 403:
+                self._auth_hint(403)
+                return None
+            if resp.is_error:
+                if return_error_json:
+                    try:
+                        err_obj = resp.json()
+                        return err_obj if isinstance(err_obj, dict) else None
+                    except ValueError:
+                        return {
+                            "ok": False,
+                            "error": (resp.text or "").strip() or f"HTTP {resp.status_code}",
+                        }
+                return None
+            try:
+                return resp.json()
+            except ValueError:
+                return {"raw": resp.text}
+
+        return None
 
     async def _stream_sse(self, path: str, **kwargs: Any) -> AsyncGenerator[str, None]:
         console = Console()
@@ -426,6 +504,59 @@ class HCClient:
     async def reload_plugin(self, name: str) -> dict[str, Any] | None:
         data = await self._request_json_absolute("POST", endpoints.PLUGIN_RELOAD.format(name=name))
         return data if isinstance(data, dict) else None
+
+    async def admin_marketplace_install_archive(
+        self,
+        archive_path: str,
+        *,
+        sha256: str | None = None,
+        http_timeout: float = 300.0,
+    ) -> dict[str, Any] | None:
+        """
+        Установка плагина из архива через операцию ядра ``marketplace.install``.
+
+        Важно: ``archive_path`` — путь **на машине (или в контейнере), где работает Core**,
+        а не обязательно на хосте, с которого вы вызываете ``hc``.
+        """
+        body: dict[str, Any] = {"archive_path": archive_path}
+        if sha256:
+            body["sha256"] = sha256
+        data = await self._request_json_absolute(
+            "POST",
+            endpoints.ADMIN_MARKETPLACE_INSTALL,
+            json=body,
+            http_timeout=http_timeout,
+            return_error_json=True,
+        )
+        return data if isinstance(data, dict) else None
+
+    async def admin_marketplace_install_upload_archive(
+        self,
+        local_path: str | Any,
+        *,
+        sha256: str | None = None,
+        http_timeout: float = 300.0,
+    ) -> dict[str, Any] | None:
+        """Загрузить архив с локального диска и установить через ``install-upload`` (multipart)."""
+        from pathlib import Path as PathClass
+
+        p = PathClass(local_path)
+        if not p.is_file():
+            Console().print(f"[red]Файл не найден: {p}[/red]")
+            return None
+
+        data_form: dict[str, str] | None = {"sha256": sha256} if sha256 else None
+
+        with p.open("rb") as fh:
+            files = {"file": (p.name, fh, "application/octet-stream")}
+            raw = await self._post_multipart_absolute(
+                endpoints.ADMIN_MARKETPLACE_INSTALL_UPLOAD,
+                files=files,
+                data=data_form,
+                http_timeout=http_timeout,
+                return_error_json=True,
+            )
+        return raw if isinstance(raw, dict) else None
 
     async def restart_plugin_container(self, name: str) -> dict[str, Any] | None:
         data = await self._request_json_absolute(

@@ -23,6 +23,10 @@ ADMIN_AUTH_SESSIONS = "/api/v1/admin/auth/sessions"
 ADMIN_AUTH_SESSIONS_REVOKE = "/api/v1/admin/auth/sessions/revoke"
 ADMIN_AUTH_SESSIONS_REVOKE_ALL = "/api/v1/admin/auth/sessions/revoke-all"
 
+# Marketplace admin — archive_path должен быть доступен процессу Core на сервере
+ADMIN_MARKETPLACE_INSTALL = "/api/v1/admin/marketplace/install"
+ADMIN_MARKETPLACE_INSTALL_UPLOAD = "/api/v1/admin/marketplace/install-upload"
+
 # Auth v1
 AUTH_BOOTSTRAP = "/api/v1/auth/bootstrap"
 AUTH_INITIALIZE = "/api/v1/auth/initialize"
