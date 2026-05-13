@@ -35,25 +35,25 @@ AUTH_LOGOUT = "/api/v1/auth/logout"
 AUTH_REFRESH = "/api/v1/auth/refresh"
 AUTH_ME = "/api/v1/auth/me"
 
-# Plugins
-PLUGINS = "/api/v1/plugins"
-PLUGIN = "/api/v1/plugins/{name}"
-PLUGIN_INSTALL = "/api/v1/plugins/{name}/install"
-PLUGIN_START = "/api/v1/plugins/{name}/start"
-PLUGIN_STOP = "/api/v1/plugins/{name}/stop"
+# Plugins (пути относительно префикса из API_PREFIX_CANDIDATES: /api или /api/v1)
+PLUGINS = "/plugins"
+PLUGIN = "/plugins/{name}"
+PLUGIN_INSTALL = "/plugins/{name}/install"
+PLUGIN_START = "/plugins/{name}/start"
+PLUGIN_STOP = "/plugins/{name}/stop"
 PLUGIN_RELOAD = "/api/v1/admin/plugins/{name}/reload"
 PLUGIN_RESTART_CONTAINER = "/api/v1/admin/plugins/{name}/restart-container"
 
-# Modules
-MODULES = "/api/v1/modules"
-MODULE_START = "/api/v1/modules/{name}/start"
-MODULE_STOP = "/api/v1/modules/{name}/stop"
-MODULE_RESTART = "/api/v1/modules/{name}/restart"
+# Modules (так же относительно префикса)
+MODULES = "/modules"
+MODULE_START = "/modules/{name}/start"
+MODULE_STOP = "/modules/{name}/stop"
+MODULE_RESTART = "/modules/{name}/restart"
 
 # Logs
-LOGS = "/api/v1/logs"
+LOGS = "/logs"
 
 # Marketplace
-MARKETPLACE_INDEX = "/api/v1/marketplace/index"
-MARKETPLACE_SEARCH = "/api/v1/marketplace/search"
+MARKETPLACE_INDEX = "/marketplace/index"
+MARKETPLACE_SEARCH = "/marketplace/search"
 

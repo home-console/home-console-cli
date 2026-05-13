@@ -8,6 +8,14 @@ from tomlkit import document, parse
 from hc.constants import CONFIG_DIR, CONFIG_PATH, DEFAULT_CORE_IMAGE, DEFAULT_HOST, DEFAULT_PORT
 
 
+def normalize_deploy_core_mode(mode: str) -> str:
+    """Синонимы для deploy.core_mode: `image` совпадает с `hc update --mode image`, не с compose-режимами deploy."""
+    m = mode.strip().lower()
+    if m == "image":
+        return "dev-image"
+    return m
+
+
 @dataclass(slots=True)
 class CoreConfig:
     host: str = DEFAULT_HOST
@@ -63,7 +71,10 @@ class Config:
         display = data.get("display", {})
         recovery = data.get("recovery", {})
         deploy = data.get("deploy", {})
-        return cls(
+        raw_core_mode = str(deploy.get("core_mode", "dev-image"))
+        core_mode = normalize_deploy_core_mode(raw_core_mode)
+        migrate_legacy_image = raw_core_mode.strip().lower() == "image"
+        inst = cls(
             core=CoreConfig(
                 host=str(core.get("host", DEFAULT_HOST)),
                 port=int(core.get("port", DEFAULT_PORT)),
@@ -81,11 +92,14 @@ class Config:
             ),
             deploy=DeployConfig(
                 core_image=str(deploy.get("core_image", DEFAULT_CORE_IMAGE)),
-                core_mode=str(deploy.get("core_mode", "dev-image")),
+                core_mode=core_mode,
                 ssh=str(deploy.get("ssh", "")),
                 path=str(deploy.get("path", "")),
             ),
         )
+        if migrate_legacy_image and CONFIG_PATH.exists():
+            inst.save()
+        return inst
 
     def save(self) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)

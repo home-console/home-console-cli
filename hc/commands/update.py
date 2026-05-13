@@ -11,9 +11,9 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from hc.config import Config
+from hc.config import Config, normalize_deploy_core_mode
 from hc.core_ops import compose_project_from_source, require_docker
-from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local
+from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local, VALID_MODES
 from hc.errors import (
     CoreSourcesNotFoundError,
     HealthyTimeoutError,
@@ -45,6 +45,34 @@ def _resolve_source(console: Console) -> CoreSource:
         exit_code=1,
         hint="Сделай `hc core init` (скачает в ~/.local/share/hc) или запусти из монорепы.",
     )
+
+
+_UPDATE_MODE_HELP = (
+    "как deploy.core_mode: dev | dev-reload | dev-image | prod "
+    "(алиас: image → dev-image; по умолчанию из config)"
+)
+
+
+def _compose_rel_for_remote_update(deploy_mode: str) -> str:
+    """Compose под deploy/dev для SSH (как раньше: build-стек vs image-стек)."""
+    fname = (
+        "docker-compose.image.yml"
+        if deploy_mode in {"dev-image", "prod"}
+        else "docker-compose.yml"
+    )
+    return f"deploy/dev/{fname}"
+
+
+def _resolve_update_deploy_mode(mode: str | None, cfg: Config) -> str:
+    deploy_mode = normalize_deploy_core_mode(mode or cfg.deploy.core_mode)
+    if deploy_mode not in VALID_MODES:
+        valid = " | ".join(sorted(VALID_MODES))
+        raise InvalidModeError(
+            message=f"--mode {deploy_mode!r} недопустим.",
+            exit_code=2,
+            hint=f"Допустимые: {valid} (алиас image → dev-image, см. `hc deploy config show`).",
+        )
+    return deploy_mode
 
 
 def _run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
@@ -169,7 +197,7 @@ def register(app: typer.Typer) -> None:
         ctx: typer.Context,
         tag: str = typer.Option("latest", "--tag", help="Тег (по умолчанию latest)"),
         image: str | None = typer.Option(None, "--image", help="Имя image без тега (по умолчанию из config)"),
-        mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
+        mode: str | None = typer.Option(None, "--mode", help=_UPDATE_MODE_HELP),
         ssh: str | None = typer.Option(None, "--ssh", help="user@host для удалённого update (по умолчанию из config)"),
         path: str | None = typer.Option(None, "--path", help="remote path с compose (для --ssh, по умолчанию из config)"),
         wait: bool = typer.Option(True, "--wait/--no-wait", help="Дождаться healthy после update (по умолчанию да)"),
@@ -207,7 +235,7 @@ def register(app: typer.Typer) -> None:
     def update_core(
         image: str | None = typer.Option(None, "--image", help="Имя image без тега (по умолчанию из config)"),
         tag: str = typer.Option("latest", "--tag", help="Тег"),
-        mode: str | None = typer.Option(None, "--mode", help="dev|image (по умолчанию из config)"),
+        mode: str | None = typer.Option(None, "--mode", help=_UPDATE_MODE_HELP),
         ssh: str | None = typer.Option(None, "--ssh", help="user@host для удалённого rollout"),
         path: str | None = typer.Option(None, "--path", help="remote path с compose (для --ssh)"),
         wait: bool = typer.Option(True, "--wait/--no-wait", help="Дождаться healthy после update"),
@@ -230,22 +258,18 @@ def register(app: typer.Typer) -> None:
             cfg = Config.load()
 
             image = (image or cfg.deploy.core_image).strip()
-            mode = (mode or cfg.deploy.core_mode).strip().lower()
-            if mode not in {"dev", "image"}:
-                raise InvalidModeError(
-                    message="--mode должен быть dev или image.",
-                    exit_code=2,
-                    hint="Пример: `hc update core --mode dev` или `hc update core --mode image`.",
-                )
+            deploy_mode = _resolve_update_deploy_mode(mode, cfg)
             ssh = ssh if ssh is not None else (cfg.deploy.ssh or None)
             path = path if path is not None else (cfg.deploy.path or None)
 
             full = f"{image}:{tag}"
-            compose_file = "docker-compose.image.yml" if mode == "image" else "docker-compose.yml"
+            compose_rel_remote = _compose_rel_for_remote_update(deploy_mode)
             target = f"remote {ssh}" if ssh else "local"
 
             if not quiet and not json_out:
-                console.print(Panel.fit(f"{full}\nmode={mode}\ntarget={target}", title="hc update core"))
+                console.print(
+                    Panel.fit(f"{full}\nmode={deploy_mode}\ntarget={target}", title="hc update core")
+                )
 
             steps: list[dict[str, object]] = []
 
@@ -257,9 +281,9 @@ def register(app: typer.Typer) -> None:
                 remote = (
                     f"cd {shlex.quote(path)} && "
                     f"CORE_RUNTIME_IMAGE={shlex.quote(full)} "
-                    f"docker compose -f deploy/dev/{compose_file} pull core-runtime && "
+                    f"docker compose -f {shlex.quote(compose_rel_remote)} pull core-runtime && "
                     f"CORE_RUNTIME_IMAGE={shlex.quote(full)} "
-                    f"docker compose -f deploy/dev/{compose_file} up -d"
+                    f"docker compose -f {shlex.quote(compose_rel_remote)} up -d"
                 )
                 _run(["ssh", ssh, remote])
                 dt = time.monotonic() - t0
@@ -272,7 +296,7 @@ def register(app: typer.Typer) -> None:
                         console,
                         ssh=ssh,
                         path=path,
-                        compose_rel=f"deploy/dev/{compose_file}",
+                        compose_rel=compose_rel_remote,
                         timeout_s=timeout,
                         interval_s=interval,
                         health_url=health_url,
@@ -280,7 +304,7 @@ def register(app: typer.Typer) -> None:
                     dtw = time.monotonic() - t0
                     steps.append({"name": "wait", "ok": True, "duration_s": dtw})
             else:
-                project = compose_project_from_source(console, src, mode=mode)
+                project = compose_project_from_source(console, src, mode=deploy_mode)
                 env = {**os.environ, "CORE_RUNTIME_IMAGE": full}
                 t0 = time.monotonic()
                 _run(
@@ -314,7 +338,7 @@ def register(app: typer.Typer) -> None:
                     "image": image,
                     "tag": tag,
                     "full": full,
-                    "mode": mode,
+                    "mode": deploy_mode,
                     "target": target,
                     "wait": bool(wait),
                     "timeout_s": int(timeout),

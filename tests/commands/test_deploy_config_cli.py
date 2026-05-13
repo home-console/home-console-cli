@@ -35,6 +35,37 @@ def test_deploy_config_set_accepts_prod_core_mode(runner: CliRunner, isolated_ho
     assert r.exit_code == 0
 
 
+def test_deploy_config_set_core_mode_image_alias(runner: CliRunner, isolated_home) -> None:
+    from hc.main import app
+
+    r = runner.invoke(app, ["deploy", "config", "set", "--core-mode", "image"])
+    assert r.exit_code == 0
+    r2 = runner.invoke(app, ["deploy", "config", "show"])
+    assert r2.exit_code == 0
+    assert "dev-image" in r2.output
+
+
+def test_deploy_config_edit_opens_editor(runner: CliRunner, isolated_home, monkeypatch) -> None:
+    import subprocess
+
+    recorded: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kw):  # noqa: ANN003
+        recorded.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setenv("EDITOR", "true")
+    monkeypatch.setattr("hc.commands.deploy.subprocess.run", fake_run)
+    from hc.main import app
+    import hc.constants as constants
+
+    r = runner.invoke(app, ["deploy", "config", "edit"])
+    assert r.exit_code == 0
+    assert recorded
+    assert recorded[0][0] == "true"
+    assert str(constants.CONFIG_PATH) in recorded[0]
+
+
 def test_deploy_config_set_roundtrip(runner: CliRunner, isolated_home) -> None:
     from hc.main import app
 

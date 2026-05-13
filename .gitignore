@@ -22,3 +22,6 @@ env/
 
 # backups
 backups/
+
+# pytest
+.pytest_cache/

@@ -1,0 +1,77 @@
+name: Publish Python package
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+    branches:
+      - master
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Detect package directory
+        id: detect
+        run: |
+          if [ -f "setup.py" ] || [ -f "pyproject.toml" ]; then
+            PKG_DIR='.'
+          elif [ -f "sdk/python/setup.py" ] || [ -f "sdk/python/pyproject.toml" ]; then
+            PKG_DIR='sdk/python'
+          else
+            echo "ERROR: cannot find setup.py or pyproject.toml in repo root or sdk/python"
+            exit 1
+          fi
+          echo "PKG_DIR=$PKG_DIR" >> $GITHUB_ENV
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Build package
+        run: |
+          python -m build "$PKG_DIR"
+
+      - name: Configure .pypirc for PyPI
+        run: |
+          {
+            echo "[distutils]"
+            echo "index-servers ="
+            echo "    pypi"
+            echo ""
+            echo "[pypi]"
+            echo "repository: https://upload.pypi.org/legacy/"
+            echo "username: __token__"
+            echo "password: $PYPI_API_TOKEN"
+          } > "$HOME/.pypirc"
+          echo "Wrote $HOME/.pypirc"
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Publish to PyPI
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "$PYPI_API_TOKEN" ]; then
+            echo "PYPI_API_TOKEN not set — skipping PyPI publish"
+            exit 0
+          fi
+          python -m twine upload --repository pypi $PKG_DIR/dist/*

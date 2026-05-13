@@ -11,8 +11,13 @@ def runner() -> CliRunner:
 
 def test_plugin_list(monkeypatch, runner: CliRunner) -> None:
     class _Client:
-        async def get_plugins(self):  # noqa: ANN001
-            return [{"name": "p1", "version": "1", "status": "running", "mode": "x", "uptime": "1s"}]
+        async def inspector_plugins(self):  # noqa: ANN001
+            return {
+                "ok": True,
+                "result": [
+                    {"name": "p1", "version": "1", "status": "running", "mode": "x", "uptime": "1s"}
+                ],
+            }
 
     monkeypatch.setattr("hc.commands.plugin.require_client", lambda console: _Client())
     from hc.main import app

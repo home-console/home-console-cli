@@ -12,7 +12,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from hc.config import Config
+from hc.config import Config, normalize_deploy_core_mode
 from hc.core_ops import compose_project_from_source, require_docker
 from hc.core_source import (
     IMAGE_MODES,
@@ -29,7 +29,10 @@ from hc.errors import (
     json_error_payload,
 )
 
-_MODE_HELP = "dev | dev-reload | dev-image | prod  (по умолчанию из config)"
+_MODE_HELP = (
+    "dev | dev-reload | dev-image | prod  (по умолчанию из config; "
+    "алиас image → dev-image)"
+)
 _DEPLOY_MODE_HELP = _MODE_HELP
 
 
@@ -445,7 +448,7 @@ def register(app: typer.Typer) -> None:
             cfg = Config.load()
 
             resolved_image = (image or cfg.deploy.core_image).strip()
-            resolved_mode = (mode or cfg.deploy.core_mode).strip().lower()
+            resolved_mode = normalize_deploy_core_mode(mode or cfg.deploy.core_mode)
             if resolved_mode not in VALID_MODES:
                 raise InvalidModeError(
                     message=f"--mode {resolved_mode!r} недопустим.",
@@ -1067,14 +1070,42 @@ def register(app: typer.Typer) -> None:
     @cfg_app.command("show")
     def cfg_show() -> None:
         console = Console()
+        from hc.constants import CONFIG_PATH
+
         cfg = Config.load()
         body = (
             f"deploy.core_image = {cfg.deploy.core_image}\n"
             f"deploy.core_mode  = {cfg.deploy.core_mode}\n"
             f"deploy.ssh        = {cfg.deploy.ssh or '(empty)'}\n"
             f"deploy.path       = {cfg.deploy.path or '(empty)'}\n"
+            f"\nфайл: {CONFIG_PATH}\n"
         )
         console.print(Panel.fit(body, title="hc deploy config"))
+
+    @cfg_app.command("edit")
+    def cfg_edit() -> None:
+        """Открыть config.toml в $EDITOR или $VISUAL (полный конфиг hc, не только deploy)."""
+        console = Console()
+        from hc.constants import CONFIG_PATH
+
+        if not CONFIG_PATH.exists():
+            Config.load().save()
+        editor = (os.environ.get("VISUAL") or os.environ.get("EDITOR") or "").strip()
+        if not editor:
+            for cand in ("nvim", "vim", "nano", "micro"):
+                if shutil.which(cand):
+                    editor = cand
+                    break
+        if not editor:
+            console.print("[red]Ошибка:[/red] не задан редактор. Укажи переменную EDITOR или VISUAL.")
+            console.print(f"[dim]Файл:[/dim] {CONFIG_PATH}")
+            raise typer.Exit(code=2)
+        cmd = [*shlex.split(editor), str(CONFIG_PATH)]
+        p = subprocess.run(cmd, check=False)  # noqa: S603
+        if p.returncode != 0:
+            console.print(f"[yellow]Редактор завершился с кодом {p.returncode}[/yellow]")
+            raise typer.Exit(code=p.returncode)
+        console.print("[green]✓[/green] редактор закрыт")
 
     @cfg_app.command("set")
     def cfg_set(
@@ -1090,7 +1121,7 @@ def register(app: typer.Typer) -> None:
         if core_image is not None:
             cfg.deploy.core_image = core_image.strip()
         if core_mode is not None:
-            m = core_mode.strip().lower()
+            m = normalize_deploy_core_mode(core_mode)
             if m not in VALID_MODES:
                 console.print(f"[red]Ошибка:[/red] --core-mode {m!r} недопустим. Допустимые: {' | '.join(sorted(VALID_MODES))}")
                 raise typer.Exit(code=2)
@@ -1198,7 +1229,7 @@ def register(app: typer.Typer) -> None:
         src = _resolve_source(console)
         cfg = Config.load()
         image = (image or cfg.deploy.core_image).strip()
-        mode = (mode or cfg.deploy.core_mode).strip().lower()
+        mode = normalize_deploy_core_mode(mode or cfg.deploy.core_mode)
         if mode not in VALID_MODES:
             console.print(f"[red]Ошибка:[/red] --mode {mode!r} недопустим. Допустимые: {' | '.join(sorted(VALID_MODES))}")
             raise typer.Exit(code=2)
@@ -1301,7 +1332,7 @@ def register(app: typer.Typer) -> None:
         src = _resolve_source(console)
         cfg = Config.load()
         image = (image or cfg.deploy.core_image).strip()
-        mode = (mode or cfg.deploy.core_mode).strip().lower()
+        mode = normalize_deploy_core_mode(mode or cfg.deploy.core_mode)
         if mode not in VALID_MODES:
             console.print(f"[red]Ошибка:[/red] --mode {mode!r} недопустим. Допустимые: {' | '.join(sorted(VALID_MODES))}")
             raise typer.Exit(code=2)
@@ -1351,7 +1382,7 @@ def register(app: typer.Typer) -> None:
         require_docker(console)
         src = _resolve_source(console)
         cfg = Config.load()
-        mode = (mode or cfg.deploy.core_mode).strip().lower()
+        mode = normalize_deploy_core_mode(mode or cfg.deploy.core_mode)
         if mode not in VALID_MODES:
             console.print(f"[red]Ошибка:[/red] --mode {mode!r} недопустим. Допустимые: {' | '.join(sorted(VALID_MODES))}")
             raise typer.Exit(code=2)
