@@ -20,6 +20,7 @@ class HCClient:
     auth: str = "auto"  # auto|bearer|api-key
     refresh_token: str = ""
     on_token_refreshed: Callable[[str], None] | None = field(default=None)
+    silent_connect: bool = False  # suppress "Core недоступен" during background probes
 
     def _auth_hint(self, status_code: int) -> None:
         console = Console()
@@ -59,11 +60,13 @@ class HCClient:
             ) as client:
                 return await client.request(method, path, headers=self._headers(), **kwargs)
         except httpx.ConnectError:
-            hostport = self.base_url.replace("http://", "").replace("https://", "")
-            console.print(f"[red]Ошибка: Core недоступен на {hostport}[/red]")
+            if not self.silent_connect:
+                hostport = self.base_url.replace("http://", "").replace("https://", "")
+                console.print(f"[red]Ошибка: Core недоступен на {hostport}[/red]")
             return None
         except httpx.RequestError as e:
-            console.print(f"[red]Ошибка: {e}[/red]")
+            if not self.silent_connect:
+                console.print(f"[red]Ошибка: {e}[/red]")
             return None
 
     async def _try_refresh(self) -> bool:

@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 APP_NAME = "HomeConsole CLI"
-APP_VERSION = "1.0"
 ENV_TOKEN = "HC_TOKEN"
 
 CONFIG_DIR = Path.home() / ".config" / "hc"

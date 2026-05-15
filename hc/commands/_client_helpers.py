@@ -11,9 +11,10 @@ from hc.config import Config
 
 
 def _mute_auth_hints(client: HCClient) -> HCClient:
-    # Capabilities probe / фоновые операции не должны спамить подсказками при 403.
+    # Фоновые проbes не должны спамить ни auth-подсказками, ни "Core недоступен".
     client._auth_hint = lambda *a, **kw: None  # type: ignore[attr-defined]
     client._expired_session_hint = lambda: None  # type: ignore[attr-defined]
+    client.silent_connect = True
     return client
 
 

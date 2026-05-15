@@ -14,6 +14,7 @@ from rich.console import Console
 
 from typer.main import get_command as _typer_get_command
 
+from hc import __version__
 from hc.config import Config
 from hc.constants import APP_NAME, HISTORY_PATH
 from hc.commands._client_helpers import require_client
@@ -229,32 +230,30 @@ def run_repl(app: typer.Typer) -> None:
     console = Console()
     cfg = Config.load()
     token = os.getenv("HC_TOKEN") or cfg.core.token
-    connected = bool(cfg.core.host.strip()) and bool(token.strip())
+    cfg_ok = bool(cfg.core.host.strip()) and bool(token.strip())
     hostport = f"{cfg.core.host}:{cfg.core.port}"
 
     plugins: list[str] = []
-    if connected:
-        client = require_client(console)
+    connected = False
+    if cfg_ok:
+        client = require_client(console, silent=True)
 
-        async def _get_names() -> list[str]:
+        async def _get_names() -> tuple[bool, list[str]]:
             # Пытаемся получить имена плагинов из inspector (админский источник истины).
             insp = await client.inspector_plugins()
             if isinstance(insp, dict):
                 arr = insp.get("plugins") or []
                 if isinstance(arr, list):
-                    names = []
-                    for p in arr:
-                        if isinstance(p, dict) and p.get("name"):
-                            names.append(str(p["name"]))
+                    names = [str(p["name"]) for p in arr if isinstance(p, dict) and p.get("name")]
                     if names:
-                        return names
+                        return True, names
             # Fallback на старый эндпоинт (если он есть).
             items = await client.get_plugins()
-            if not items:
-                return []
-            return [str(p.get("name", "")) for p in items if p.get("name")]
+            if items is not None:
+                return True, [str(p.get("name", "")) for p in items if p.get("name")]
+            return False, []
 
-        plugins = anyio.run(_get_names)
+        connected, plugins = anyio.run(_get_names)
 
     commands = [
         "connect",
@@ -290,7 +289,13 @@ def run_repl(app: typer.Typer) -> None:
 
     completer = _HCCompleter(app=app, commands=commands, plugins=plugins, get_group_ctx=_get_ctx)
 
-    console.print(f"{APP_NAME} 0.0.1 | " + (f"connected to {hostport}" if connected else "not connected"))
+    if connected:
+        status = f"connected to {hostport}"
+    elif cfg_ok:
+        status = f"offline • configured for {hostport}"
+    else:
+        status = "not connected"
+    console.print(f"{APP_NAME} {__version__} | {status}")
     console.print("Type 'help' or '?' for commands, 'exit' to quit")
 
     HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
