@@ -81,6 +81,28 @@ def _run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None 
         raise typer.Exit(code=p.returncode)
 
 
+def _run_pull(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    image: str,
+) -> None:
+    """docker compose pull с понятной подсказкой при ошибке авторизации."""
+    p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=False)  # noqa: S603
+    if p.returncode != 0:
+        registry = image.split("/")[0] if "/" in image else "ghcr.io"
+        raise HcCliError(
+            message=f"Не удалось загрузить образ {image}",
+            hint=(
+                f"Образ недоступен (denied / unauthorized).\n"
+                f"  Авторизуйся в реестре:\n"
+                f"  docker login {registry} -u <github_username> -p <PAT_read:packages>"
+            ),
+            exit_code=p.returncode,
+        )
+
+
 def _fmt_s(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.1f}s"
@@ -307,10 +329,11 @@ def register(app: typer.Typer) -> None:
                 project = compose_project_from_source(console, src, mode=deploy_mode)
                 env = {**os.environ, "CORE_RUNTIME_IMAGE": full}
                 t0 = time.monotonic()
-                _run(
+                _run_pull(
                     ["docker", "compose", "-f", str(project.compose_file), "pull", "core-runtime"],
                     cwd=project.cwd,
                     env=env,
+                    image=full,
                 )
                 _run(["docker", "compose", "-f", str(project.compose_file), "up", "-d"], cwd=project.cwd, env=env)
                 dt = time.monotonic() - t0

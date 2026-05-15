@@ -106,6 +106,28 @@ def _run_env(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | N
         raise typer.Exit(code=p.returncode)
 
 
+def _run_pull(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    image: str,
+) -> None:
+    """docker compose pull с понятной подсказкой при ошибке авторизации."""
+    p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=False)  # noqa: S603
+    if p.returncode != 0:
+        registry = image.split("/")[0] if "/" in image else "ghcr.io"
+        raise HcCliError(
+            message=f"Не удалось загрузить образ {image}",
+            hint=(
+                f"Образ недоступен (denied / unauthorized).\n"
+                f"  Авторизуйся в реестре:\n"
+                f"  docker login {registry} -u <github_username> -p <PAT_read:packages>"
+            ),
+            exit_code=p.returncode,
+        )
+
+
 def _copy_dir_contents(src: Path, dst: Path) -> None:
     if dst.exists():
         shutil.rmtree(dst)
@@ -707,10 +729,11 @@ def register(app: typer.Typer) -> None:
             env = {**os.environ, "PLATFORM_IMAGE": full_image}
             console.print(f"[cyan]→[/cyan] Deploy platform image [bold]{full_image}[/bold]")
             if start:
-                _run_env(
+                _run_pull(
                     ["docker", "compose", "-f", str(compose_file), "pull", "platform-web"],
                     cwd=platform_root,
                     env=env,
+                    image=full_image,
                 )
                 _run_env(
                     ["docker", "compose", "-f", str(compose_file), "up", "-d"],
@@ -1477,10 +1500,11 @@ def register(app: typer.Typer) -> None:
         console.print(f"Local rollout: [bold]{full}[/bold]")
         env = {**os.environ, "CORE_RUNTIME_IMAGE": full, **_compose_env_overrides(db=db, cache=cache)}
         if do_pull:
-            _run_env(
+            _run_pull(
                 ["docker", "compose", "-f", str(project.compose_file), "pull", "core-runtime"],
                 cwd=project.cwd,
                 env=env,
+                image=full,
             )
         _run_env(
             ["docker", "compose", "-f", str(project.compose_file), "up", "-d"],

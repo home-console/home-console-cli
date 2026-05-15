@@ -24,6 +24,10 @@ def test_deploy_platform_image_mode_uses_compose_image(
     monkeypatch.setattr(
         "hc.commands.deploy._run_env", lambda cmd, cwd=None, env=None: calls.append((cmd, cwd, env))
     )
+    monkeypatch.setattr(
+        "hc.commands.deploy._run_pull",
+        lambda cmd, cwd=None, env=None, image="": calls.append((cmd, cwd, env)),
+    )
 
     from hc.main import app
 
