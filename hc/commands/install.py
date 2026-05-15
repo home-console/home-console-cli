@@ -16,6 +16,7 @@ def register(app: typer.Typer) -> None:
     def install(
         name: str = typer.Argument(..., help="Имя плагина"),
         version: str | None = typer.Option(None, "--version", help="Желаемая версия"),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Показать план установки без реального выполнения"),
     ) -> None:
         console = Console()
         client = require_client(console)
@@ -53,6 +54,10 @@ def register(app: typer.Typer) -> None:
         table.add_row("Описание", str(info.get("description", "")))
         table.add_row("Зависимости", ", ".join(map(str, deps)) if deps else "-")
         console.print(table)
+
+        if dry_run:
+            console.print("[yellow]Dry run:[/yellow] установка не выполнена")
+            raise typer.Exit(code=0)
 
         if not typer.confirm("Install?", default=False):
             raise typer.Exit(code=0)

@@ -16,6 +16,7 @@ pip install -e .
 
 ```bash
 hc --help
+hc nav
 ```
 
 ## Конфигурация
@@ -74,8 +75,35 @@ hc plugin list
 - `hc deploy` (по умолчанию: build+push+rollout+wait) и `hc deploy ...` (тонкие подкоманды)
 - `hc deploy platform` (локальный dev flow)
 - `hc deploy platform --mode image --image ghcr.io/home-console/platform-home-console --tag latest` (image-only deploy)
+- `hc deploy stack dev` / `hc deploy stack prod` (полный stack для dev/prod)
 - `hc update core ...` (обновление core-runtime до нового image:tag)
 - `hc shell`
+- `hc nav [section ...]` (удобная навигация по командам: `hc nav deploy`, `hc nav deploy dev`)
+
+### Навигация по командам (без запоминания)
+
+```bash
+hc nav
+hc nav deploy
+hc nav deploy dev
+```
+
+Подсказка: на любом уровне можно проваливаться дальше и смотреть доступные разделы.
+
+### Быстрый dev up по профилям
+
+```bash
+hc deploy dev up --profile base
+hc deploy dev up --profile platform
+hc deploy dev up --profile cache
+hc deploy dev up --profile db
+```
+
+Профили:
+- `base` = `core+proxy`
+- `platform` = `core+proxy+platform`
+- `cache` = `core+proxy+platform+cache`
+- `db` = `core+proxy+platform+cache+db`
 
 ### Deploy “одной командой”
 

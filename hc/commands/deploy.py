@@ -34,6 +34,22 @@ _MODE_HELP = (
     "алиас image → dev-image)"
 )
 _DEPLOY_MODE_HELP = _MODE_HELP
+_DEV_PROFILE_SERVICES: dict[str, list[str]] = {
+    "core+proxy": ["core-runtime", "caddy"],
+    "core+proxy+platform": ["core-runtime", "caddy", "platform-web"],
+    "core+proxy+platform+cache": ["core-runtime", "caddy", "platform-web", "redis"],
+    "core+proxy+platform+cache+db": ["core-runtime", "caddy", "platform-web", "redis", "postgres"],
+}
+_DEV_PROFILE_ALIASES: dict[str, str] = {
+    "base": "core+proxy",
+    "platform": "core+proxy+platform",
+    "cache": "core+proxy+platform+cache",
+    "db": "core+proxy+platform+cache+db",
+}
+_STACK_ENV_COMPOSE: dict[str, str] = {
+    "dev": "deploy/dev/docker-compose.image.yml",
+    "prod": "deploy/prod/docker-compose.image.yml",
+}
 
 
 def _find_repo_root() -> Path | None:
@@ -123,6 +139,34 @@ def _normalize_edge_health_path(p: str) -> str:
     if not v.startswith("/"):
         v = "/" + v
     return v
+
+
+def _resolve_dev_profile(profile: str) -> tuple[str, list[str]]:
+    raw = (profile or "").strip().lower()
+    resolved = _DEV_PROFILE_ALIASES.get(raw, raw)
+    if resolved not in _DEV_PROFILE_SERVICES:
+        choices = " | ".join(
+            [*sorted(_DEV_PROFILE_SERVICES.keys()), *sorted(_DEV_PROFILE_ALIASES.keys())]
+        )
+        raise InvalidModeError(
+            message=f"--profile {profile!r} недопустим.",
+            exit_code=2,
+            hint=f"Допустимые профили: {choices}",
+        )
+    return resolved, _DEV_PROFILE_SERVICES[resolved]
+
+
+def _resolve_stack_env(env: str | None, compose_rel: str) -> tuple[str, str]:
+    raw = (env or "prod").strip().lower()
+    if raw not in _STACK_ENV_COMPOSE:
+        raise InvalidModeError(
+            message=f"stack env {env!r} недопустим.",
+            exit_code=2,
+            hint="Допустимые: dev | prod",
+        )
+    default_compose = _STACK_ENV_COMPOSE[raw]
+    resolved_compose = compose_rel if compose_rel.strip() else default_compose
+    return raw, resolved_compose
 
 
 def _wait_http_ok(
@@ -434,6 +478,7 @@ def register(app: typer.Typer) -> None:
         ),
         quiet: bool = typer.Option(False, "--quiet", help="Минимальный вывод (только итог/ошибка)"),
         json_out: bool = typer.Option(False, "--json", help="Машинный вывод в JSON"),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Показать план деплоя без реального выполнения"),
     ) -> None:
         """
         Если запущено как `hc deploy` без подкоманд — выполняет полный пайплайн:
@@ -468,6 +513,23 @@ def register(app: typer.Typer) -> None:
                 console.print(
                     Panel.fit(f"{full}\nmode={resolved_mode}\ntarget={target}", title="hc deploy")
                 )
+
+            if dry_run:
+                from rich.table import Table as _Table
+                plan = _Table(title="Dry run — план деплоя")
+                plan.add_column("Шаг", style="bold")
+                plan.add_column("Действие")
+                if build:
+                    plan.add_row("Build", f"docker build -t {full} <src>")
+                if push:
+                    plan.add_row("Push", f"docker push {full}")
+                if rollout:
+                    plan.add_row("Rollout", f"compose pull + up -d → {target}")
+                if rollout and wait:
+                    plan.add_row("Wait healthy", f"{health_url} (timeout={timeout}s)")
+                console.print(plan)
+                console.print("[yellow]Dry run:[/yellow] деплой не выполнен")
+                raise typer.Exit(code=0)
 
             if build:
                 src = _resolve_source(console)
@@ -591,6 +653,7 @@ def register(app: typer.Typer) -> None:
             "--restart-remote/--no-restart-remote",
             help="После remote sync перезапустить caddy (docker compose restart)",
         ),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Показать план деплоя без реального выполнения"),
     ) -> None:
         """Локально собрать platform web или запустить platform image из GHCR."""
         console = Console()
@@ -605,6 +668,31 @@ def register(app: typer.Typer) -> None:
             if platform_path
             else _resolve_platform_root(console)
         )
+
+        if dry_run:
+            from rich.table import Table as _Table
+            plan = _Table(title="Dry run — план деплоя platform")
+            plan.add_column("Шаг", style="bold")
+            plan.add_column("Действие")
+            plan.add_row("Режим", resolved_mode)
+            plan.add_row("Platform root", str(platform_root))
+            if resolved_mode == "image":
+                plan.add_row("Image", f"{image}:{tag}")
+                if start:
+                    plan.add_row("Start", "docker compose pull + up -d")
+            else:
+                if build:
+                    plan.add_row("Build", "pnpm --filter=web build")
+                plan.add_row("Sync dist", str(platform_root / "apps" / "web" / "dist"))
+                if ssh:
+                    plan.add_row("Remote sync", f"rsync dist → {ssh}:{path}/deploy/dev/frontend/")
+                    if restart_remote:
+                        plan.add_row("Restart caddy", f"docker compose restart caddy на {ssh}")
+                elif start:
+                    plan.add_row("Start core", "bash deploy/dev/start.sh")
+            console.print(plan)
+            console.print("[yellow]Dry run:[/yellow] деплой не выполнен")
+            raise typer.Exit(code=0)
 
         if resolved_mode == "image":
             require_docker(console)
@@ -702,6 +790,10 @@ def register(app: typer.Typer) -> None:
 
     @deploy_app.command("stack")
     def deploy_stack(
+        env: str = typer.Argument(
+            "prod",
+            help="Окружение стека: dev | prod (пример: `hc deploy stack dev`)",
+        ),
         core_image: str | None = typer.Option(
             None, "--core-image", help="Core image без тега (по умолчанию из deploy.core_image)"
         ),
@@ -721,9 +813,9 @@ def register(app: typer.Typer) -> None:
             help="remote path к core-runtime-service (по умолчанию из deploy.path)",
         ),
         compose_rel: str = typer.Option(
-            "deploy/prod/docker-compose.image.yml",
+            "",
             "--compose",
-            help="Путь к compose (относительно core-runtime-service на сервере)",
+            help="Путь к compose (если не указан: выбирается по env: dev/prod)",
         ),
         core_runtime_url: str = typer.Option(
             "http://core-runtime:8000",
@@ -788,6 +880,7 @@ def register(app: typer.Typer) -> None:
         interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),
         quiet: bool = typer.Option(False, "--quiet", help="Минимальный вывод"),
         json_out: bool = typer.Option(False, "--json", help="Машинный вывод в JSON"),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Показать план деплоя без реального выполнения"),
     ) -> None:
         """
         Деплой всего стека (core-runtime + platform-web) из image’ов.
@@ -800,6 +893,7 @@ def register(app: typer.Typer) -> None:
             require_docker(console)
             cfg = Config.load()
             src = _resolve_source(console)
+            resolved_env, resolved_compose_rel = _resolve_stack_env(env, compose_rel)
 
             resolved_core_image = (core_image or cfg.deploy.core_image).strip()
             full_core = f"{resolved_core_image}:{core_tag}"
@@ -831,18 +925,41 @@ def register(app: typer.Typer) -> None:
             if not quiet and not json_out:
                 console.print(
                     Panel.fit(
-                        f"core={full_core}\nplatform={full_platform}\ncompose={compose_rel}\n"
+                        f"core={full_core}\nplatform={full_platform}\ncompose={resolved_compose_rel}\n"
+                        f"env={resolved_env}\n"
                         f"target={'remote ' + resolved_ssh if resolved_ssh else 'local'}",
                         title="hc deploy stack",
                     )
                 )
+
+            if dry_run:
+                from rich.table import Table as _Table
+                target_str = f"remote {resolved_ssh}" if resolved_ssh else "local"
+                plan = _Table(title="Dry run — план деплоя stack")
+                plan.add_column("Шаг", style="bold")
+                plan.add_column("Действие")
+                plan.add_row("Target", target_str)
+                plan.add_row("Env", resolved_env)
+                plan.add_row("Core image", full_core)
+                plan.add_row("Platform image", full_platform)
+                plan.add_row("Compose", resolved_compose_rel)
+                if pull:
+                    plan.add_row("Pull", "docker compose pull core-runtime platform-web edge")
+                plan.add_row("Rollout", "docker compose up -d")
+                if wait:
+                    plan.add_row("Wait healthy", f"edge → core ({edge_health_path}, timeout={timeout}s)")
+                if (external_base_url or "").strip():
+                    plan.add_row("External check", (external_base_url or "").strip())
+                console.print(plan)
+                console.print("[yellow]Dry run:[/yellow] деплой не выполнен")
+                raise typer.Exit(code=0)
 
             if resolved_ssh:
                 if not resolved_path:
                     raise HcCliError(
                         message="для --ssh нужен --path",
                         exit_code=2,
-                        hint="Пример: `hc deploy stack --ssh user@host --path /srv/core-runtime-service`",
+                        hint=f"Пример: `hc deploy stack {resolved_env} --ssh user@host --path /srv/core-runtime-service`",
                     )
                 t0 = _step_start(
                     console, "Rollout stack remote (compose pull + up -d)", quiet=quiet or json_out
@@ -851,9 +968,9 @@ def register(app: typer.Typer) -> None:
                 remote = f"cd {shlex.quote(resolved_path)} && "
                 if pull:
                     remote += (
-                        f"{exports} docker compose -f {shlex.quote(compose_rel)} pull core-runtime platform-web edge && "
+                        f"{exports} docker compose -f {shlex.quote(resolved_compose_rel)} pull core-runtime platform-web edge && "
                     )
-                remote += f"{exports} docker compose -f {shlex.quote(compose_rel)} up -d"
+                remote += f"{exports} docker compose -f {shlex.quote(resolved_compose_rel)} up -d"
                 _run(_ssh_cmd(resolved_ssh, remote))
                 dt = _step_ok(console, "Rollout", t0, quiet=quiet or json_out)
                 steps.append({"name": "rollout", "ok": True, "duration_s": dt})
@@ -868,9 +985,9 @@ def register(app: typer.Typer) -> None:
                     while time.time() < deadline:
                         chk = (
                             f"cd {shlex.quote(resolved_path)} && "
-                            f"docker compose -f {shlex.quote(compose_rel)} exec -T edge sh -lc "
+                            f"docker compose -f {shlex.quote(resolved_compose_rel)} exec -T edge sh -lc "
                             f"{shlex.quote(f'curl -fsS http://127.0.0.1{edge_health_path} >/dev/null && echo edge_core_ok || echo edge_core_no')} && "
-                            f"docker compose -f {shlex.quote(compose_rel)} exec -T edge sh -lc "
+                            f"docker compose -f {shlex.quote(resolved_compose_rel)} exec -T edge sh -lc "
                             f"{shlex.quote('wget -qO- http://127.0.0.1/ >/dev/null && echo edge_ui_ok || echo edge_ui_no')}"
                         )
                         p = subprocess.run(_ssh_cmd(resolved_ssh, chk), text=True, capture_output=True, check=False)  # noqa: S603
@@ -892,12 +1009,12 @@ def register(app: typer.Typer) -> None:
                     steps.append({"name": "wait", "ok": True, "duration_s": dt})
             else:
                 # local: apply compose from repo source (core-runtime-service)
-                compose_file = src.path / compose_rel
+                compose_file = src.path / resolved_compose_rel
                 if not compose_file.exists():
                     raise HcCliError(
                         message=f"Не найден compose файл: {compose_file}",
                         exit_code=1,
-                        hint="Проверь путь `--compose` и наличие deploy/prod/docker-compose.image.yml в core-runtime-service.",
+                        hint="Проверь `--compose` или используй `hc deploy stack dev|prod`.",
                     )
                 env = {**os.environ, **env_pairs}
                 t0 = _step_start(console, "Rollout stack local (compose pull + up -d)", quiet=quiet or json_out)
@@ -1031,7 +1148,8 @@ def register(app: typer.Typer) -> None:
                     "command": "deploy.stack",
                     "core": full_core,
                     "platform": full_platform,
-                    "compose": compose_rel,
+                    "env": resolved_env,
+                    "compose": resolved_compose_rel,
                     "target": f"remote {resolved_ssh}" if resolved_ssh else "local",
                     "wait": bool(wait),
                     "timeout_s": int(timeout),
@@ -1056,6 +1174,84 @@ def register(app: typer.Typer) -> None:
             if json_out:
                 print(json.dumps(json_error_payload("deploy.stack", e), ensure_ascii=False))
                 raise typer.Exit(code=int(e.exit_code or 1))
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    dev_app = typer.Typer(
+        help="Dev stack shortcuts (up/down профили сервисов)",
+        context_settings={"help_option_names": ["-h", "--help"]},
+        no_args_is_help=True,
+    )
+
+    @dev_app.command("up")
+    def dev_up(
+        profile: str = typer.Option(
+            "core+proxy",
+            "--profile",
+            help=(
+                "Профиль сервисов: core+proxy | core+proxy+platform | "
+                "core+proxy+platform+cache | core+proxy+platform+cache+db "
+                "(алиасы: base|platform|cache|db)"
+            ),
+        ),
+        ssh: str | None = typer.Option(
+            None, "--ssh", help="user@host для удалённого запуска (по умолчанию из deploy.ssh)"
+        ),
+        path: str | None = typer.Option(
+            None, "--path", help="remote path к core-runtime-service (для --ssh)"
+        ),
+        pull: bool = typer.Option(
+            False,
+            "--pull/--no-pull",
+            help="Перед up сделать docker compose pull для сервисов профиля",
+        ),
+    ) -> None:
+        """Поднять dev compose только с нужным набором сервисов. (Используй `hc env up` для hot-reload.)"""
+        console = Console()
+        try:
+            require_docker(console)
+            src = _resolve_source(console)
+            cfg = Config.load()
+            resolved_profile, services = _resolve_dev_profile(profile)
+            resolved_ssh = ssh if ssh is not None else (cfg.deploy.ssh or None)
+            resolved_path = path if path is not None else (cfg.deploy.path or None)
+
+            compose_rel = src.compose_rel("dev")
+            service_list = " ".join(services)
+            console.print(f"[cyan]→[/cyan] dev up profile=[bold]{resolved_profile}[/bold] services={service_list}")
+
+            if resolved_ssh:
+                if not resolved_path:
+                    console.print("[red]Ошибка:[/red] для --ssh нужен --path")
+                    raise typer.Exit(code=2)
+                pull_cmd = (
+                    f"docker compose -f {shlex.quote(compose_rel)} pull {' '.join(shlex.quote(s) for s in services)} && "
+                    if pull
+                    else ""
+                )
+                remote = (
+                    f"cd {shlex.quote(resolved_path)} && "
+                    f"{pull_cmd}"
+                    f"docker compose -f {shlex.quote(compose_rel)} up -d {' '.join(shlex.quote(s) for s in services)}"
+                )
+                _run(_ssh_cmd(resolved_ssh, remote))
+                console.print("[green]✓[/green] remote dev profile started")
+                return
+
+            project = compose_project_from_source(console, src, mode="dev")
+            if pull:
+                _run(
+                    ["docker", "compose", "-f", str(project.compose_file), "pull", *services],
+                    cwd=project.cwd,
+                )
+            _run(
+                ["docker", "compose", "-f", str(project.compose_file), "up", "-d", *services],
+                cwd=project.cwd,
+            )
+            console.print("[green]✓[/green] local dev profile started")
+        except HcCliError as e:
             console.print(f"[red]Ошибка:[/red] {e.message}")
             if e.hint:
                 console.print(f"[dim]Подсказка:[/dim] {e.hint}")
@@ -1463,4 +1659,5 @@ def register(app: typer.Typer) -> None:
 
     deploy_app.add_typer(cfg_app, name="config")
     deploy_app.add_typer(core_app, name="core")
+    deploy_app.add_typer(dev_app, name="dev")
     app.add_typer(deploy_app, name="deploy")

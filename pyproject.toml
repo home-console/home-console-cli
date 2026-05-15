@@ -1,6 +1,6 @@
 [project]
 name = "homeconsole-cli"
-version = "0.0.1"
+version = "0.0.2"
 description = "HomeConsole CLI (hc) — управление платформой через HTTP API"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -11,6 +11,7 @@ dependencies = [
   "anyio>=4",
   "prompt_toolkit>=3",
   "tomlkit>=0.12",
+  "questionary>=2.0",
 ]
 
 [build-system]

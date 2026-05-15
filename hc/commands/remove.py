@@ -15,6 +15,7 @@ def register(app: typer.Typer) -> None:
     def remove(
         name: str = typer.Argument(..., help="Имя плагина"),
         force: bool = typer.Option(False, "--force", help="Удалить даже если есть зависимые"),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Показать план удаления без реального выполнения"),
     ) -> None:
         console = Console()
         client = require_client(console)
@@ -32,6 +33,19 @@ def register(app: typer.Typer) -> None:
         dependents, plugins = anyio.run(_deps)
         if plugins is None:
             raise typer.Exit(code=1)
+
+        if dry_run:
+            table = Table(title="Dry run — будет удалено")
+            table.add_column("Поле", style="bold")
+            table.add_column("Значение")
+            table.add_row("Плагин", name)
+            if dependents and not force:
+                table.add_row("Зависимые (блокируют удаление без --force)", ", ".join(dependents))
+            elif dependents:
+                table.add_row("Зависимые (будут затронуты)", ", ".join(dependents))
+            console.print(table)
+            console.print("[yellow]Dry run:[/yellow] удаление не выполнено")
+            raise typer.Exit(code=0)
 
         if dependents and not force:
             table = Table(title="Нельзя удалить — есть зависимые")

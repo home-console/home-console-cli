@@ -4,9 +4,11 @@ import sys
 
 import typer
 from rich.console import Console
+from rich.panel import Panel
 
 from hc.commands.core import register as register_core
 from hc.commands.auth import register as register_auth
+from hc.commands.env import register as register_env
 from hc.commands.reset import register as register_reset
 from hc.commands.recovery import register as register_recovery
 from hc.commands.connect import register as register_connect
@@ -32,6 +34,109 @@ app = typer.Typer(
     pretty_exceptions_show_locals=False,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+
+
+_NAV_TREE: dict[str, dict[str, object]] = {
+    "connect": {"desc": "Подключение к core", "children": {}},
+    "status": {"desc": "Проверка статуса API", "children": {}},
+    "setup": {"desc": "Первичная настройка", "children": {}},
+    "env": {
+        "desc": "Локальное dev-окружение (hot-reload)",
+        "children": {
+            "up":      {"desc": "Поднять сервисы (интерактивный выбор или --profile)", "children": {}},
+            "down":    {"desc": "Остановить окружение", "children": {}},
+            "logs":    {"desc": "Логи сервисов", "children": {}},
+            "restart": {"desc": "Перезапустить сервис(ы)", "children": {}},
+            "status":  {"desc": "Статус контейнеров", "children": {}},
+        },
+    },
+    "deploy": {
+        "desc": "Деплой core/platform/stack (image-based, local/remote)",
+        "children": {
+            "core":     {"desc": "build / push / rollout / wait / logs / release", "children": {}},
+            "platform": {"desc": "Deploy platform web", "children": {}},
+            "stack":    {"desc": "Полный image stack (dev|prod)", "children": {}},
+            "config":   {"desc": "Параметры deploy по умолчанию", "children": {}},
+        },
+    },
+    "update": {"desc": "Обновление core image", "children": {"core": {"desc": "Обновить core", "children": {}}}},
+    "plugin": {"desc": "Список/управление плагинами", "children": {}},
+    "module": {"desc": "Модули core", "children": {}},
+    "logs": {"desc": "Логи", "children": {}},
+    "search": {"desc": "Поиск", "children": {}},
+    "install": {"desc": "Установка компонентов", "children": {}},
+    "remove": {"desc": "Удаление компонентов", "children": {}},
+    "auth": {"desc": "Авторизация", "children": {}},
+    "secrets": {"desc": "Управление секретами", "children": {}},
+    "recovery": {"desc": "Recovery сценарии", "children": {}},
+    "reset": {"desc": "Сброс состояний", "children": {}},
+    "ping": {"desc": "Проверка доступности", "children": {}},
+    "marketplace": {"desc": "Маркетплейс", "children": {}},
+    "repl": {"desc": "Интерактивный режим", "children": {}},
+    "shell": {"desc": "Алиас для repl", "children": {}},
+}
+
+
+def _nav_resolve(path: list[str]) -> tuple[list[str], dict[str, object]]:
+    node: dict[str, object] = {"desc": "hc CLI", "children": _NAV_TREE}
+    consumed: list[str] = []
+    for part in path:
+        children = node.get("children")
+        if not isinstance(children, dict) or part not in children:
+            raise typer.BadParameter(f"Неизвестный раздел: {' '.join([*consumed, part])}")
+        child = children[part]
+        if not isinstance(child, dict):
+            raise typer.BadParameter(f"Повреждён nav-раздел: {' '.join([*consumed, part])}")
+        node = child
+        consumed.append(part)
+    return consumed, node
+
+
+@app.command("nav")
+def nav(path: list[str] = typer.Argument(None, help="Путь по разделам, например: deploy dev")) -> None:
+    """
+    Навигация по командам без запоминания синтаксиса.
+
+    Примеры:
+    - hc nav
+    - hc nav deploy
+    - hc nav deploy dev
+    """
+    console = Console()
+    parts = [p.strip() for p in (path or []) if p and p.strip()]
+    try:
+        consumed, node = _nav_resolve(parts)
+    except typer.BadParameter as e:
+        console.print(f"[red]Ошибка:[/red] {e}")
+        console.print("[dim]Подсказка:[/dim] начни с `hc nav`")
+        raise typer.Exit(code=2)
+
+    children = node.get("children")
+    title = "hc nav" if not consumed else f"hc nav {' '.join(consumed)}"
+    desc = str(node.get("desc", "")).strip()
+    lines = [desc] if desc else []
+    if isinstance(children, dict) and children:
+        lines.append("")
+        lines.append("Доступные разделы:")
+        for key in sorted(children):
+            child = children[key]
+            child_desc = ""
+            if isinstance(child, dict):
+                child_desc = str(child.get("desc", "")).strip()
+            lines.append(f"- {key:12} {child_desc}".rstrip())
+        lines.append("")
+        lines.append(f"Провалиться глубже: `hc nav {' '.join([*consumed, '<section>']).strip()}`")
+    else:
+        cmd = "hc " + " ".join(consumed)
+        lines.append("")
+        lines.append(f"Запуск help для команды: `{cmd} --help`")
+
+    lines.append("")
+    lines.append("Быстрый старт:")
+    lines.append("- `hc nav env`")
+    lines.append("- `hc env up`               ← интерактивные чекбоксы")
+    lines.append("- `hc env up --profile hmr`  ← core + caddy + Vite HMR")
+    console.print(Panel.fit("\n".join(lines), title=title))
 
 
 @app.command("repl")
@@ -66,6 +171,7 @@ def _root(ctx: typer.Context) -> None:
 
 
 def _register_all() -> None:
+    register_env(app)
     register_core(app)
     register_auth(app)
     register_reset(app)
@@ -102,4 +208,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
