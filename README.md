@@ -2,13 +2,42 @@
 
 CLI-утилита для управления платформой HomeConsole **исключительно через HTTP API** CoreRuntime.
 
-## Установка (локально)
+## Установка
+
+### Рекомендуется — `pipx` (Debian / Ubuntu / Raspbian / OrangePi OS)
+
+`pipx` создаёт изолированный venv автоматически и регистрирует `hc` глобально:
+
+```bash
+apt install pipx          # или: pip install pipx --user
+pipx ensurepath           # добавляет ~/.local/bin в PATH (один раз)
+pipx install homeconsole-cli
+```
+
+После `pipx ensurepath` перезапусти шелл или выполни `source ~/.bashrc`.
+
+Обновление:
+```bash
+pipx upgrade homeconsole-cli
+```
+
+### Альтернатива — `pip --user`
+
+```bash
+pip install --user homeconsole-cli
+```
+
+Убедись, что `~/.local/bin` в `PATH`:
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+### Локальная разработка (из исходников)
 
 ```bash
 cd home-console-cli
 python -m venv .venv
 source .venv/bin/activate
-pip install -U pip
 pip install -e .
 ```
 
