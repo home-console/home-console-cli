@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.7] — 2026-05-16
+
+### Fixed
+- Краш `AttributeError: 'HCClient' object attribute '_auth_hint' is read-only` на Python 3.14
+  — monkey-patching методов на `slots=True` датаклассе запрещён в 3.14;
+  заменено на поле `silent: bool` с проверкой внутри методов
+
 ## [0.0.6] — 2026-05-16
 
 ### Added
