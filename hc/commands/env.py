@@ -621,41 +621,50 @@ def register(app: typer.Typer) -> None:
 
     @env_app.command("rebuild")
     def env_rebuild(
-        service: str | None = typer.Argument(None, help="Сервис (пусто = все сервисы из src)"),
         mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        profile: str | None = typer.Option(None, "--profile", "-p", help=_PROFILE_HELP),
         no_cache: bool = typer.Option(False, "--no-cache", help="Сборка без кэша Docker"),
     ) -> None:
         """
-        Пересобрать образ и перезапустить сервис(ы).
+        Пересобрать образы и перезапустить сервисы (интерактивный выбор).
 
         Примеры:
-          hc env rebuild                    # пересобрать всё
-          hc env rebuild core-runtime       # только core-runtime
-          hc env rebuild core-runtime --no-cache
+          hc env rebuild                          # интерактив
+          hc env rebuild --profile base           # core + caddy без вопросов
+          hc env rebuild --no-cache               # интерактив, без кэша
         """
         console = Console()
         try:
             require_docker(console)
             mode = mode.strip().lower()
+            if mode not in _SERVICES:
+                console.print(f"[red]Ошибка:[/red] неизвестный режим {mode!r}. Допустимые: {' | '.join(_SERVICES)}")
+                raise typer.Exit(code=2)
+
             src = _resolve_source(console)
             project = compose_project_from_source(console, src, mode=mode)
+            running = _get_running_services(project.compose_file, project.cwd)
 
-            targets = [service] if service else []
-            label = f"[bold]{service}[/bold]" if service else "all"
+            selected = _resolve_services(mode=mode, profile=profile, console=console, running=running)
+            service_names = [s.name for s in selected]
 
-            console.print(f"[cyan]→[/cyan] build {label}")
-            build_cmd = ["docker", "compose", "-f", str(project.compose_file), "build"]
+            console.print(
+                f"\n[cyan]→[/cyan] env rebuild  "
+                f"mode=[bold]{mode}[/bold]  "
+                f"services=[bold]{', '.join(service_names)}[/bold]"
+                + ("  [dim]--no-cache[/dim]" if no_cache else "")
+            )
+
+            base_cmd = ["docker", "compose", "-f", str(project.compose_file)]
+
+            build_cmd = [*base_cmd, "build"]
             if no_cache:
                 build_cmd.append("--no-cache")
-            build_cmd += targets
+            build_cmd += service_names
             _run(build_cmd, cwd=project.cwd)
 
-            console.print(f"[cyan]→[/cyan] up -d {label}")
-            _run(
-                ["docker", "compose", "-f", str(project.compose_file), "up", "-d", *targets],
-                cwd=project.cwd,
-            )
-            console.print(f"[green]✓[/green] rebuild ok — {label}")
+            _run([*base_cmd, "up", "-d", *service_names], cwd=project.cwd)
+            console.print(f"[green]✓[/green] rebuild ok")
 
         except HcCliError as e:
             console.print(f"[red]Ошибка:[/red] {e.message}")
