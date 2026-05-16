@@ -22,6 +22,7 @@ from hc.core_ops import (
     require_docker,
 )
 from hc.env_bootstrap import core_env_path, ensure_core_env
+from hc.hints import CORE_DOTENV_HELP, ENV_VS_CORE_DOTENV
 from hc.native_core import native_down, native_logs, native_ps, native_up
 
 def _find_repo_root() -> Path | None:
@@ -78,8 +79,9 @@ def register(app: typer.Typer) -> None:
         console.print(f"[green]✓[/green] Обновлено: {src.path}")
 
     env_app = typer.Typer(
-        help="Работа с .env Core",
+        help=CORE_DOTENV_HELP,
         context_settings={"help_option_names": ["-h", "--help"]},
+        no_args_is_help=True,
     )
 
     def _mask_env(text: str) -> str:
@@ -106,6 +108,7 @@ def register(app: typer.Typer) -> None:
         if ctx.invoked_subcommand is not None:
             return
         console = Console()
+        console.print(ENV_VS_CORE_DOTENV)
         src = _resolve_source(console)
         if create:
             ensure_core_env(console, src.path)

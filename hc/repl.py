@@ -18,10 +18,11 @@ from hc import __version__
 from hc.config import Config
 from hc.constants import APP_NAME, HISTORY_PATH
 from hc.commands._client_helpers import require_client
-from hc.update_check import get_update_notification
+from hc.cli_registry import REPL_GROUPS, repl_root_commands
+from hc.update_check import print_update_banner
 
 
-_GROUPS = {"core", "auth", "setup", "plugin", "module", "reset", "recovery", "deploy", "update"}
+_GROUPS = REPL_GROUPS
 
 
 class _HCCompleter(Completer):
@@ -256,33 +257,7 @@ def run_repl(app: typer.Typer) -> None:
 
         connected, plugins = anyio.run(_get_names)
 
-    commands = [
-        "connect",
-        "status",
-        "install",
-        "remove",
-        "search",
-        "logs",
-        "core",
-        "auth",
-        "reset",
-        "plugin",
-        "module",
-        "setup",
-        "recovery",
-        "deploy",
-        "update",
-        "shell",
-        "repl",
-        "help",
-        "?",
-        "exit",
-        "back",
-        "..",
-        "use",
-        "history",
-        "clear",
-    ]
+    commands = repl_root_commands()
     group_ctx: str | None = None
 
     def _get_ctx() -> str | None:
@@ -299,13 +274,7 @@ def run_repl(app: typer.Typer) -> None:
     console.print(f"{APP_NAME} {__version__} | {status}")
     console.print("Type 'help' or '?' for commands, 'exit' to quit")
 
-    latest = get_update_notification(__version__)
-    if latest:
-        console.print(
-            f"[yellow]→ Доступна новая версия [bold]{latest}[/bold] "
-            f"(текущая {__version__})[/yellow]"
-        )
-        console.print("[dim]  pipx upgrade homeconsole-cli  |  pip install --upgrade homeconsole-cli[/dim]")
+    print_update_banner(console, __version__)
 
     HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
     session = PromptSession(_prompt(None), history=FileHistory(str(HISTORY_PATH)), completer=completer)

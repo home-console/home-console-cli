@@ -92,22 +92,75 @@ hc plugin list
 
 ## Команды
 
+### Подключение и Core API
+
 - `hc connect <host> [--port 8080] [--token TOKEN]`
-- `hc status`
-- `hc install <name> [--version X.Y.Z]`
-- `hc remove <name> [--force]`
-- `hc plugin list|start|stop|info`
+- `hc status` — статус Core; `--watch` / `-w` для live-мониторинга с латентностью
+- `hc ping` — доступность Core без авторизации
+- `hc auth` — JWT / API key
+- `hc plugin list|start|stop|info|…`
 - `hc module list|status`
 - `hc logs [--follow] [--module <name>] [--level debug|info|warning|error]`
 - `hc search <query>`
-- `hc setup`
-- `hc deploy` (по умолчанию: build+push+rollout+wait) и `hc deploy ...` (тонкие подкоманды)
-- `hc deploy platform` (локальный dev flow)
-- `hc deploy platform --mode image --image ghcr.io/home-console/platform-home-console --tag latest` (image-only deploy)
-- `hc deploy stack dev` / `hc deploy stack prod` (полный stack для dev/prod)
-- `hc update core ...` (обновление core-runtime до нового image:tag)
-- `hc shell`
-- `hc nav [section ...]` (удобная навигация по командам: `hc nav deploy`, `hc nav deploy dev`)
+- `hc install <name> [--version X.Y.Z] [--dry-run]`
+- `hc remove <name> [--force] [--dry-run]`
+- `hc marketplace` — каталог плагинов
+- `hc secrets` — SecretStore Core
+
+### Конфигурация CLI
+
+- `hc config show` — весь `~/.config/hc/config.toml` (токены скрыты)
+- `hc config set <ключ> <значение>` — например `hc config set core.port 8080`
+- `hc config edit` — открыть файл в `$EDITOR`
+- `hc deploy config …` — только дефолты деплоя (image, mode, ssh)
+
+Ключи для `hc config set`: `core.host`, `core.port`, `core.token`, `core.auth`, `core.verify_ssl`, `display.color`, `display.emoji`, `recovery.mode`, `deploy.core_image`, `deploy.core_mode`, `deploy.ssh`, `deploy.path`.
+
+### Версия CLI
+
+- `hc version` — версия и проверка PyPI
+- `hc upgrade` — обновить через pipx (если установлено так) или `pip install -U`
+- `hc upgrade --check` — только проверить, есть ли новее
+
+При любом запуске команды (кроме `shell` / `repl`) CLI показывает баннер, если на PyPI есть более новая версия.
+
+### Локальное dev-окружение
+
+- `hc env up` — интерактивный выбор сервисов и БД (SQLite / PostgreSQL); последний выбор сохраняется в `~/.local/state/hc/last_env.json`
+- `hc env up --dry-run` / `hc env down --dry-run` — план без запуска docker
+- `hc env pull` — `git pull --ff-only` исходников core-runtime-service
+- `hc env ps` — контейнеры, порты и подсказки URL
+- `hc env exec <service> [cmd…]` — зайти в контейнер (по умолчанию `sh`)
+- `hc env down` / `logs` / `restart` / `status` / `rebuild`
+
+Не путать: **`hc env`** — dev-стек Docker; **`hc core env`** — только файл `.env` Core.
+- `hc env stats [--watch]` — CPU/RAM/сеть контейнеров
+- `hc env health` — healthcheck сервисов
+- Профили: `base` | `backend` | `platform` | `hmr` | `full` — `hc env up --profile hmr`
+
+### Core (исходники и compose)
+
+- `hc core init` / `hc core update` — клон / `git pull` исходников
+- `hc core up|down|logs|status` — docker или `--mode native`
+- `hc core env` — файл `.env` Core (не путать с `hc env`)
+
+### Деплой и обновление образов
+
+- `hc deploy` (по умолчанию: build+push+rollout+wait) и подкоманды `hc deploy core|platform|stack|config`
+- `hc deploy platform --mode image --image ghcr.io/home-console/platform-home-console --tag latest`
+- `hc deploy stack dev` / `hc deploy stack prod`
+- `hc update core …` — обновить Docker-образ core из registry
+
+### Диагностика и recovery
+
+- `hc doctor` — Docker, git, конфиг, исходники, порты, диск
+- `hc recovery …` — recovery-стек (core, db, compose, backup)
+- `hc setup` — мастер первого запуска
+
+### Прочее
+
+- `hc shell` / `hc repl` — интерактивный режим
+- `hc nav [section ...]` — навигация по командам без запоминания синтаксиса
 
 ### Навигация по командам (без запоминания)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import getpass
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import anyio
@@ -16,7 +17,10 @@ from hc.commands.connect import connect_and_save
 from hc.commands._client_helpers import require_client
 from hc.core_source import get_core_source_from_repo, get_core_source_local
 from hc.core_ops import compose_project_from_source, core_up, require_docker
+from hc import __version__
+from hc.hints import SETUP_ENV_HINT
 from hc.setup_runner import SetupProcess, start_background
+from hc.update_check import get_update_notification, print_update_banner
 
 
 async def _probe(url: str, verify_ssl: bool) -> bool:
@@ -95,8 +99,62 @@ def _maybe_start_core(console: Console, background: bool) -> SetupProcess | None
     return SetupProcess.load()
 
 
+def _offer_shell_completion(console: Console) -> None:
+    if not sys.stdin.isatty():
+        return
+    shells = ("bash", "zsh", "fish")
+    shell = "bash"
+    try:
+        from shellingham import detect_shell
+
+        _path, name = detect_shell()
+        if name in shells:
+            shell = name
+    except Exception:
+        pass
+
+    console.print("\n[bold]Автодополнение[/bold]")
+    console.print(
+        f"  Tab: [cyan]hc --install-completion {shell}[/cyan]\n"
+        f"  Или: [dim]eval \"$(hc --show-completion {shell})\"[/dim]"
+    )
+    if not typer.confirm(f"Запустить установку completion для {shell}?", default=False):
+        return
+
+    hc_bin = shutil.which("hc")
+    cmd = (
+        [hc_bin, "--install-completion", shell]
+        if hc_bin
+        else [sys.executable, "-m", "hc.main", "--install-completion", shell]
+    )
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603
+    if proc.stdout.strip():
+        console.print(proc.stdout)
+    if proc.returncode != 0:
+        hint = (proc.stderr or proc.stdout or "не удалось").strip()
+        console.print(f"[yellow]{hint}[/yellow]")
+        console.print(f"[dim]Вручную:[/dim] hc --install-completion {shell}")
+
+
+def _maybe_upgrade_cli(console: Console) -> None:
+    latest = get_update_notification(__version__)
+    if not latest:
+        return
+    console.print(
+        f"\n[yellow]→ На PyPI доступна homeconsole-cli {latest}[/yellow] "
+        f"(сейчас {__version__})"
+    )
+    if typer.confirm("Обновить CLI сейчас (pipx / pip)?", default=True):
+        from hc.commands.cli_version import run_cli_upgrade
+
+        run_cli_upgrade(console)
+
+
 def run_setup(background: bool) -> None:
     console = Console()
+    print_update_banner(console, __version__)
+    console.print(SETUP_ENV_HINT)
+    console.print()
     cfg = Config.load()
 
     host = typer.prompt("Host", default=cfg.core.host or "localhost")
@@ -125,6 +183,7 @@ def run_setup(background: bool) -> None:
         else:
             console.print("Подними CoreRuntime и повтори `hc setup` (или используй `hc connect`).")
             console.print("Подсказка: в этом репо обычно `http://localhost:18000`.")
+            console.print(SETUP_ENV_HINT)
             raise typer.Exit(code=1)
 
     token = getpass.getpass("Token: ").strip()
@@ -150,4 +209,6 @@ def run_setup(background: bool) -> None:
         anyio.run(_install_base)
 
     console.print(f"[green]✓[/green] Готово. Подключено к {host}:{port}.")
+    _maybe_upgrade_cli(console)
+    _offer_shell_completion(console)
 

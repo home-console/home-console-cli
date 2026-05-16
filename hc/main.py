@@ -26,7 +26,14 @@ from hc.commands.ping import register as register_ping
 from hc.commands.doctor import register as register_doctor
 from hc.commands.marketplace import register as register_marketplace
 from hc.commands.secrets import register as register_secrets
+from hc.commands.cli_version import register as register_cli_version
+from hc.commands.config_cmd import register as register_config
+from hc import __version__
+from hc.update_check import print_update_banner
+from hc.cli_registry import NAV_TREE
 from hc.shell import run_shell
+
+_SKIP_UPDATE_NOTIFY = frozenset({"version", "upgrade", "shell", "repl", "nav"})
 
 app = typer.Typer(
     add_completion=True,
@@ -37,50 +44,8 @@ app = typer.Typer(
 )
 
 
-_NAV_TREE: dict[str, dict[str, object]] = {
-    "connect": {"desc": "Подключение к core", "children": {}},
-    "status": {"desc": "Проверка статуса API", "children": {}},
-    "setup": {"desc": "Первичная настройка", "children": {}},
-    "env": {
-        "desc": "Локальное dev-окружение (hot-reload)",
-        "children": {
-            "up":      {"desc": "Поднять сервисы (интерактивный выбор или --profile)", "children": {}},
-            "down":    {"desc": "Остановить окружение", "children": {}},
-            "logs":    {"desc": "Логи сервисов", "children": {}},
-            "restart": {"desc": "Перезапустить сервис(ы)", "children": {}},
-            "status":  {"desc": "Статус контейнеров", "children": {}},
-        },
-    },
-    "deploy": {
-        "desc": "Деплой core/platform/stack (image-based, local/remote)",
-        "children": {
-            "core":     {"desc": "build / push / rollout / wait / logs / release", "children": {}},
-            "platform": {"desc": "Deploy platform web", "children": {}},
-            "stack":    {"desc": "Полный image stack (dev|prod)", "children": {}},
-            "config":   {"desc": "Параметры deploy по умолчанию", "children": {}},
-        },
-    },
-    "update": {"desc": "Обновление core image", "children": {"core": {"desc": "Обновить core", "children": {}}}},
-    "plugin": {"desc": "Список/управление плагинами", "children": {}},
-    "module": {"desc": "Модули core", "children": {}},
-    "logs": {"desc": "Логи", "children": {}},
-    "search": {"desc": "Поиск", "children": {}},
-    "install": {"desc": "Установка компонентов", "children": {}},
-    "remove": {"desc": "Удаление компонентов", "children": {}},
-    "auth": {"desc": "Авторизация", "children": {}},
-    "secrets": {"desc": "Управление секретами", "children": {}},
-    "recovery": {"desc": "Recovery сценарии", "children": {}},
-    "reset": {"desc": "Сброс состояний", "children": {}},
-    "ping":   {"desc": "Проверка доступности", "children": {}},
-    "doctor": {"desc": "Диагностика системы (Docker, конфиг, порты, диск)", "children": {}},
-    "marketplace": {"desc": "Маркетплейс", "children": {}},
-    "repl": {"desc": "Интерактивный режим", "children": {}},
-    "shell": {"desc": "Алиас для repl", "children": {}},
-}
-
-
 def _nav_resolve(path: list[str]) -> tuple[list[str], dict[str, object]]:
-    node: dict[str, object] = {"desc": "hc CLI", "children": _NAV_TREE}
+    node: dict[str, object] = {"desc": "hc CLI", "children": NAV_TREE}
     consumed: list[str] = []
     for part in path:
         children = node.get("children")
@@ -165,7 +130,10 @@ def shell() -> None:
 
 @app.callback(invoke_without_command=True)
 def _root(ctx: typer.Context) -> None:
-    if ctx.invoked_subcommand is None:
+    sub = ctx.invoked_subcommand
+    if sub and sub not in _SKIP_UPDATE_NOTIFY:
+        print_update_banner(Console(), __version__)
+    if sub is None:
         if not sys.stdin.isatty():
             Console().print("[red]Ошибка:[/red] укажи команду. Пример: `hc status`")
             raise typer.Exit(code=1)
@@ -193,6 +161,8 @@ def _register_all() -> None:
     register_marketplace(app)
     register_doctor(app)
     register_secrets(app)
+    register_cli_version(app)
+    register_config(app)
 
 
 _register_all()

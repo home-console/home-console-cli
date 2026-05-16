@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
-import threading
 import time
+
+from rich.console import Console
 
 from hc.constants import STATE_DIR
 
 _CACHE_FILE = STATE_DIR / "version_check.json"
-_TTL = 86400  # 24 hours
+_FETCH_TIMEOUT = 2.0
 _PYPI_URL = "https://pypi.org/pypi/homeconsole-cli/json"
+_PYPI_PACKAGE = "homeconsole-cli"
 
 
 def _parse_ver(v: str) -> tuple[int, ...]:
@@ -37,36 +39,57 @@ def _write_cache(latest: str) -> None:
         pass
 
 
-def _fetch_and_cache() -> None:
-    """Background thread: fetch latest version from PyPI and cache it."""
+def _fetch_latest() -> str | None:
     try:
         import httpx
-        with httpx.Client(timeout=5.0) as client:
+
+        with httpx.Client(timeout=_FETCH_TIMEOUT) as client:
             resp = client.get(_PYPI_URL)
         if resp.status_code == 200:
-            latest = resp.json()["info"]["version"]
-            _write_cache(latest)
+            return str(resp.json()["info"]["version"])
     except Exception:
         pass
+    return None
 
 
 def get_update_notification(current: str) -> str | None:
     """
-    Returns a notification string if a newer version is available, else None.
-    Uses a 24-hour cache — never blocks startup.
-    If cache is missing or expired, starts a background refresh for next session.
+    Returns latest version string if newer than current, else None.
+
+    If cache already records a newer release, returns immediately.
+    Otherwise queries PyPI synchronously (≤2s) so the banner appears
+    in the same shell session right after a release.
     """
     try:
         data = _read_cache()
-        ts = data.get("ts", 0)
-        latest = data.get("latest", "")
+        cached_latest = str(data.get("latest", "") or "")
 
-        if not latest or time.time() - ts > _TTL:
-            # Refresh in background — result visible next session
-            threading.Thread(target=_fetch_and_cache, daemon=True).start()
+        if cached_latest and _is_newer(cached_latest, current):
+            return cached_latest
+
+        latest = _fetch_latest()
+        if latest:
+            _write_cache(latest)
 
         if latest and _is_newer(latest, current):
             return latest
     except Exception:
         pass
     return None
+
+
+def upgrade_hint() -> str:
+    return "pipx upgrade homeconsole-cli  |  pip install -U homeconsole-cli  |  hc upgrade"
+
+
+def print_update_banner(console: Console, current: str) -> bool:
+    """Print yellow banner if a newer release exists. Returns True if printed."""
+    latest = get_update_notification(current)
+    if not latest:
+        return False
+    console.print(
+        f"[yellow]→ Доступна новая версия [bold]{latest}[/bold] "
+        f"(текущая {current})[/yellow]"
+    )
+    console.print(f"[dim]  {upgrade_hint()}[/dim]")
+    return True
