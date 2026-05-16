@@ -20,9 +20,12 @@ class HCClient:
     auth: str = "auto"  # auto|bearer|api-key
     refresh_token: str = ""
     on_token_refreshed: Callable[[str], None] | None = field(default=None)
-    silent_connect: bool = False  # suppress "Core недоступен" during background probes
+    silent_connect: bool = False  # suppress connect errors during background probes
+    silent: bool = False          # suppress all hints (auth, session, connect)
 
     def _auth_hint(self, status_code: int) -> None:
+        if self.silent:
+            return
         console = Console()
         if status_code == 403:
             console.print("[yellow]Не хватает прав для этой операции.[/yellow]")
@@ -100,6 +103,8 @@ class HCClient:
             return False
 
     def _expired_session_hint(self) -> None:
+        if self.silent:
+            return
         console = Console()
         console.print("[red]Сессия истекла.[/red] Войдите заново: `hc auth login -u admin`")
 

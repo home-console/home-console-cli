@@ -11,9 +11,7 @@ from hc.config import Config
 
 
 def _mute_auth_hints(client: HCClient) -> HCClient:
-    # Фоновые проbes не должны спамить ни auth-подсказками, ни "Core недоступен".
-    client._auth_hint = lambda *a, **kw: None  # type: ignore[attr-defined]
-    client._expired_session_hint = lambda: None  # type: ignore[attr-defined]
+    client.silent = True
     client.silent_connect = True
     return client
 
