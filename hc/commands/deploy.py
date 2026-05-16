@@ -52,11 +52,15 @@ _STACK_ENV_COMPOSE: dict[str, str] = {
 }
 
 
+_MONOREPO_SIBLINGS = frozenset({"home-console-cli", "packages", "platform-home-console"})
+
+
 def _find_repo_root() -> Path | None:
     here = Path(__file__).resolve()
     for p in [here, *here.parents]:
         if (p / "core-runtime-service").exists():
-            return p
+            if any((p / s).exists() for s in _MONOREPO_SIBLINGS):
+                return p
     return None
 
 

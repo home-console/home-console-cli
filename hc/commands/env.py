@@ -105,11 +105,17 @@ _DB_HELP = "sqlite | postgres  (без --db: интерактивный выбо
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+# Known siblings of core-runtime-service that confirm we're in the monorepo root.
+# Without them, a standalone core-runtime-service clone in any parent dir would be mistaken for monorepo.
+_MONOREPO_SIBLINGS = frozenset({"home-console-cli", "packages", "platform-home-console"})
+
+
 def _find_repo_root() -> Path | None:
     here = Path(__file__).resolve()
     for p in [here, *here.parents]:
         if (p / "core-runtime-service").exists():
-            return p
+            if any((p / s).exists() for s in _MONOREPO_SIBLINGS):
+                return p
     return None
 
 
