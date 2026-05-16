@@ -212,6 +212,47 @@ def _get_running_services(compose_file: Path, cwd: Path) -> set[str]:
     return set()
 
 
+def _warn_orphan_volumes(console: Console, cwd: Path) -> None:
+    """After down -v, check for volumes that compose didn't remove (not in top-level volumes:)."""
+    try:
+        r = subprocess.run(  # noqa: S603
+            ["docker", "volume", "ls", "--format", "{{.Name}}"],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+        project = cwd.name  # compose project name = directory name
+        orphans = [
+            v for v in r.stdout.splitlines()
+            if v.startswith(f"{project}_") or v.startswith("dev_")
+        ]
+        if orphans:
+            console.print(f"[yellow]![/yellow] Volumes не удалены (нет в top-level volumes секции compose):")
+            for v in orphans:
+                console.print(f"  [dim]docker volume rm {v}[/dim]")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _detect_active_profiles(running: set[str]) -> set[str]:
+    """Return compose profiles that have at least one running container."""
+    profiles: set[str] = set()
+    for svcs in _SERVICES.values():
+        for s in svcs:
+            if s.compose_profile and s.name in running:
+                profiles.add(s.compose_profile)
+    for opt in _DB_OPTIONS:
+        if opt.compose_profile and opt.service and opt.service in running:
+            profiles.add(opt.compose_profile)
+    return profiles
+
+
+def _detect_active_db(running: set[str]) -> str:
+    """Return the DB key ('postgres' | 'sqlite') based on running containers."""
+    for opt in _DB_OPTIONS:
+        if opt.service and opt.service in running:
+            return opt.key
+    return "sqlite"
+
+
 def _pick_services_interactive(available: list[_Svc], running: set[str]) -> list[_Svc]:
     try:
         import questionary
@@ -520,7 +561,7 @@ def register(app: typer.Typer) -> None:
         mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
         volumes: bool = typer.Option(False, "--volumes", "-v", help="Удалить volumes (БД, кэш)"),
     ) -> None:
-        """Остановить dev-окружение."""
+        """Остановить dev-окружение (автоматически определяет активные профили)."""
         console = Console()
         try:
             require_docker(console)
@@ -528,12 +569,43 @@ def register(app: typer.Typer) -> None:
             src = _resolve_source(console)
             project = compose_project_from_source(console, src, mode=mode)
 
-            console.print(f"[cyan]→[/cyan] env down  mode=[bold]{mode}[/bold]")
-            cmd = ["docker", "compose", "-f", str(project.compose_file), "down"]
+            # Detect which profiles are actually running so we stop them too.
+            running = _get_running_services(project.compose_file, project.cwd)
+            active_profiles = _detect_active_profiles(running)
+            active_db = _detect_active_db(running)
+
+            profile_hint = f"  profiles=[bold]{', '.join(sorted(active_profiles))}[/bold]" if active_profiles else ""
+            console.print(f"[cyan]→[/cyan] env down  mode=[bold]{mode}[/bold]  db=[bold]{active_db}[/bold]{profile_hint}")
+
+            cmd = ["docker", "compose", "-f", str(project.compose_file)]
+            for profile in sorted(active_profiles):
+                cmd += ["--profile", profile]
+            cmd.append("down")
+
             if volumes:
+                if active_db == "sqlite" and sys.stdin.isatty():
+                    console.print(
+                        "[yellow]![/yellow] SQLite хранит данные в volume [bold]core-data[/bold] — "
+                        "они будут удалены вместе с остальными volumes."
+                    )
+                    try:
+                        import questionary
+                        confirmed = questionary.confirm(
+                            "Удалить volumes (данные SQLite будут потеряны)?",
+                            default=False,
+                        ).ask()
+                    except ImportError:
+                        confirmed = True
+                    if not confirmed:
+                        console.print("[dim]Volumes оставлены.[/dim]")
+                        raise typer.Exit(code=0)
                 cmd.append("-v")
+
             _run(cmd, cwd=project.cwd)
             console.print("[green]✓[/green] env down ok")
+
+            if volumes:
+                _warn_orphan_volumes(console, project.cwd)
 
         except HcCliError as e:
             console.print(f"[red]Ошибка:[/red] {e.message}")
