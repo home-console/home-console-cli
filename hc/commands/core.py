@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import subprocess
-import sys
 from pathlib import Path
 
 import typer
@@ -72,9 +70,9 @@ def register(app: typer.Typer) -> None:
         src = init_core_source(console, repo_url=repo, ref=ref)
         console.print(f"[green]✓[/green] Core исходники готовы: {src.path}")
 
-    @core_app.command("pull-sources")
-    def pull_sources() -> None:
-        """Обновить локальную копию исходников Core (git pull). Раньше: `hc core update` только для git."""
+    @core_app.command("update")
+    def core_update() -> None:
+        """Обновить локальную копию исходников Core (git pull --ff-only)."""
         console = Console()
         src = update_core_source(console)
         console.print(f"[green]✓[/green] Обновлено: {src.path}")
@@ -258,20 +256,6 @@ def register(app: typer.Typer) -> None:
             console.print("[red]Ошибка: --mode должен быть docker или native.[/red]")
             raise typer.Exit(code=1)
         _docker_logs(console, follow=follow, tail=tail)
-
-    @core_app.command("update")
-    def core_runtime_update(
-        tag: str = typer.Option("latest", "--tag", help="Тег образа"),
-        wait: bool = typer.Option(True, "--wait/--no-wait"),
-        quiet: bool = typer.Option(False, "--quiet"),
-    ) -> None:
-        """Обновить core-runtime до образа (алиас для `hc update core`)."""
-        cmd = [sys.executable, "-m", "hc.main", "update", "core", "--tag", tag]
-        if not wait:
-            cmd.append("--no-wait")
-        if quiet:
-            cmd.append("--quiet")
-        raise SystemExit(subprocess.run(cmd, check=False).returncode)
 
     app.add_typer(core_app, name="core")
 
