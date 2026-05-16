@@ -168,6 +168,32 @@ def _run(cmd: list[str], *, cwd: Path | None = None, extra_env: dict[str, str] |
         raise typer.Exit(code=p.returncode)
 
 
+def _try_pull_source(src: CoreSource, console: Console) -> None:
+    """git pull --ff-only if the working tree is clean. Silently skips on dirty tree or any error."""
+    try:
+        status = subprocess.run(  # noqa: S603
+            ["git", "status", "--porcelain"],
+            cwd=str(src.path),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if status.returncode != 0 or status.stdout.strip():
+            return  # dirty or not a git repo — skip
+
+        pull = subprocess.run(  # noqa: S603
+            ["git", "pull", "--ff-only", "--quiet"],
+            cwd=str(src.path),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if pull.returncode == 0 and pull.stdout.strip():
+            console.print(f"[dim]↑ core-runtime-service обновлён[/dim]")
+    except Exception:  # noqa: BLE001
+        pass  # network unavailable, timeout, etc. — not critical
+
+
 def _get_running_services(compose_file: Path, cwd: Path) -> set[str]:
     try:
         r = subprocess.run(  # noqa: S603
@@ -424,6 +450,7 @@ def register(app: typer.Typer) -> None:
                 raise typer.Exit(code=2)
 
             src = _resolve_source(console)
+            _try_pull_source(src, console)
             project = compose_project_from_source(console, src, mode=mode)
             running = _get_running_services(project.compose_file, project.cwd)
 
