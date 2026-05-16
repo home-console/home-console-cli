@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.0.6] — 2026-05-16
+
+### Added
+- `hc env rebuild` — пересборка образов с интерактивным выбором сервисов (тот же UX что у `hc env up`): чекбоксы, `--profile`, `--no-cache`
+
+### Changed
+- `hc core update` — теперь обновляет **исходники Core** (`git pull --ff-only`), а не Docker-образ
+- `hc update core` остаётся каноническим способом обновить Docker-образ из registry
+- Удалён дублирующий алиас `hc core update → hc update core`
+
 ## [0.0.5] — 2026-05-16
 
 ### Added
