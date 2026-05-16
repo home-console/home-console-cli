@@ -619,6 +619,50 @@ def register(app: typer.Typer) -> None:
                 console.print(f"[dim]Подсказка:[/dim] {e.hint}")
             raise typer.Exit(code=int(e.exit_code or 1))
 
+    @env_app.command("rebuild")
+    def env_rebuild(
+        service: str | None = typer.Argument(None, help="Сервис (пусто = все сервисы из src)"),
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        no_cache: bool = typer.Option(False, "--no-cache", help="Сборка без кэша Docker"),
+    ) -> None:
+        """
+        Пересобрать образ и перезапустить сервис(ы).
+
+        Примеры:
+          hc env rebuild                    # пересобрать всё
+          hc env rebuild core-runtime       # только core-runtime
+          hc env rebuild core-runtime --no-cache
+        """
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+
+            targets = [service] if service else []
+            label = f"[bold]{service}[/bold]" if service else "all"
+
+            console.print(f"[cyan]→[/cyan] build {label}")
+            build_cmd = ["docker", "compose", "-f", str(project.compose_file), "build"]
+            if no_cache:
+                build_cmd.append("--no-cache")
+            build_cmd += targets
+            _run(build_cmd, cwd=project.cwd)
+
+            console.print(f"[cyan]→[/cyan] up -d {label}")
+            _run(
+                ["docker", "compose", "-f", str(project.compose_file), "up", "-d", *targets],
+                cwd=project.cwd,
+            )
+            console.print(f"[green]✓[/green] rebuild ok — {label}")
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
     @env_app.command("status")
     def env_status(
         mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
