@@ -23,7 +23,7 @@ DEFAULT_CORE_REPO = "https://github.com/home-console/core-runtime-service"
 DEFAULT_CORE_REF = "master"
 
 # Образ для prod / dev-image rollout (Ghcr). Локально собранный тег задаёт через --image.
-DEFAULT_CORE_IMAGE = "ghcr.io/home-console/core-runtime"
+DEFAULT_CORE_IMAGE = "ghcr.io/home-console/core-runtime-service"
 
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8080
