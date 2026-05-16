@@ -3,6 +3,10 @@
 ## [0.0.5] — 2026-05-16
 
 ### Added
+- `hc env stats` — CPU%, RAM, NET I/O, BLOCK I/O контейнеров; `--watch` для live-режима
+- `hc env health` — healthcheck статус каждого сервиса (healthy / unhealthy / starting)
+- `hc status --watch` — live-мониторинг Core API с латентностью (avg за последние 10 запросов)
+- `hc doctor` — полная диагностика: Docker, git, конфиг, исходники Core, compose-файлы, порты, диск
 - `hc shell`: уведомление о новой версии при старте — проверяет PyPI раз в 24 часа в фоне, не блокирует запуск (кэш `~/.local/state/hc/version_check.json`)
 - `hc env up`: автоматический `git pull --ff-only` исходников Core перед запуском — только если рабочее дерево чистое; при локальных изменениях молча пропускает
 

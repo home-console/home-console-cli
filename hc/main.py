@@ -23,6 +23,7 @@ from hc.commands.status import register as register_status
 from hc.commands.deploy import register as register_deploy
 from hc.commands.update import register as register_update
 from hc.commands.ping import register as register_ping
+from hc.commands.doctor import register as register_doctor
 from hc.commands.marketplace import register as register_marketplace
 from hc.commands.secrets import register as register_secrets
 from hc.shell import run_shell
@@ -70,7 +71,8 @@ _NAV_TREE: dict[str, dict[str, object]] = {
     "secrets": {"desc": "Управление секретами", "children": {}},
     "recovery": {"desc": "Recovery сценарии", "children": {}},
     "reset": {"desc": "Сброс состояний", "children": {}},
-    "ping": {"desc": "Проверка доступности", "children": {}},
+    "ping":   {"desc": "Проверка доступности", "children": {}},
+    "doctor": {"desc": "Диагностика системы (Docker, конфиг, порты, диск)", "children": {}},
     "marketplace": {"desc": "Маркетплейс", "children": {}},
     "repl": {"desc": "Интерактивный режим", "children": {}},
     "shell": {"desc": "Алиас для repl", "children": {}},
@@ -189,6 +191,7 @@ def _register_all() -> None:
     register_update(app)
     register_ping(app)
     register_marketplace(app)
+    register_doctor(app)
     register_secrets(app)
 
 

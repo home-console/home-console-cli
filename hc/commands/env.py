@@ -644,4 +644,159 @@ def register(app: typer.Typer) -> None:
                 console.print(f"[dim]Подсказка:[/dim] {e.hint}")
             raise typer.Exit(code=int(e.exit_code or 1))
 
+    @env_app.command("stats")
+    def env_stats(
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        watch: bool = typer.Option(False, "--watch", "-w", help="Обновлять каждые N секунд"),
+        interval: float = typer.Option(3.0, "--interval", "-n", help="Интервал обновления (сек)"),
+    ) -> None:
+        """CPU%, RAM, NET I/O контейнеров dev-окружения."""
+        import json
+        import time
+        from rich.live import Live
+        from rich.table import Table
+
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+
+            def _stats_table() -> Table:
+                r = subprocess.run(  # noqa: S603
+                    ["docker", "compose", "-f", str(project.compose_file),
+                     "stats", "--no-stream", "--format", "{{json .}}"],
+                    cwd=str(project.cwd),
+                    capture_output=True, text=True, check=False,
+                )
+                table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+                table.add_column("Сервис")
+                table.add_column("CPU%",     justify="right")
+                table.add_column("RAM",      justify="right")
+                table.add_column("RAM%",     justify="right")
+                table.add_column("NET I/O",  justify="right")
+                table.add_column("BLOCK I/O",justify="right")
+                table.add_column("PIDs",     justify="right")
+
+                for line in r.stdout.strip().splitlines():
+                    try:
+                        d = json.loads(line)
+                        cpu_s = d.get("CPUPerc", "0%")
+                        try:
+                            cpu_f = float(cpu_s.rstrip("%"))
+                            cpu_color = "red" if cpu_f > 80 else "yellow" if cpu_f > 40 else "green"
+                        except ValueError:
+                            cpu_color = "white"
+                        table.add_row(
+                            d.get("Name", "?"),
+                            f"[{cpu_color}]{cpu_s}[/{cpu_color}]",
+                            d.get("MemUsage", "?"),
+                            d.get("MemPerc", "?"),
+                            d.get("NetIO", "?"),
+                            d.get("BlockIO", "?"),
+                            d.get("PIDs", "?"),
+                        )
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                return table
+
+            if watch:
+                with Live(refresh_per_second=1, screen=False) as live:
+                    while True:
+                        live.update(_stats_table())
+                        time.sleep(interval)
+            else:
+                console.print(_stats_table())
+
+        except (KeyboardInterrupt, typer.Abort):
+            pass
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("health")
+    def env_health(
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+    ) -> None:
+        """Healthcheck статус каждого сервиса окружения."""
+        import json
+        from rich.table import Table
+
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+
+            r = subprocess.run(  # noqa: S603
+                ["docker", "compose", "-f", str(project.compose_file),
+                 "ps", "--format", "json"],
+                cwd=str(project.cwd),
+                capture_output=True, text=True, check=False,
+            )
+
+            table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+            table.add_column("Сервис")
+            table.add_column("Статус")
+            table.add_column("Health")
+            table.add_column("Порты")
+
+            _STATUS_COLOR = {"running": "green", "exited": "red", "paused": "yellow"}
+            _HEALTH_COLOR = {"healthy": "green", "unhealthy": "red",
+                             "starting": "yellow", "none": "dim"}
+
+            rows: list[dict] = []
+            raw = r.stdout.strip()
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    rows = parsed if isinstance(parsed, list) else [parsed]
+                except json.JSONDecodeError:
+                    for line in raw.splitlines():
+                        try:
+                            rows.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+
+            if not rows:
+                console.print("[yellow]Нет запущенных контейнеров.[/yellow]")
+                console.print(f"[dim]compose:[/dim] {project.compose_file}")
+                return
+
+            for row in rows:
+                name = row.get("Service") or row.get("Name") or "?"
+                state = str(row.get("State") or row.get("Status") or "?").lower()
+                health = str(row.get("Health") or "none").lower()
+                ports = row.get("Publishers") or row.get("Ports") or ""
+                if isinstance(ports, list):
+                    ports = ", ".join(
+                        f"{p.get('PublishedPort', '')}→{p.get('TargetPort', '')}"
+                        for p in ports if p.get("PublishedPort")
+                    )
+
+                sc = _STATUS_COLOR.get(state, "white")
+                hc_color = _HEALTH_COLOR.get(health, "white")
+                health_icon = {"healthy": "✓", "unhealthy": "✗",
+                               "starting": "…", "none": "—"}.get(health, health)
+
+                table.add_row(
+                    f"[bold]{name}[/bold]",
+                    f"[{sc}]{state}[/{sc}]",
+                    f"[{hc_color}]{health_icon} {health}[/{hc_color}]",
+                    str(ports),
+                )
+
+            console.print(table)
+            console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
     app.add_typer(env_app, name="env")
