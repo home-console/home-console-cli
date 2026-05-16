@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from hc.core_ops import compose_project_from_source, require_docker
-from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local
+from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local, init_core_source
 from hc.errors import CoreSourcesNotFoundError, HcCliError
 
 
@@ -128,10 +128,36 @@ def _resolve_source(console: Console) -> CoreSource:
     src = get_core_source_local()
     if src:
         return src
+
+    # On a fresh machine: offer to auto-clone core-runtime-service.
+    from hc.constants import CORE_SRC_DIR, DEFAULT_CORE_REPO
+    console.print(f"[yellow]Исходники Core не найдены.[/yellow] ({CORE_SRC_DIR})")
+
+    if sys.stdin.isatty():
+        try:
+            import questionary
+            answer = questionary.confirm(
+                f"Скачать core-runtime-service в {CORE_SRC_DIR}?",
+                default=True,
+            ).ask()
+        except ImportError:
+            answer = None
+
+        if answer is None:
+            raise typer.Abort()
+        if not answer:
+            raise CoreSourcesNotFoundError(
+                message="Исходники Core не найдены.",
+                exit_code=1,
+                hint=f"Запусти: hc core init  (клонирует {DEFAULT_CORE_REPO})",
+            )
+
+        return init_core_source(console, None, None)
+
     raise CoreSourcesNotFoundError(
         message="Исходники Core не найдены.",
         exit_code=1,
-        hint="Сделай `hc core init` или запусти из монорепы HomeConsole.",
+        hint=f"Запусти: hc core init  (клонирует {DEFAULT_CORE_REPO})",
     )
 
 
