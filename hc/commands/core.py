@@ -23,7 +23,7 @@ from hc.core_ops import (
 )
 from hc.env_bootstrap import core_env_path, ensure_core_env
 from hc.hints import CORE_DOTENV_HELP, ENV_VS_CORE_DOTENV
-from hc.native_core import native_down, native_logs, native_ps, native_up
+from hc.native_core import native_down, native_logs, native_ps, native_signal, native_up
 
 def _find_repo_root() -> Path | None:
     here = Path(__file__).resolve()
@@ -150,16 +150,24 @@ def register(app: typer.Typer) -> None:
             "--use-hc-python",
             help="Native: запускать Core тем же интерпретатором, что и `hc`",
         ),
+        foreground: bool = typer.Option(
+            False,
+            "--foreground",
+            "-f",
+            help="Native: запустить в foreground (stdout прямо в терминал, Ctrl+C для остановки)",
+        ),
     ) -> None:
         console = Console()
         m = mode.lower().strip()
         if m == "native":
             src = _resolve_source(console)
-            native_up(console, src, use_hc_python=use_hc_python, no_ui=no_ui)
+            native_up(console, src, use_hc_python=use_hc_python, no_ui=no_ui, foreground=foreground)
             return
         if m != "docker":
             console.print("[red]Ошибка: --mode должен быть docker или native.[/red]")
             raise typer.Exit(code=1)
+        if foreground:
+            console.print("[yellow]Подсказка:[/yellow] --foreground применяется только в режиме --mode native.")
 
         require_docker(console)
         src = _resolve_source(console)
@@ -186,6 +194,55 @@ def register(app: typer.Typer) -> None:
         project = compose_project_from_source(console, src)
         core_down(console, project, volumes=volumes)
         console.print("[green]✓[/green] CoreRuntime остановлен.")
+
+    @core_app.command("restart")
+    def restart(
+        mode: str = typer.Option("docker", "--mode", help="docker|native"),
+        no_ui: bool = typer.Option(True, "--no-ui/--with-ui", help="Запустить без UI"),
+        use_hc_python: bool = typer.Option(
+            False,
+            "--use-hc-python",
+            help="Native: использовать интерпретатор `hc`",
+        ),
+        volumes: bool = typer.Option(False, "-v", "--volumes", help="При остановке удалить volumes (только docker)"),
+    ) -> None:
+        """Перезапустить Core (down → up)."""
+        console = Console()
+        m = mode.lower().strip()
+        if m == "native":
+            console.print("[dim]Останавливаю native Core…[/dim]")
+            native_down(console, volumes=False)
+            console.print("[dim]Запускаю native Core…[/dim]")
+            src = _resolve_source(console)
+            native_up(console, src, use_hc_python=use_hc_python, no_ui=no_ui)
+            return
+        if m != "docker":
+            console.print("[red]Ошибка: --mode должен быть docker или native.[/red]")
+            raise typer.Exit(code=1)
+
+        require_docker(console)
+        src = _resolve_source(console)
+        project = compose_project_from_source(console, src)
+        console.print("[dim]Останавливаю CoreRuntime…[/dim]")
+        core_down(console, project, volumes=volumes)
+        console.print("[dim]Запускаю CoreRuntime…[/dim]")
+        core_up(console, project, no_ui=no_ui)
+        console.print("[green]✓[/green] CoreRuntime перезапущен.")
+
+    @core_app.command("signal")
+    def sig(
+        sig_name: str = typer.Argument(..., help="reload|dump|quit|term|int или номер сигнала"),
+    ) -> None:
+        """Послать UNIX-сигнал native Core процессу (только --mode native).
+
+        reload → SIGHUP  (перечитать конфиг без перезапуска)
+        dump   → SIGUSR1 (дамп состояния в лог)
+        quit   → SIGQUIT
+        term   → SIGTERM
+        int    → SIGINT
+        """
+        console = Console()
+        native_signal(console, sig_name)
 
     def _docker_ps(console: Console) -> None:
         require_docker(console)
@@ -259,6 +316,47 @@ def register(app: typer.Typer) -> None:
             console.print("[red]Ошибка: --mode должен быть docker или native.[/red]")
             raise typer.Exit(code=1)
         _docker_logs(console, follow=follow, tail=tail)
+
+    @core_app.command("dump")
+    def dump(
+        output: str | None = typer.Option(None, "--output", "-o", help="Сохранить в файл (JSON)"),
+    ) -> None:
+        """Дамп живого состояния ядра: плагины, сервисы, модули, события, capabilities.
+
+        Полезно для диагностики и отладки.
+        """
+        import json
+        import anyio
+        from hc.commands._client_helpers import require_client
+        console = Console()
+        client = require_client(console)
+
+        async def _collect() -> dict:
+            plugins_data   = await client.inspector_plugins() or {}
+            services_data  = await client.list_services_inspector() or []
+            events_data    = await client.list_events_inspector() or []
+            modules_data   = await client.get_modules() or []
+            caps_data      = await client.list_capabilities() or []
+            health_data    = await client.health() or {}
+            return {
+                "health":       health_data,
+                "plugins":      (plugins_data.get("result") or plugins_data.get("plugins") or [])
+                                if isinstance(plugins_data, dict) else plugins_data,
+                "services":     services_data,
+                "modules":      modules_data,
+                "events":       events_data,
+                "capabilities": caps_data,
+            }
+
+        data = anyio.run(_collect)
+
+        if output:
+            from pathlib import Path
+            Path(output).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            console.print(f"[green]✓[/green] Дамп сохранён: {output}")
+        else:
+            from hc.json_output import print_json
+            print_json(data)
 
     app.add_typer(core_app, name="core")
 

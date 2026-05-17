@@ -57,3 +57,11 @@ LOGS = "/logs"
 MARKETPLACE_INDEX = "/marketplace/index"
 MARKETPLACE_SEARCH = "/marketplace/search"
 
+# Admin inspector
+ADMIN_INSPECTOR_SERVICES = "/api/v1/admin/inspector/services"
+ADMIN_INSPECTOR_EVENTS = "/api/v1/admin/inspector/events"
+ADMIN_INSPECTOR_EVENTS_STREAM = "/api/v1/admin/inspector/events/stream"
+ADMIN_INSPECTOR_CAPABILITIES = "/api/v1/admin/inspector/capabilities"
+ADMIN_SERVICE_CALL = "/api/v1/admin/services/{name}/call"
+ADMIN_EVENT_EMIT = "/api/v1/admin/events/emit"
+

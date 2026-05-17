@@ -24,6 +24,7 @@ class CoreConfig:
     refresh_token: str = ""  # session_id cookie from login, used for token refresh
     auth: str = "auto"  # auto|bearer|api-key
     verify_ssl: bool = True
+    socket_path: str = ""  # Unix domain socket (RUNTIME_SOCKET_PATH). Если задан — используется вместо HTTP.
 
 
 @dataclass(slots=True)
@@ -82,6 +83,7 @@ class Config:
                 refresh_token=str(core.get("refresh_token", "")),
                 auth=str(core.get("auth", "auto")),
                 verify_ssl=bool(core.get("verify_ssl", True)),
+                socket_path=str(core.get("socket_path", "")),
             ),
             display=DisplayConfig(
                 color=bool(display.get("color", True)),
@@ -111,6 +113,7 @@ class Config:
             "refresh_token": self.core.refresh_token,
             "auth": self.core.auth,
             "verify_ssl": self.core.verify_ssl,
+            "socket_path": self.core.socket_path,
         }
         doc["display"] = {"color": self.display.color, "emoji": self.display.emoji}
         doc["recovery"] = {"mode": self.recovery.mode}

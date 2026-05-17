@@ -28,6 +28,10 @@ from hc.commands.marketplace import register as register_marketplace
 from hc.commands.secrets import register as register_secrets
 from hc.commands.cli_version import register as register_cli_version
 from hc.commands.config_cmd import register as register_config
+from hc.commands.emergency import register as register_emergency
+from hc.commands.service import register as register_service
+from hc.commands.event import register as register_event
+from hc.commands.shell_config import register as register_shell_config
 from hc import __version__
 from hc.update_check import print_update_banner
 from hc.cli_registry import NAV_TREE
@@ -163,6 +167,10 @@ def _register_all() -> None:
     register_secrets(app)
     register_cli_version(app)
     register_config(app)
+    register_emergency(app)
+    register_service(app)
+    register_event(app)
+    register_shell_config(app)
 
 
 _register_all()

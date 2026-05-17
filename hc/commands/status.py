@@ -10,6 +10,80 @@ from rich.panel import Panel
 from rich.text import Text
 
 from hc.commands._client_helpers import require_client
+from hc.json_output import print_json
+
+
+def _show_components(console: Console, client: object) -> None:
+    """Показать статус каждого компонента: API, модули, плагины, БД."""
+    from rich.table import Table
+
+    async def _gather():
+        health  = await client.health()               # type: ignore[union-attr]
+        modules = await client.get_modules()          # type: ignore[union-attr]
+        plugins = await client.get_plugins()          # type: ignore[union-attr]
+        sys_h   = await client._request_json_absolute("GET", "/api/v1/admin/inspector/system_health")  # type: ignore[union-attr]
+        return health, modules, plugins, sys_h
+
+    health, modules, plugins, sys_health = anyio.run(_gather)
+
+    table = Table(title="Components", show_header=True)
+    table.add_column("Компонент", style="bold", width=22)
+    table.add_column("Статус", width=12)
+    table.add_column("Детали")
+
+    def _row(name: str, ok: bool | None, detail: str = "") -> None:
+        if ok is True:
+            status = Text("● online", style="green")
+        elif ok is False:
+            status = Text("○ offline", style="red")
+        else:
+            status = Text("? unknown", style="yellow")
+        table.add_row(name, status, detail)
+
+    # API
+    _row("API", health is not None,
+         f"v{health.get('version', '?')}  uptime={health.get('uptime', '?')}" if health else "недоступен")
+
+    # Modules
+    if isinstance(modules, list):
+        ok_m = sum(1 for m in modules if str(m.get("status", "")).lower() in {"running", "ok"})
+        total_m = len(modules)
+        _row("Modules", ok_m == total_m, f"{ok_m} / {total_m} running")
+        # Отдельная строка для каждого не-running модуля
+        for m in modules:
+            if str(m.get("status", "")).lower() not in {"running", "ok"}:
+                table.add_row(
+                    f"  └ {m.get('name', '?')}",
+                    Text(str(m.get("status", "?")), style="yellow"),
+                    "required" if m.get("required") else "optional",
+                )
+    else:
+        _row("Modules", None, "нет данных")
+
+    # Plugins
+    if isinstance(plugins, list):
+        ok_p = sum(1 for p in plugins if str(p.get("status", "")).lower() == "running")
+        _row("Plugins", ok_p == len(plugins) or not plugins,
+             f"{ok_p} / {len(plugins)} running")
+    else:
+        _row("Plugins", None, "нет данных")
+
+    # Storage (из system_health)
+    if isinstance(sys_health, dict):
+        result = sys_health.get("result") or sys_health
+        storage = result.get("storage") if isinstance(result, dict) else None
+        if isinstance(storage, dict):
+            st = storage.get("status", "unknown")
+            _row("Storage", st in {"ok", "healthy"}, st)
+        else:
+            _row("Storage", None, "нет данных")
+    else:
+        _row("Storage", None, "Core недоступен")
+
+    console.print(table)
+
+
+from rich.text import Text  # noqa: E402 — нужен для _show_components
 
 
 def register(app: typer.Typer) -> None:
@@ -17,9 +91,14 @@ def register(app: typer.Typer) -> None:
     def status(
         watch: bool = typer.Option(False, "--watch", "-w", help="Live-мониторинг (Ctrl+C для выхода)"),
         interval: float = typer.Option(5.0, "--interval", "-n", help="Интервал обновления в секундах"),
+        json_out: bool = typer.Option(False, "--json", help="Машинный вывод в JSON"),
+        components: bool = typer.Option(False, "--components", "-c", help="Показать статус каждого компонента отдельно"),
     ) -> None:
         """Статус Core: версия, uptime, плагины, модули. С --watch — live-мониторинг."""
         console = Console()
+        if json_out and watch:
+            console.print("[red]Ошибка:[/red] --json несовместим с --watch")
+            raise typer.Exit(code=2)
         client = require_client(console)
 
         latencies: list[float] = []
@@ -94,8 +173,29 @@ def register(app: typer.Typer) -> None:
 
             return Panel(Text("\n").join(lines), title=title, border_style="cyan")
 
+        if components:
+            _show_components(console, client)
+            return
+
         if not watch:
             health, active_plugins, modules_stat, latency_ms = anyio.run(_fetch)
+            if json_out:
+                if not health:
+                    print_json({"ok": False, "error": "Core недоступен"})
+                    raise typer.Exit(code=1)
+                payload: dict[str, object] = {
+                    "ok": True,
+                    "version": health.get("version"),
+                    "status": health.get("status"),
+                    "uptime": health.get("uptime"),
+                    "latency_ms": round(latency_ms, 2),
+                }
+                if active_plugins is not None:
+                    payload["plugins_active"] = active_plugins
+                if modules_stat is not None:
+                    payload["modules"] = {"ok": modules_stat[0], "total": modules_stat[1]}
+                print_json(payload)
+                return
             console.print(_build_panel(health, active_plugins, modules_stat, latency_ms))
             if not health:
                 raise typer.Exit(code=1)

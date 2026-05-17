@@ -168,7 +168,16 @@ def register(app: typer.Typer) -> None:
 
     @cfg_app.command("edit")
     def config_edit() -> None:
-        """Открыть config.toml в $EDITOR / $VISUAL."""
-        open_config_editor(Console())
+        """Открыть config.toml в $EDITOR / $VISUAL. После сохранения — валидация."""
+        console = Console()
+        open_config_editor(console)
+        # Валидируем что файл не сломан после редактирования
+        try:
+            cfg = Config.load()
+            console.print(f"[green]✓[/green] Конфиг валиден: {cfg.core.host}:{cfg.core.port}")
+        except Exception as e:
+            console.print(f"[red]Ошибка: конфиг повреждён после редактирования:[/red] {e}")
+            console.print(f"[dim]Исправь файл: {CONFIG_PATH}[/dim]")
+            raise typer.Exit(code=1)
 
     app.add_typer(cfg_app, name="config")

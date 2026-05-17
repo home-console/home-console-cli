@@ -71,7 +71,10 @@ NAV_TREE: dict[str, dict[str, object]] = {
     "secrets": {"desc": "SecretStore Core", "children": {}},
     "recovery": {"desc": "Recovery-стек (db, backup, compose)", "children": {}},
     "reset": {"desc": "Сброс конфига/кэша", "children": {}},
-    "doctor": {"desc": "Диагностика Docker, конфиг, порты", "children": {}},
+    "doctor": {
+        "desc": "Диагностика: --quick | --api | полная",
+        "children": {},
+    },
     "marketplace": {"desc": "Каталог плагинов", "children": {}},
     "config": {
         "desc": "Конфигурация ~/.config/hc/config.toml",

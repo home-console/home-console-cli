@@ -22,6 +22,22 @@ class HCClient:
     on_token_refreshed: Callable[[str], None] | None = field(default=None)
     silent_connect: bool = False  # suppress connect errors during background probes
     silent: bool = False          # suppress all hints (auth, session, connect)
+    socket_path: str | None = None  # Unix domain socket path (RUNTIME_SOCKET_PATH)
+
+    def _make_transport(self) -> httpx.AsyncHTTPTransport | None:
+        """Вернуть UDS-транспорт если задан socket_path, иначе None (httpx default)."""
+        if self.socket_path:
+            return httpx.AsyncHTTPTransport(uds=self.socket_path)
+        return None
+
+    def _async_client(self, *, timeout: float = 30.0) -> httpx.AsyncClient:
+        transport = self._make_transport()
+        return httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=timeout,
+            verify=self.verify_ssl,
+            transport=transport,
+        )
 
     def _auth_hint(self, status_code: int) -> None:
         if self.silent:
@@ -58,9 +74,7 @@ class HCClient:
     ) -> httpx.Response | None:
         console = Console()
         try:
-            async with httpx.AsyncClient(
-                base_url=self.base_url, timeout=timeout, verify=self.verify_ssl
-            ) as client:
+            async with self._async_client(timeout=timeout) as client:
                 return await client.request(method, path, headers=self._headers(), **kwargs)
         except httpx.ConnectError:
             if not self.silent_connect:
@@ -78,9 +92,7 @@ class HCClient:
         if not self.refresh_token:
             return False
         try:
-            async with httpx.AsyncClient(
-                base_url=self.base_url, timeout=10.0, verify=self.verify_ssl
-            ) as client:
+            async with self._async_client(timeout=10.0) as client:
                 resp = await client.post(
                     endpoints.AUTH_REFRESH,
                     cookies={"session_id": self.refresh_token},
@@ -274,9 +286,7 @@ class HCClient:
         console = Console()
         for attempt in range(2):
             try:
-                async with httpx.AsyncClient(
-                    base_url=self.base_url, timeout=http_timeout, verify=self.verify_ssl
-                ) as client:
+                async with self._async_client(timeout=http_timeout) as client:
                     resp = await client.post(
                         path,
                         headers=dict(self._headers()),
@@ -324,9 +334,7 @@ class HCClient:
 
         for attempt in range(2):
             try:
-                async with httpx.AsyncClient(
-                    base_url=self.base_url, timeout=None, verify=self.verify_ssl
-                ) as client:
+                async with self._async_client(timeout=30000.0) as client:
                     async with client.stream(
                         "GET",
                         url,
@@ -391,9 +399,7 @@ class HCClient:
     ) -> tuple[dict[str, Any] | None, str]:
         """Login and return (response_data, session_id_cookie) for refresh token storage."""
         try:
-            async with httpx.AsyncClient(
-                base_url=self.base_url, timeout=30.0, verify=self.verify_ssl
-            ) as client:
+            async with self._async_client(timeout=30.0) as client:
                 resp = await client.post(
                     endpoints.AUTH_LOGIN,
                     json={"user_id": user_id, "password": password},
@@ -637,3 +643,90 @@ class HCClient:
             if latest and latest != current:
                 updates.append({"name": name, "current": current, "latest": latest})
         return updates
+
+    # ------------------------------------------------------------------
+    # Inspector — services & events
+    # ------------------------------------------------------------------
+
+    async def list_services_inspector(self) -> list[dict[str, Any]] | None:
+        data = await self._request_json_absolute("GET", endpoints.ADMIN_INSPECTOR_SERVICES)
+        if isinstance(data, dict):
+            payload = data.get("result") or data.get("services") or data.get("data")
+            if isinstance(payload, list):
+                return payload
+        if isinstance(data, list):
+            return data
+        return None
+
+    async def list_events_inspector(self) -> list[dict[str, Any]] | None:
+        data = await self._request_json_absolute("GET", endpoints.ADMIN_INSPECTOR_EVENTS)
+        if isinstance(data, dict):
+            payload = data.get("result") or data.get("events") or data.get("data")
+            if isinstance(payload, list):
+                return payload
+        if isinstance(data, list):
+            return data
+        return None
+
+    async def list_capabilities(self) -> list[dict[str, Any]] | None:
+        data = await self._request_json_absolute("GET", endpoints.ADMIN_INSPECTOR_CAPABILITIES)
+        if isinstance(data, dict):
+            payload = data.get("result") or data.get("capabilities") or data.get("data")
+            if isinstance(payload, list):
+                return payload
+        if isinstance(data, list):
+            return data
+        return None
+
+    async def call_service(self, name: str, kwargs: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        url = endpoints.ADMIN_SERVICE_CALL.format(name=name)
+        body: dict[str, Any] = {}
+        if kwargs:
+            body["kwargs"] = kwargs
+        data = await self._request_json_absolute(
+            "POST", url, json=body, return_error_json=True, http_timeout=30.0
+        )
+        return data if isinstance(data, dict) else None
+
+    async def emit_event(self, event_type: str, data: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        body = {"event_type": event_type, "data": data or {}}
+        result = await self._request_json_absolute(
+            "POST", endpoints.ADMIN_EVENT_EMIT, json=body, return_error_json=True
+        )
+        return result if isinstance(result, dict) else None
+
+    async def stream_events(self, filter: str = "*") -> AsyncGenerator[dict[str, Any], None]:
+        """Стримить live события с event bus через SSE."""
+        import httpx as _httpx
+        url = endpoints.ADMIN_INSPECTOR_EVENTS_STREAM
+        params = {"filter": filter} if filter != "*" else {}
+        try:
+            async with self._async_client(timeout=30000.0) as client:
+                async with client.stream(
+                    "GET",
+                    url,
+                    headers={**self._headers(), "Accept": "text/event-stream"},
+                    params=params,
+                ) as resp:
+                    if resp.status_code == 401:
+                        self._expired_session_hint()
+                        return
+                    if resp.status_code == 403:
+                        self._auth_hint(403)
+                        return
+                    if resp.is_error:
+                        Console().print(f"[red]Ошибка: HTTP {resp.status_code}[/red]")
+                        return
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        raw = line.removeprefix("data:").strip()
+                        try:
+                            import json
+                            yield json.loads(raw)
+                        except ValueError:
+                            pass
+        except _httpx.ConnectError:
+            Console().print(f"[red]Ошибка: Core недоступен[/red]")
+        except _httpx.RequestError as e:
+            Console().print(f"[red]Ошибка: {e}[/red]")

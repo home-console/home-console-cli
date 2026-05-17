@@ -8,8 +8,6 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
-
 from hc.constants import CONFIG_PATH, SETUP_LOG_PATH
 from hc.core_ops import compose_project_from_source, require_docker
 from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local
@@ -160,37 +158,22 @@ def register(app: typer.Typer) -> None:
     recovery_app.add_typer(config_mod.build_app(ctx), name="config")
 
     @recovery_app.command("doctor")
-    def doctor() -> None:
+    def doctor(
+        json_out: bool = typer.Option(False, "--json", help="Вывод в JSON"),
+    ) -> None:
+        """Алиас recovery-проверок → `hc doctor --quick` (+ setup.log)."""
+        from hc.doctor_lib import print_doctor_report, run_doctor
+
         console = Console()
-        table = Table(title="hc doctor (local)")
-        table.add_column("Check", style="bold")
-        table.add_column("Result")
-
-        def ok(v: bool) -> str:
-            return "[green]ok[/green]" if v else "[red]fail[/red]"
-
-        has_docker = True
-        try:
-            require_docker(console)
-        except typer.Exit:
-            has_docker = False
-        table.add_row("docker", ok(has_docker))
-
-        try:
-            src = ctx.resolve_source(console)
-            table.add_row("core source", f"[green]{src.path}[/green]")
-            proj = compose_project_from_source(console, src)
-            table.add_row("compose", ok(proj.compose_file.exists()))
-            table.add_row(".env", ok((src.path / ".env").exists()))
-        except typer.Exit:
-            table.add_row("core source", "[red]not found[/red]")
-        table.add_row("setup.log", ok(SETUP_LOG_PATH.exists()))
-        table.add_row("hc config", ok(CONFIG_PATH.exists()))
-        console.print(table)
-        if SETUP_LOG_PATH.exists():
+        console.print(
+            "[dim]Совет: для полной диагностики —[/dim] "
+            "[bold]hc doctor[/bold]  "
+            "[dim]| API —[/dim] [bold]hc doctor --api[/bold]"
+        )
+        report = run_doctor(console, scope="recovery")
+        print_doctor_report(console, report, json_out=json_out)
+        if SETUP_LOG_PATH.exists() and not json_out:
             console.print("Открыть лог: [bold]hc recovery config open-setup-log[/bold]")
-        if not has_docker:
-            raise typer.Exit(code=1)
 
     @recovery_app.command("hint")
     def hint() -> None:

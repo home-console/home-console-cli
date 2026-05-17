@@ -17,6 +17,7 @@ from rich.table import Table
 from rich.text import Text
 
 from hc.commands._client_helpers import require_client
+from hc.json_output import print_json
 from hc.config import Config
 from hc.core_ops import require_docker
 from hc.core_source import get_core_source_from_repo
@@ -119,7 +120,9 @@ def register(app: typer.Typer) -> None:
     )
 
     @plugin_app.command("list")
-    def list_plugins() -> None:
+    def list_plugins(
+        json_out: bool = typer.Option(False, "--json", help="Машинный вывод в JSON"),
+    ) -> None:
         console = Console()
         client = require_client(console)
 
@@ -144,6 +147,10 @@ def register(app: typer.Typer) -> None:
         if not isinstance(plugins, list):
             console.print("[red]Ошибка:[/red] не удалось получить список плагинов.")
             raise typer.Exit(code=1)
+
+        if json_out:
+            print_json({"ok": True, "plugins": plugins})
+            return
 
         table = Table(title="Plugins")
         table.add_column("Плагин", style="bold")
@@ -448,6 +455,73 @@ def register(app: typer.Typer) -> None:
         console.print("[cyan]→[/cyan] docker compose cp → core-runtime:/app/plugins/")
         _run_cmd(["sh", "-lc", inner_cp], cwd=core_root)
         console.print("[green]✓[/green] plugins synced into local container volume")
+
+    from hc.commands.plugin_new import register_new
+    register_new(plugin_app)
+
+    # capabilities subgroup
+    cap_app = typer.Typer(
+        help="Инспекция capability registry",
+        context_settings={"help_option_names": ["-h", "--help"]},
+        no_args_is_help=True,
+    )
+
+    @cap_app.command("list")
+    def cap_list(
+        json_out: bool = typer.Option(False, "--json", help="JSON вывод"),
+    ) -> None:
+        """Показать все зарегистрированные capability и их провайдеры."""
+        console = Console()
+        client = require_client(console)
+        caps = anyio.run(client.list_capabilities)
+        if caps is None:
+            console.print("[red]Ошибка: не удалось получить список capabilities.[/red]")
+            raise typer.Exit(code=1)
+        if json_out:
+            from hc.json_output import print_json
+            print_json({"ok": True, "capabilities": caps})
+            return
+        from rich.table import Table
+        table = Table(title=f"Capabilities ({len(caps)})")
+        table.add_column("ID", style="bold cyan")
+        table.add_column("Провайдеры")
+        table.add_column("Local")
+        table.add_column("Remote")
+        for c in caps:
+            providers = [p.get("name", "?") for p in c.get("providers", [])]
+            table.add_row(
+                c.get("id", ""),
+                ", ".join(providers) or "—",
+                str(c.get("local_provider_count", 0)),
+                str(c.get("remote_provider_count", 0)),
+            )
+        console.print(table)
+
+    @cap_app.command("who-provides")
+    def cap_who_provides(
+        cap_id: str = typer.Argument(..., help="ID capability (напр. oauth:yandex)"),
+    ) -> None:
+        """Какой плагин предоставляет capability."""
+        console = Console()
+        client = require_client(console)
+        caps = anyio.run(client.list_capabilities)
+        if caps is None:
+            raise typer.Exit(code=1)
+        found = [c for c in caps if c.get("id", "") == cap_id]
+        if not found:
+            console.print(f"[yellow]Capability {cap_id!r} не зарегистрирован.[/yellow]")
+            raise typer.Exit(code=1)
+        cap = found[0]
+        console.print(f"[bold]{cap_id}[/bold]")
+        for p in cap.get("providers", []):
+            ptype = p.get("type", "local")
+            color = "green" if ptype == "local" else "yellow"
+            console.print(f"  [{color}]{ptype}[/{color}]  {p.get('name', '?')}")
+
+    plugin_app.add_typer(cap_app, name="capabilities")
+
+    from hc.commands.plugin_dev import register_dev
+    register_dev(plugin_app)
 
     app.add_typer(plugin_app, name="plugin")
 

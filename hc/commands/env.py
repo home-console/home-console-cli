@@ -15,6 +15,7 @@ from hc.core_source import CoreSource, get_core_source_from_repo, get_core_sourc
 from hc.env_state import load_last_env, save_last_env
 from hc.errors import CoreSourcesNotFoundError, HcCliError
 from hc.hints import ENV_STACK_HELP, ENV_VS_CORE_DOTENV
+from hc.json_output import print_json
 
 
 # ─── Service catalogue ────────────────────────────────────────────────────────
@@ -303,8 +304,36 @@ def _compose_ps_rows(project: ComposeProject) -> list[dict[str, object]]:
     return rows
 
 
-def _print_env_ps(console: Console, project: ComposeProject) -> None:
+def _env_ps_entries(project: ComposeProject) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for row in _compose_ps_rows(project):
+        service = str(row.get("Service") or row.get("Name") or "?")
+        ports = str(row.get("Publishers") or row.get("Ports") or "")
+        if ports in ("", "[]"):
+            ports = ""
+        entries.append(
+            {
+                "service": service,
+                "state": str(row.get("State") or row.get("Status") or "?"),
+                "ports": ports,
+                "url_hint": _KNOWN_ENDPOINTS.get(service, ""),
+            }
+        )
+    return entries
+
+
+def _print_env_ps(console: Console, project: ComposeProject, *, json_out: bool = False) -> None:
     rows = _compose_ps_rows(project)
+    if json_out:
+        print_json(
+            {
+                "ok": True,
+                "compose_file": str(project.compose_file),
+                "containers": _env_ps_entries(project),
+            }
+        )
+        return
+
     if not rows:
         subprocess.run(  # noqa: S603
             ["docker", "compose", "-f", str(project.compose_file), "ps", "-a"],
@@ -321,14 +350,13 @@ def _print_env_ps(console: Console, project: ComposeProject) -> None:
     table.add_column("Порты")
     table.add_column("URL / хост", style="cyan")
 
-    for row in rows:
-        service = str(row.get("Service") or row.get("Name") or "?")
-        state = str(row.get("State") or row.get("Status") or "?")
-        ports = str(row.get("Publishers") or row.get("Ports") or "—")
-        if ports in ("", "[]"):
-            ports = "—"
-        hint = _KNOWN_ENDPOINTS.get(service, "")
-        table.add_row(service, state, ports, hint)
+    for entry in _env_ps_entries(project):
+        table.add_row(
+            entry["service"],
+            entry["state"],
+            entry["ports"] or "—",
+            entry["url_hint"],
+        )
 
     console.print(table)
     console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
@@ -1057,6 +1085,7 @@ def register(app: typer.Typer) -> None:
     @env_app.command("ps")
     def env_ps(
         mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        json_out: bool = typer.Option(False, "--json", help="Машинный вывод в JSON"),
     ) -> None:
         """Контейнеры dev-стека: состояние, порты и подсказки URL."""
         console = Console()
@@ -1065,7 +1094,7 @@ def register(app: typer.Typer) -> None:
             mode = mode.strip().lower()
             src = _resolve_source(console)
             project = compose_project_from_source(console, src, mode=mode)
-            _print_env_ps(console, project)
+            _print_env_ps(console, project, json_out=json_out)
         except HcCliError as e:
             console.print(f"[red]Ошибка:[/red] {e.message}")
             if e.hint:

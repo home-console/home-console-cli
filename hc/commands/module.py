@@ -99,5 +99,46 @@ def register(app: typer.Typer) -> None:
         _require_supported(console, res)
         console.print(f"[green]✓[/green] {name} перезапущен")
 
+    @module_app.command("inspect")
+    def inspect(name: str = typer.Argument(..., help="Имя модуля")) -> None:
+        """Показать детали модуля: статус, uptime, зависимости."""
+        from rich.panel import Panel
+        from rich.pretty import Pretty
+        console = Console()
+        client = _client(console)
+        modules = anyio.run(client.get_modules)
+        if modules is None:
+            raise typer.Exit(code=1)
+
+        target = next((m for m in modules if m.get("name", "") == name), None)
+        if target is None:
+            known = [m.get("name", "") for m in modules]
+            console.print(f"[red]Модуль {name!r} не найден.[/red]")
+            console.print(f"Доступные: {', '.join(known)}")
+            raise typer.Exit(code=1)
+
+        from rich.table import Table
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("Поле", style="bold dim", width=16)
+        table.add_column("Значение", overflow="fold")
+
+        priority_keys = ["name", "status", "required", "uptime", "description"]
+        for key in priority_keys:
+            val = target.get(key)
+            if val is None:
+                continue
+            if key == "status":
+                color = "green" if str(val).lower() in {"running", "ok"} else "yellow"
+                table.add_row(key, f"[{color}]{val}[/{color}]")
+            elif key == "required":
+                table.add_row(key, "required" if bool(val) else "optional")
+            else:
+                table.add_row(key, str(val))
+
+        extra = {k: v for k, v in target.items() if k not in priority_keys and v is not None}
+        console.print(Panel(table, title=f"[bold]Module: {name}[/bold]", expand=False))
+        if extra:
+            console.print(Panel(Pretty(extra, expand_all=True), title="metadata", expand=False))
+
     app.add_typer(module_app, name="module")
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import shlex
+import subprocess
+import sys
 from typing import Iterable, Iterator, Sequence
 
 import anyio
@@ -9,7 +11,9 @@ import click
 import typer
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completion, Completer, WordCompleter
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.styles import Style
 from rich.console import Console
 
 from typer.main import get_command as _typer_get_command
@@ -181,6 +185,54 @@ class _HCCompleter(Completer):
             yield from self._cmd.get_completions(document, complete_event)
 
 
+_REPL_STYLE = Style.from_dict({
+    "prompt.bracket":  "#555555",
+    "prompt.name":     "#00aaff bold",
+    "prompt.sep":      "#555555",
+    "prompt.host":     "#888888",
+    "prompt.dot.on":   "#00cc66 bold",
+    "prompt.dot.off":  "#cc3333 bold",
+    "prompt.dot.warn": "#ccaa00 bold",
+    "prompt.ctx":      "#ccaa00",
+    "prompt.arrow":    "#00aaff bold",
+})
+
+
+def _build_prompt(
+    *,
+    host: str,
+    connected: bool,
+    group_ctx: str | None,
+    user: str = "",
+) -> HTML:
+    """Строит цветной промпт для prompt_toolkit."""
+    dot_cls = "prompt.dot.on" if connected else "prompt.dot.off"
+    dot = "●" if connected else "○"
+
+    ctx_part = (
+        f' <prompt.sep>/</prompt.sep>'
+        f'<prompt.ctx>{group_ctx}</prompt.ctx>'
+        if group_ctx else ""
+    )
+    user_part = (
+        f'<prompt.sep>:</prompt.sep><prompt.host>{user}</prompt.host>'
+        if user else ""
+    )
+
+    return HTML(
+        f'<prompt.bracket>[</prompt.bracket>'
+        f'<prompt.name>hc</prompt.name>'
+        f'<prompt.sep>@</prompt.sep>'
+        f'<prompt.host>{host}</prompt.host>'
+        f'{user_part}'
+        f'<prompt.sep> </prompt.sep>'
+        f'<{dot_cls}>{dot}</{dot_cls}>'
+        f'{ctx_part}'
+        f'<prompt.bracket>]</prompt.bracket>'
+        f'<prompt.arrow>▶</prompt.arrow> '
+    )
+
+
 def _prompt(prefix: str | None) -> str:
     return f"{prefix}> " if prefix else "hc> "
 
@@ -228,6 +280,37 @@ def _split_batch(line: str) -> list[tuple[str, str | None]]:
     return out
 
 
+def _print_banner(console: Console, connected: bool, hostport: str, cfg_ok: bool, version: str) -> None:
+    from rich.panel import Panel
+    from rich.text import Text
+
+    if connected:
+        status_color = "green"
+        status_icon = "●"
+        status_text = f"connected  {hostport}"
+    elif cfg_ok:
+        status_color = "yellow"
+        status_icon = "○"
+        status_text = f"offline  {hostport}"
+    else:
+        status_color = "red"
+        status_icon = "○"
+        status_text = "not configured"
+
+    t = Text()
+    t.append("HomeConsole", style="bold #00aaff")
+    t.append(f"  v{version}", style="dim")
+    t.append("   ")
+    t.append(f"{status_icon} {status_text}", style=f"bold {status_color}")
+    t.append("\n", style="")
+    t.append("  Type 'help' or '?' for commands, 'exit' to quit", style="dim")
+    t.append("\n  ", style="")
+    t.append("!cmd", style="dim bold")
+    t.append(" — system shell command", style="dim")
+
+    console.print(Panel(t, border_style="#333333", padding=(0, 1)))
+
+
 def run_repl(app: typer.Typer) -> None:
     console = Console()
     cfg = Config.load()
@@ -237,25 +320,31 @@ def run_repl(app: typer.Typer) -> None:
 
     plugins: list[str] = []
     connected = False
+    current_user = ""
+
     if cfg_ok:
         client = require_client(console, silent=True)
 
-        async def _get_names() -> tuple[bool, list[str]]:
-            # Пытаемся получить имена плагинов из inspector (админский источник истины).
+        async def _get_names() -> tuple[bool, list[str], str]:
             insp = await client.inspector_plugins()
             if isinstance(insp, dict):
                 arr = insp.get("plugins") or []
                 if isinstance(arr, list):
                     names = [str(p["name"]) for p in arr if isinstance(p, dict) and p.get("name")]
                     if names:
-                        return True, names
-            # Fallback на старый эндпоинт (если он есть).
+                        me = await client.auth_me()
+                        user_id = ""
+                        if isinstance(me, dict):
+                            r = me.get("result") or me
+                            if isinstance(r, dict):
+                                user_id = str(r.get("user_id") or r.get("username") or "")
+                        return True, names, user_id
             items = await client.get_plugins()
             if items is not None:
-                return True, [str(p.get("name", "")) for p in items if p.get("name")]
-            return False, []
+                return True, [str(p.get("name", "")) for p in items if p.get("name")], ""
+            return False, [], ""
 
-        connected, plugins = anyio.run(_get_names)
+        connected, plugins, current_user = anyio.run(_get_names)
 
     commands = repl_root_commands()
     group_ctx: str | None = None
@@ -265,19 +354,25 @@ def run_repl(app: typer.Typer) -> None:
 
     completer = _HCCompleter(app=app, commands=commands, plugins=plugins, get_group_ctx=_get_ctx)
 
-    if connected:
-        status = f"connected to {hostport}"
-    elif cfg_ok:
-        status = f"offline • configured for {hostport}"
-    else:
-        status = "not connected"
-    console.print(f"{APP_NAME} {__version__} | {status}")
-    console.print("Type 'help' or '?' for commands, 'exit' to quit")
-
+    _print_banner(console, connected, hostport, cfg_ok, __version__)
     print_update_banner(console, __version__)
 
     HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    session = PromptSession(_prompt(None), history=FileHistory(str(HISTORY_PATH)), completer=completer)
+
+    def _make_prompt() -> HTML:
+        return _build_prompt(
+            host=hostport,
+            connected=connected,
+            group_ctx=group_ctx,
+            user=current_user,
+        )
+
+    session: PromptSession = PromptSession(
+        _make_prompt(),
+        history=FileHistory(str(HISTORY_PATH)),
+        completer=completer,
+        style=_REPL_STYLE,
+    )
 
     while True:
         try:
@@ -288,6 +383,14 @@ def run_repl(app: typer.Typer) -> None:
         line = line.strip()
         if not line:
             continue
+
+        # !cmd — запуск системной команды прямо из hc shell
+        if line.startswith("!"):
+            sys_cmd = line[1:].strip()
+            if sys_cmd:
+                subprocess.run(sys_cmd, shell=True)  # noqa: S602
+            continue
+
         if line == "clear":
             console.clear()
             continue
@@ -295,16 +398,20 @@ def run_repl(app: typer.Typer) -> None:
             break
         if line in {"back", ".."}:
             group_ctx = None
-            session.message = _prompt(None)
+            session.message = "hc> "
             continue
         if line in {"help", "?"}:
-            console.print("Команды: " + ", ".join(commands))
+            console.print("\n[bold]Команды:[/bold] " + "  ".join(sorted(commands)))
+            console.print("[dim]  !<cmd>[/dim]  — системная команда (bash)")
+            console.print("[dim]  use <group>[/dim]  — войти в контекст (core, plugin, ...)")
+            console.print("[dim]  back / ..[/dim]  — выйти из контекста")
+            console.print("[dim]  exit[/dim]  — выйти из hc shell\n")
             continue
         if line.startswith("use "):
             target = line.removeprefix("use ").strip()
             if target in _GROUPS:
                 group_ctx = target
-                session.message = _prompt(f"hc {group_ctx}")
+                session.message = f"hc {group_ctx}> "
                 try:
                     app(prog_name="hc", args=[group_ctx, "--help"], standalone_mode=False)
                 except Exception:
@@ -334,29 +441,19 @@ def run_repl(app: typer.Typer) -> None:
             except ValueError as e:
                 console.print(f"[red]Ошибка: {e}[/red]")
                 return False
-            # UX: внутри `hc shell` люди часто по привычке пишут `hc ...`
-            # Считаем это допустимым и просто убираем префикс.
             if args and args[0] == "hc":
                 args = args[1:]
-
-            # `setup help` / `core ?` → показываем help.
             if args and args[-1] in {"help", "?"}:
                 args = [*args[:-1], "--help"]
-
-            # Проваливаемся в контекст: `core` → core>
             if len(args) == 1 and args[0] in _GROUPS:
                 group_ctx = args[0]
-                session.message = _prompt(f"hc {group_ctx}")
                 try:
                     app(prog_name="hc", args=[group_ctx, "--help"], standalone_mode=False)
                 except Exception:
                     pass
                 return True
-
-            # Если мы внутри группы, подставляем префикс.
             if group_ctx and (not args or args[0] not in _GROUPS):
                 args = [group_ctx, *args]
-
             try:
                 app(prog_name="hc", args=args, standalone_mode=False)
                 return True
@@ -371,7 +468,6 @@ def run_repl(app: typer.Typer) -> None:
                 if args and args[0] == "connect" and "Missing argument" in msg and "HOST" in msg:
                     console.print("[red]Ошибка: не указан адрес CoreRuntime.[/red]")
                     console.print("Пример: [bold]connect localhost --port 18000[/bold]")
-                    console.print("Токен можно передать `--token`, через `HC_TOKEN`, или ввести интерактивно.")
                     return False
                 console.print(f"[red]{msg}[/red]")
                 return False

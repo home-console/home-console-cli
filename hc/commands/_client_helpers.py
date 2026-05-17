@@ -40,6 +40,7 @@ def client_from_config(cfg: Config, *, token: str | None = None, silent: bool = 
     port = int(port_raw) if port_raw else int(cfg.core.port)
     auth = os.getenv("HC_AUTH") or cfg.core.auth
 
+    socket_path = os.getenv("HC_SOCKET") or getattr(cfg.core, "socket_path", "") or ""
     base_url = f"http://{host}:{port}"
     client = HCClient(
         base_url=base_url,
@@ -48,6 +49,7 @@ def client_from_config(cfg: Config, *, token: str | None = None, silent: bool = 
         auth=auth,
         refresh_token=cfg.core.refresh_token if using_config_token else "",
         on_token_refreshed=_make_refresh_callback(cfg) if using_config_token else None,
+        socket_path=socket_path or None,
     )
     return _mute_auth_hints(client) if silent else client
 

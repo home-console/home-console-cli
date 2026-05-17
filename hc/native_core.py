@@ -163,6 +163,7 @@ def native_up(
     *,
     use_hc_python: bool,
     no_ui: bool,
+    foreground: bool = False,
     wait_health: bool = True,
     health_timeout: float = 90.0,
 ) -> None:
@@ -192,6 +193,11 @@ def native_up(
     py_exe = resolve_core_python(console, src.path, use_hc_python=use_hc_python)
     _, log_path = _native_paths()
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if foreground:
+        _native_up_foreground(console, src, py_exe=py_exe, main_py=main_py, env_path=env_path)
+        return
+
     log_f: IO[bytes] = open(log_path, "ab", buffering=0)  # noqa: SIM115
     try:
         if sys.platform == "win32":
@@ -242,6 +248,50 @@ def native_up(
         "[dim]Полный стек с UI — через Docker (`hc core up`). Лог процесса: "
         f"{log_path}[/dim]"
     )
+
+
+def _native_up_foreground(
+    console: Console,
+    src: CoreSource,
+    *,
+    py_exe: str,
+    main_py: Path,
+    env_path: Path,
+) -> None:
+    """Запустить Core в foreground — stdout/stderr прямо в терминал.
+
+    PID-файл пишется до передачи управления процессу и удаляется при выходе.
+    Ctrl+C → SIGINT → graceful shutdown Core (uvicorn сам обрабатывает).
+    """
+    port, display_host = api_listen_display(env_path)
+    base_url = f"http://{display_host}:{port}"
+    console.print(f"[dim]Core (native, foreground). API будет на [bold]{base_url}[/bold]. Ctrl+C для остановки.[/dim]")
+
+    try:
+        proc = subprocess.Popen(  # noqa: S603
+            [py_exe, str(main_py)],
+            cwd=str(src.path),
+        )
+    except OSError as e:
+        console.print(f"[red]Ошибка: не удалось запустить процесс: {e}[/red]")
+        raise typer.Exit(code=1) from e
+
+    _write_pid_file(proc.pid)
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        console.print("\n[dim]Получен Ctrl+C, жду завершения Core…[/dim]")
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    finally:
+        _remove_pid_file()
+
+    if proc.returncode not in (0, -2, -15):  # 0=ok, SIGINT, SIGTERM
+        console.print(f"[yellow]Core завершился с кодом {proc.returncode}.[/yellow]")
+        raise typer.Exit(code=proc.returncode)
 
 
 def _terminate_process_tree(pid: int, *, grace: float) -> None:
@@ -299,6 +349,33 @@ def native_down(console: Console, *, volumes: bool) -> None:
     console.print("[green]✓[/green] Нативный Core остановлен.")
 
 
+def _proc_stats(pid: int) -> dict[str, str]:
+    """Получить uptime, RSS (МБ) и CPU% процесса без psutil."""
+    stats: dict[str, str] = {}
+    if sys.platform == "win32":
+        return stats
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["ps", "-p", str(pid), "-o", "etime=,rss=,pcpu="],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split()
+            if len(parts) >= 1:
+                stats["uptime"] = parts[0]
+            if len(parts) >= 2:
+                try:
+                    rss_kb = int(parts[1])
+                    stats["rss"] = f"{rss_kb / 1024:.1f} MB"
+                except ValueError:
+                    pass
+            if len(parts) >= 3:
+                stats["cpu"] = f"{parts[2]}%"
+    except Exception:  # noqa: BLE001
+        pass
+    return stats
+
+
 def native_ps(console: Console, src: CoreSource) -> None:
     env_path = core_env_path(src.path)
     port, display_host = api_listen_display(env_path)
@@ -313,7 +390,19 @@ def native_ps(console: Console, src: CoreSource) -> None:
         _remove_pid_file()
         raise typer.Exit(code=1)
 
-    console.print(f"native core-runtime  PID={pid}  API={base_url}")
+    stats = _proc_stats(pid)
+    uptime = stats.get("uptime", "—")
+    rss    = stats.get("rss",    "—")
+    cpu    = stats.get("cpu",    "—")
+
+    console.print(
+        f"[bold]native core-runtime[/bold]  "
+        f"PID=[cyan]{pid}[/cyan]  "
+        f"uptime=[cyan]{uptime}[/cyan]  "
+        f"mem=[cyan]{rss}[/cyan]  "
+        f"cpu=[cyan]{cpu}[/cyan]"
+    )
+    console.print(f"API: [bold]{base_url}[/bold]")
     try:
         r = httpx.get(base_url.rstrip("/") + "/api/v1/monitor/health", timeout=3.0)
         if r.status_code == 200:
@@ -367,3 +456,57 @@ def _tail_follow(console: Console, path: Path, *, tail_lines: int) -> None:
                 console.print(line.decode("utf-8", errors="replace"), end="")
             else:
                 time.sleep(0.3)
+
+
+# ---------------------------------------------------------------------------
+# Signal / named aliases
+# ---------------------------------------------------------------------------
+
+_SIGNAL_ALIASES: dict[str, int] = {
+    "reload":  signal.SIGHUP.value  if hasattr(signal, "SIGHUP")  else 1,
+    "dump":    signal.SIGUSR1.value if hasattr(signal, "SIGUSR1") else 10,
+    "quit":    signal.SIGQUIT.value if hasattr(signal, "SIGQUIT") else 3,
+    "term":    signal.SIGTERM.value,
+    "int":     signal.SIGINT.value,
+}
+
+
+def native_signal(console: Console, sig: str) -> None:
+    """Послать сигнал native-процессу Core.
+
+    sig — имя (reload|dump|quit|term|int) или номер сигнала (строка).
+    """
+    if sys.platform == "win32":
+        console.print("[red]Ошибка: сигналы не поддерживаются на Windows.[/red]")
+        raise typer.Exit(code=1)
+
+    pid = _read_pid_file()
+    if pid is None:
+        console.print("[red]Ошибка: нативный Core не запущен (нет PID-файла).[/red]")
+        raise typer.Exit(code=1)
+    if not _pid_alive(pid):
+        console.print(f"[yellow]PID {pid} не существует — устаревший PID-файл.[/yellow]")
+        _remove_pid_file()
+        raise typer.Exit(code=1)
+
+    sig_lower = sig.strip().lower()
+    signum: int | None = _SIGNAL_ALIASES.get(sig_lower)
+    if signum is None:
+        try:
+            signum = int(sig)
+        except ValueError:
+            known = ", ".join(_SIGNAL_ALIASES.keys())
+            console.print(f"[red]Ошибка: неизвестный сигнал {sig!r}. Известные: {known}, или номер (напр. 15).[/red]")
+            raise typer.Exit(code=1)
+
+    try:
+        os.kill(pid, signum)
+    except ProcessLookupError:
+        console.print(f"[yellow]Процесс {pid} не найден.[/yellow]")
+        _remove_pid_file()
+        raise typer.Exit(code=1)
+    except PermissionError:
+        console.print(f"[red]Ошибка: нет прав на отправку сигнала процессу {pid}.[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"[green]✓[/green] Сигнал {sig} ({signum}) → PID {pid}")

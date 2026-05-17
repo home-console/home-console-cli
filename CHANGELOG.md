@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.0.9] — 2026-05-17
+
+### Added
+- `hc core restart [--mode docker|native]` — перезапуск Core одной командой (down → up)
+- `hc core up --foreground` / `-f` — запуск native Core прямо в TTY (stdout в терминал, Ctrl+C для остановки)
+- `hc core signal <reload|dump|quit|term|int|N>` — отправить UNIX-сигнал native Core процессу
+  - `reload` → SIGHUP (перечитать конфиг без перезапуска)
+  - `dump` → SIGUSR1 (дамп состояния в лог)
+- `hc emergency inspect` — дамп состояния БД без API: пользователи, сессии, API-ключи, все namespaces
+- `hc emergency reset-admin` — сброс пароля пользователя напрямую в SQLite (bcrypt); интерактивный ввод; автоотзыв сессий
+- `hc emergency list-users` — список пользователей из БД без API
+- `hc emergency revoke-sessions <user_id>` — инвалидировать сессии пользователя напрямую в БД
+- `hc plugin new <name>` — scaffolding плагина: `plugin.py`, `__init__.py`, `plugin.json`, `requirements.txt`
+  - флаги `--description`, `--author`, `--capability` (повторяемый), `--output`, `--force`
+- Unix socket транспорт в `HCClient` — если задан `RUNTIME_SOCKET_PATH` в Core или `HC_SOCKET` env / `core.socket_path` в config — CLI подключается через UDS вместо HTTP
+- `core.socket_path` добавлен в конфиг (`~/.config/hc/config.toml`)
+- `bcrypt>=4.0` добавлен как зависимость пакета
+- `hc service list` — все зарегистрированные сервисы ядра с фильтром `--plugin` / `--filter`
+- `hc event list` — snapshot текущих подписок на события
+- `hc event tail [--filter glob]` — live SSE-стрим событий event bus (Ctrl+C для остановки)
+- `hc plugin dev <path>` — dev-режим плагина: polling-watch файлов → sync → auto-reload
+- `hc shell` — новый цветной промпт `[hc@host:user ●]▶` с индикатором online/offline
+- `hc shell` — `!cmd` для выполнения системных команд прямо из hc shell
+- `hc shell` — новый баннер с версией и статусом Core в панели
+- `hc shell-config show/install/uninstall`
+- `hc service call <name> [--json <kwargs>]` — вызвать сервис ядра напрямую из CLI
+- `hc event emit <type> [--json <data>]` — послать событие в event bus
+- `hc plugin capabilities list` — все зарегистрированные capability и провайдеры
+- `hc plugin capabilities who-provides <cap>` — какой плагин даёт capability
+- `hc core dump [--output file.json]` — дамп живого состояния ядра (плагины, сервисы, модули, события)
+
+### Changed (core-runtime-service)
+- `modules/admin/http_endpoints.py`: добавлен endpoint `GET /api/v1/admin/inspector/capabilities`
+- `modules/api/route_binding.py`: добавлены `POST /api/v1/admin/services/{name}/call` и `POST /api/v1/admin/events/emit`
+- `hc core ps --mode native` — теперь показывает uptime, memory RSS, CPU% (через `ps`)
+- `hc module inspect <name>` — детальная информация о модуле ядра
+- `hc config edit` — открывает `$EDITOR`, после закрытия валидирует конфиг
+- `hc status --components` / `-c` — статус каждого компонента: API, Modules, Plugins, Storage — установка zsh/bash/fish конфига с алиасами и промптом
+  - алиасы: `plugins`, `events`, `core-status`, `core-restart`, `emergency`, `services`
+  - функция `hcs` — быстрый вход в hc shell
+  - RPROMPT/right prompt показывает статус Core (● online / ○ offline)
+  - `--mode auto|native|docker` — автодетект по наличию запущенного контейнера
+  - `--interval` — частота проверки (default 1s)
+  - `--no-reload` — только sync, без API reload
+  - `--compose` — путь к compose-файлу для docker-режима
+
+### Changed (core-runtime-service)
+- `modules/api/module.py`: uvicorn слушает Unix socket если задан `RUNTIME_SOCKET_PATH` в `.env`
+- `modules/api/route_binding.py`: добавлен SSE endpoint `GET /api/v1/admin/inspector/events/stream`
+
 ## [0.0.8] — 2026-05-16
 
 ### Fixed
