@@ -153,7 +153,8 @@ hc plugin list
 
 ### Диагностика и recovery
 
-- `hc doctor` — Docker, git, конфиг, исходники, порты, диск
+- `hc doctor` — полная диагностика; `hc doctor --quick` — Docker/конфиг/режимы; `hc doctor --api` — Core API
+- `hc doctor --json` / `hc status --json` / `hc plugin list --json` / `hc env ps --json`
 - `hc recovery …` — recovery-стек (core, db, compose, backup)
 - `hc setup` — мастер первого запуска
 
