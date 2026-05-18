@@ -32,6 +32,19 @@ async def _probe(url: str, verify_ssl: bool) -> bool:
     return r.status_code in {200, 401, 403}
 
 
+async def _probe_ports(host: str, ports: list[int], verify_ssl: bool) -> list[int]:
+    results = [False] * len(ports)
+
+    async def _try(idx: int, p: int) -> None:
+        results[idx] = await _probe(f"http://{host}:{p}", verify_ssl)
+
+    async with anyio.create_task_group() as tg:
+        for i, p in enumerate(ports):
+            tg.start_soon(_try, i, p)
+
+    return [ports[i] for i, ok in enumerate(results) if ok]
+
+
 def _pick_port(host: str, cfg: Config) -> int:
     suggested = cfg.core.port
     if host == "localhost" and suggested == 8080:
@@ -39,22 +52,18 @@ def _pick_port(host: str, cfg: Config) -> int:
     return suggested or 8080
 
 
-def _autofix_port(console: Console, host: str, port: int, verify_ssl: bool) -> tuple[int, str] | None:
-    common = [port, 18000, 8000, 8080]
-    seen: set[int] = set()
-    for p in common:
-        if p in seen:
-            continue
-        seen.add(p)
-        url = f"http://{host}:{p}"
-        if anyio.run(_probe, url, verify_ssl):
-            if p != port and typer.confirm(
-                f"Core отвечает на порту {p}. Использовать его вместо {port}?", default=True
-            ):
-                return p, url
-            if p == port:
-                return p, url
-    return None
+def _autofix_port(host: str, port: int, verify_ssl: bool) -> tuple[int, str] | None:
+    candidates = list(dict.fromkeys([port, 18000, 8000, 8080]))
+    responding = anyio.run(_probe_ports, host, candidates, verify_ssl)
+    if not responding:
+        return None
+    found = responding[0]
+    url = f"http://{host}:{found}"
+    if found != port and not typer.confirm(
+        f"Core отвечает на порту {found}. Использовать его вместо {port}?", default=True
+    ):
+        return None
+    return found, url
 
 
 def _find_repo_root() -> Path | None:
@@ -161,7 +170,7 @@ def run_setup(background: bool) -> None:
     port = int(typer.prompt("Port", default=str(_pick_port(host, cfg))))
     base_url = f"http://{host}:{port}"
 
-    fixed = _autofix_port(console, host, port, cfg.core.verify_ssl)
+    fixed = _autofix_port(host, port, cfg.core.verify_ssl)
     if fixed:
         port, base_url = fixed
 
@@ -170,9 +179,10 @@ def run_setup(background: bool) -> None:
         console.print("[yellow]Core не запущен или недоступен на указанном адресе.[/yellow]")
         sp = _maybe_start_core(console, background=background)
         if sp and background:
-            console.print("[green]✓[/green] Запустил CoreRuntime в фоне.")
-            console.print("Дай ему 10–20 секунд, потом продолжим подключение.")
-            console.print("Смотри логи: `hc setup logs --follow`")
+            console.print("[green]✓[/green] CoreRuntime запускается в фоне.")
+            console.print("Когда поднимется (10–20 сек), выполни:")
+            console.print("  [bold cyan]hc connect localhost --port 18000[/bold cyan]")
+            console.print("Логи: [dim]hc setup logs --follow[/dim]")
             raise typer.Exit(code=0)
         if sp:
             host, port = "localhost", 18000
@@ -209,6 +219,7 @@ def run_setup(background: bool) -> None:
         anyio.run(_install_base)
 
     console.print(f"[green]✓[/green] Готово. Подключено к {host}:{port}.")
+    SetupProcess.cleanup()
     _maybe_upgrade_cli(console)
     _offer_shell_completion(console)
 

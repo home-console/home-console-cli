@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import typer
 from rich.console import Console
 
@@ -67,8 +68,6 @@ def register(app: typer.Typer) -> None:
                         pos = size
                 except KeyboardInterrupt:
                     break
-                import time
-
                 time.sleep(0.5)
 
     app.add_typer(setup_app, name="setup")

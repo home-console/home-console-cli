@@ -307,6 +307,13 @@ def _print_banner(console: Console, connected: bool, hostport: str, cfg_ok: bool
     t.append("\n  ", style="")
     t.append("!cmd", style="dim bold")
     t.append(" — system shell command", style="dim")
+    if not cfg_ok:
+        t.append("\n  ", style="")
+        t.append("→ run ", style="dim")
+        t.append("setup", style="bold cyan")
+        t.append(" to connect, or ", style="dim")
+        t.append("connect <host>", style="bold cyan")
+        t.append(" if core is already running", style="dim")
 
     console.print(Panel(t, border_style="#333333", padding=(0, 1)))
 
@@ -388,7 +395,7 @@ def run_repl(app: typer.Typer) -> None:
         if line.startswith("!"):
             sys_cmd = line[1:].strip()
             if sys_cmd:
-                subprocess.run(sys_cmd, shell=True)  # noqa: S602
+                subprocess.run(shlex.split(sys_cmd), shell=False)  # noqa: S603
             continue
 
         if line == "clear":

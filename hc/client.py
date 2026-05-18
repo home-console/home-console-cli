@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -330,41 +331,52 @@ class HCClient:
 
     async def _stream_sse(self, path: str, **kwargs: Any) -> AsyncGenerator[str, None]:
         console = Console()
-        url = f"{(self.api_prefix or API_PREFIX_CANDIDATES[0])}{path}"
+        prefix = self.api_prefix or API_PREFIX_CANDIDATES[0]
+        url = f"{prefix}{path}"
+        max_reconnects = 5
+        backoff_base = 0.5
 
-        for attempt in range(2):
-            try:
-                async with self._async_client(timeout=30000.0) as client:
-                    async with client.stream(
-                        "GET",
-                        url,
-                        headers={**self._headers(), "Accept": "text/event-stream"},
-                        **kwargs,
-                    ) as resp:
-                        if resp.status_code == 401:
-                            if attempt == 0 and await self._try_refresh():
-                                continue  # retry with refreshed token
-                            self._expired_session_hint()
+        for reconnect in range(max_reconnects):
+            for auth_attempt in range(2):
+                try:
+                    async with self._async_client(timeout=30000.0) as client:
+                        async with client.stream(
+                            "GET",
+                            url,
+                            headers={**self._headers(), "Accept": "text/event-stream"},
+                            **kwargs,
+                        ) as resp:
+                            if resp.status_code == 401:
+                                if auth_attempt == 0 and await self._try_refresh():
+                                    continue
+                                self._expired_session_hint()
+                                return
+                            if resp.status_code == 403:
+                                self._auth_hint(403)
+                                return
+                            if resp.is_error:
+                                console.print(f"[red]Ошибка: HTTP {resp.status_code}[/red]")
+                                return
+                            async for line in resp.aiter_lines():
+                                if not line:
+                                    continue
+                                if line.startswith("data:"):
+                                    yield line.removeprefix("data:").lstrip()
                             return
-                        if resp.status_code == 403:
-                            self._auth_hint(403)
-                            return
-                        if resp.is_error:
-                            console.print(f"[red]Ошибка: HTTP {resp.status_code}[/red]")
-                            return
-                        async for line in resp.aiter_lines():
-                            if not line:
-                                continue
-                            if line.startswith("data:"):
-                                yield line.removeprefix("data:").lstrip()
-                        return
-            except httpx.ConnectError:
-                hostport = self.base_url.replace("http://", "").replace("https://", "")
-                console.print(f"[red]Ошибка: Core недоступен на {hostport}[/red]")
-                return
-            except httpx.RequestError as e:
-                console.print(f"[red]Ошибка: {e}[/red]")
-                return
+                except httpx.ConnectError:
+                    if reconnect < max_reconnects - 1:
+                        await asyncio.sleep(backoff_base * (2**reconnect))
+                        continue
+                    hostport = self.base_url.replace("http://", "").replace("https://", "")
+                    console.print(f"[red]Ошибка: Core недоступен на {hostport}[/red]")
+                    return
+                except httpx.RequestError as e:
+                    if reconnect < max_reconnects - 1:
+                        await asyncio.sleep(backoff_base * (2**reconnect))
+                        continue
+                    console.print(f"[red]Ошибка: {e}[/red]")
+                    return
+            return
 
     # ------------------------------------------------------------------
     # Auth
@@ -494,6 +506,15 @@ class HCClient:
             return data
         data = await self._request_json("GET", endpoints.HEALTH)
         return data if isinstance(data, dict) else None
+
+    async def core_version(self) -> dict[str, Any] | None:
+        data = await self._request_json_absolute("GET", endpoints.VERSION)
+        if not isinstance(data, dict):
+            return None
+        result = data.get("result")
+        if isinstance(result, dict):
+            return result
+        return data
 
     async def get_plugins(self) -> list[dict[str, Any]] | None:
         data = await self._request_json_optional("GET", endpoints.PLUGINS)

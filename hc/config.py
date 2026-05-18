@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import fcntl
+import os
+import threading
 from dataclasses import dataclass, field
 from typing import Self
 
 from tomlkit import document, parse
 
 from hc.constants import CONFIG_DIR, CONFIG_PATH, DEFAULT_CORE_IMAGE, DEFAULT_HOST, DEFAULT_PORT
+
+_config_lock = threading.RLock()
+_cached_config: "Config | None" = None
+_cached_mtime: float | None = None
 
 
 def normalize_deploy_core_mode(mode: str) -> str:
@@ -14,6 +21,14 @@ def normalize_deploy_core_mode(mode: str) -> str:
     if m == "image":
         return "dev-image"
     return m
+
+
+def invalidate_config_cache() -> None:
+    """Сбросить in-process кэш (тесты, внешние правки файла)."""
+    global _cached_config, _cached_mtime
+    with _config_lock:
+        _cached_config = None
+        _cached_mtime = None
 
 
 @dataclass(slots=True)
@@ -65,9 +80,30 @@ class Config:
 
     @classmethod
     def load(cls) -> Self:
+        global _cached_config, _cached_mtime
+        with _config_lock:
+            mtime: float | None = None
+            if CONFIG_PATH.exists():
+                mtime = CONFIG_PATH.stat().st_mtime
+                if _cached_config is not None and _cached_mtime == mtime:
+                    return _cached_config
+
+            inst = cls._load_unlocked()
+            _cached_config = inst
+            _cached_mtime = mtime
+            return inst
+
+    @classmethod
+    def _load_unlocked(cls) -> Self:
         if not CONFIG_PATH.exists():
             return cls()
-        data = parse(CONFIG_PATH.read_text(encoding="utf-8"))
+        with CONFIG_PATH.open("r", encoding="utf-8") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
+            try:
+                raw = fh.read()
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        data = parse(raw)
         core = data.get("core", {})
         display = data.get("display", {})
         recovery = data.get("recovery", {})
@@ -123,8 +159,25 @@ class Config:
             "ssh": self.deploy.ssh,
             "path": self.deploy.path,
         }
-        CONFIG_PATH.write_text(doc.as_string(), encoding="utf-8")
+        payload = doc.as_string()
+        tmp_path = CONFIG_PATH.with_suffix(".toml.tmp")
+        with _config_lock:
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    fh.write(payload)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                finally:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            os.replace(tmp_path, CONFIG_PATH)
+            try:
+                CONFIG_PATH.chmod(0o600)
+            except OSError:
+                pass
+            global _cached_config, _cached_mtime
+            _cached_config = self
+            _cached_mtime = CONFIG_PATH.stat().st_mtime if CONFIG_PATH.exists() else None
 
     def is_configured(self) -> bool:
         return bool(self.core.host.strip()) and bool(self.core.token.strip())
-

@@ -10,7 +10,6 @@ REPL_GROUPS: frozenset[str] = frozenset(
         "env",
         "deploy",
         "update",
-        "setup",
         "plugin",
         "module",
         "recovery",

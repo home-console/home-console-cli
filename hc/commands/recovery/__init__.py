@@ -202,4 +202,5 @@ def register(app: typer.Typer) -> None:
         console.print(f"[green]✓[/green] Backup: {snap}")
 
     app.add_typer(recovery_app, name="recovery")
+    app.add_typer(recovery_app, name="local")
 

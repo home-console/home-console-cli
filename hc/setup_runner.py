@@ -40,6 +40,10 @@ class SetupProcess:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         SETUP_PID_PATH.write_text(f"{self.pid}\n", encoding="utf-8")
 
+    @classmethod
+    def cleanup(cls) -> None:
+        SETUP_PID_PATH.unlink(missing_ok=True)
+
 
 def start_background(command: list[str], cwd: Path) -> SetupProcess:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)

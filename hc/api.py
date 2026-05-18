@@ -3,7 +3,11 @@ from __future__ import annotations
 # Здесь живут все “контрактные” пути, чтобы не размазывать строки по коду.
 # Если Core переедет на /api/v1 — клиент должен пережить это без правок команд.
 
-API_PREFIX_CANDIDATES: tuple[str, ...] = ("/api", "/api/v1")
+# v1 первым — не залипать на legacy /api, если оба префикса отвечают.
+API_PREFIX_CANDIDATES: tuple[str, ...] = ("/api/v1", "/api")
+
+# Публичный контракт версии Core (без auth).
+VERSION = "/api/v1/version"
 
 # Core
 HEALTH = "/health"

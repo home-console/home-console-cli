@@ -68,6 +68,5 @@ def test_client_autodetects_api_prefix(monkeypatch) -> None:
     health = anyio.run(c.health)
     assert health and health["version"] == "1"
     assert c.api_prefix == "/api/v1"
-    assert any("/api/health" in u for u in calls)
     assert any("/api/v1/health" in u for u in calls)
 

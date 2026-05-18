@@ -25,6 +25,12 @@ def connect_and_save(host: str, port: int, token: str, auth: str = "auto") -> di
     if not health:
         return None
 
+    ver = anyio.run(client.core_version)
+    if ver:
+        v = str(ver.get("version", "")).strip()
+        if v:
+            console.print(f"[dim]Core version:[/dim] {v}")
+
     cfg.core.host = host
     cfg.core.port = port
     cfg.core.token = token

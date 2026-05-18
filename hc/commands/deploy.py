@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from hc.config import Config, normalize_deploy_core_mode
-from hc.core_ops import compose_project_from_source, require_docker
+from hc.core_ops import ComposeProject, compose_project_from_source, require_docker
 from hc.core_source import (
     IMAGE_MODES,
     VALID_MODES,
@@ -453,6 +453,57 @@ def _wait_core_healthy_remote(
     )
 
 
+def _running_core_image(compose_file: Path) -> str | None:
+    """Текущий образ core-runtime до rollout (для отката)."""
+    ps = subprocess.run(  # noqa: S603
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(compose_file),
+            "ps",
+            "-q",
+            "core-runtime",
+        ],
+        cwd=str(compose_file.parent),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    cid = (ps.stdout or "").strip().splitlines()
+    if not cid:
+        return None
+    insp = subprocess.run(  # noqa: S603
+        ["docker", "inspect", "-f", "{{.Config.Image}}", cid[0]],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    image = (insp.stdout or "").strip()
+    return image or None
+
+
+def _rollback_core_local(
+    console: Console,
+    *,
+    compose_file: Path,
+    previous_image: str,
+    db: str | None,
+    cache: str | None,
+    quiet: bool,
+) -> None:
+    if not quiet:
+        console.print(f"[yellow]Rollback:[/yellow] откат на образ [bold]{previous_image}[/bold]")
+    env = {**os.environ, "CORE_RUNTIME_IMAGE": previous_image, **_compose_env_overrides(db=db, cache=cache)}
+    _run_env(
+        ["docker", "compose", "-f", str(compose_file), "up", "-d"],
+        cwd=compose_file.parent,
+        env=env,
+    )
+    if not quiet:
+        console.print("[green]✓[/green] rollback compose up выполнен")
+
+
 def register(app: typer.Typer) -> None:
     deploy_app = typer.Typer(
         help="Деплой: build/tag/push/rollout и sync platform frontend в core",
@@ -505,6 +556,11 @@ def register(app: typer.Typer) -> None:
         quiet: bool = typer.Option(False, "--quiet", help="Минимальный вывод (только итог/ошибка)"),
         json_out: bool = typer.Option(False, "--json", help="Машинный вывод в JSON"),
         dry_run: bool = typer.Option(False, "--dry-run", help="Показать план деплоя без реального выполнения"),
+        rollback_on_failure: bool = typer.Option(
+            True,
+            "--rollback-on-failure/--no-rollback-on-failure",
+            help="При падении wait healthy откатить compose на предыдущий образ (local)",
+        ),
     ) -> None:
         """
         Если запущено как `hc deploy` без подкоманд — выполняет полный пайплайн:
@@ -570,6 +626,16 @@ def register(app: typer.Typer) -> None:
                 dt = _step_ok(console, "Push", t0, quiet=quiet or json_out)
                 steps.append({"name": "push", "ok": True, "duration_s": dt})
 
+            previous_image: str | None = None
+            rollback_project: ComposeProject | None = None
+            if rollout and wait and not resolved_ssh and rollback_on_failure:
+                try:
+                    src_rb = _resolve_source(console)
+                    rollback_project = compose_project_from_source(console, src_rb, mode=resolved_mode)
+                    previous_image = _running_core_image(rollback_project.compose_file)
+                except Exception:  # noqa: BLE001
+                    previous_image = None
+
             if rollout:
                 t0 = _step_start(console, "Rollout (compose pull + up -d)", quiet=quiet or json_out)
                 core_rollout(
@@ -587,19 +653,37 @@ def register(app: typer.Typer) -> None:
 
                 if wait:
                     t0 = _step_start(console, "Wait healthy", quiet=quiet or json_out)
-                    core_wait(
-                        image=resolved_image,
-                        tag=tag,
-                        ssh=resolved_ssh,
-                        path=resolved_path,
-                        mode=resolved_mode,
-                        db=db,
-                        cache=cache,
-                        timeout=timeout,
-                        interval=interval,
-                        health_url=health_url,
-                        quiet=quiet or json_out,
-                    )  # type: ignore[misc]
+                    try:
+                        core_wait(
+                            image=resolved_image,
+                            tag=tag,
+                            ssh=resolved_ssh,
+                            path=resolved_path,
+                            mode=resolved_mode,
+                            db=db,
+                            cache=cache,
+                            timeout=timeout,
+                            interval=interval,
+                            health_url=health_url,
+                            quiet=quiet or json_out,
+                        )  # type: ignore[misc]
+                    except HealthyTimeoutError:
+                        if (
+                            rollback_on_failure
+                            and previous_image
+                            and rollback_project is not None
+                            and not resolved_ssh
+                            and previous_image != full
+                        ):
+                            _rollback_core_local(
+                                console,
+                                compose_file=rollback_project.compose_file,
+                                previous_image=previous_image,
+                                db=db,
+                                cache=cache,
+                                quiet=quiet or json_out,
+                            )
+                        raise
                     dt = _step_ok(console, "Wait healthy", t0, quiet=quiet or json_out)
                     steps.append({"name": "wait", "ok": True, "duration_s": dt})
 
@@ -1439,6 +1523,11 @@ def register(app: typer.Typer) -> None:
             "--pull/--no-pull",
             help="docker compose pull core-runtime (только для dev-image и prod; для dev/dev-reload не используется)",
         ),
+        rollback_on_failure: bool = typer.Option(
+            True,
+            "--rollback-on-failure/--no-rollback-on-failure",
+            help="При падении wait healthy откатить compose на предыдущий образ (local)",
+        ),
     ) -> None:
         """
         Rollout (compose pull + up -d) для core-runtime.
@@ -1501,6 +1590,7 @@ def register(app: typer.Typer) -> None:
 
         # local rollout
         project = compose_project_from_source(console, src, mode=mode)
+        previous_image = _running_core_image(project.compose_file) if wait and rollback_on_failure else None
         console.print(f"Local rollout: [bold]{full}[/bold]")
         env = {**os.environ, "CORE_RUNTIME_IMAGE": full, **_compose_env_overrides(db=db, cache=cache)}
         if do_pull:
@@ -1517,14 +1607,30 @@ def register(app: typer.Typer) -> None:
         )
         console.print("[green]✓[/green] local rollout ok")
         if wait:
-            _wait_core_healthy_local(
-                console,
-                compose_file=project.compose_file,
-                timeout_s=timeout,
-                interval_s=interval,
-                health_url=health_url,
-                quiet=False,
-            )
+            try:
+                _wait_core_healthy_local(
+                    console,
+                    compose_file=project.compose_file,
+                    timeout_s=timeout,
+                    interval_s=interval,
+                    health_url=health_url,
+                    quiet=False,
+                )
+            except HealthyTimeoutError:
+                if (
+                    rollback_on_failure
+                    and previous_image
+                    and previous_image != full
+                ):
+                    _rollback_core_local(
+                        console,
+                        compose_file=project.compose_file,
+                        previous_image=previous_image,
+                        db=db,
+                        cache=cache,
+                        quiet=False,
+                    )
+                raise
 
     @core_app.command("wait")
     def core_wait(

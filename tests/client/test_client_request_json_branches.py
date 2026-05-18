@@ -124,6 +124,5 @@ def test_request_json_locks_prefix_after_first_success(monkeypatch) -> None:
 
     second = anyio.run(c._request_json, "GET", "/x")
     assert second == {"ok": True}
-    assert calls[0].startswith("/api/x")
+    assert calls[0].startswith("/api/v1/x")
     assert calls[1].startswith("/api/x")
-    assert not any(p.startswith("/api/v1/x") for p in calls)

@@ -285,11 +285,50 @@ def register(app: typer.Typer) -> None:
             raise typer.Exit(code=1)
         _docker_logs(console, follow=follow, tail=tail)
 
-    # Backward-compatible aliases (раньше назывались так же, как API команды на верхнем уровне).
-    @core_app.command("status")
-    def status(mode: str = typer.Option("docker", "--mode", help="docker|native")) -> None:
+    @core_app.command("version")
+    def core_version_cmd(
+        json_out: bool = typer.Option(False, "--json", help="Машинный вывод в JSON"),
+    ) -> None:
+        """Версия Core Runtime (GET /api/v1/version)."""
+        import anyio
+
+        from hc.commands._client_helpers import require_client
+        from hc.json_output import print_json
+
         console = Console()
-        console.print("[dim]Подсказка:[/dim] `hc core status` переехала в `hc core ps`.")
+        client = require_client(console)
+
+        async def _fetch() -> dict | None:
+            return await client.core_version()
+
+        data = anyio.run(_fetch)
+        if not data:
+            console.print("[red]Ошибка:[/red] Core не ответил на /api/v1/version")
+            raise typer.Exit(code=1)
+        if json_out:
+            print_json({"ok": True, **data})
+            return
+        version = str(data.get("version", "unknown"))
+        api = str(data.get("api", "v1"))
+        console.print(f"core-runtime [bold]{version}[/bold]  [dim](api {api})[/dim]")
+
+    # Backward-compatible alias: docker/native ps, не дублирует `hc status` (API).
+    @core_app.command("status")
+    def status(
+        docker: bool = typer.Option(
+            False,
+            "--docker",
+            help="Показать docker/native процессы (иначе только подсказка)",
+        ),
+        mode: str = typer.Option("docker", "--mode", help="docker|native (с --docker)"),
+    ) -> None:
+        console = Console()
+        console.print(
+            "[dim]API-статус Core:[/dim] [bold]hc status[/bold]  "
+            "[dim]| контейнеры:[/dim] [bold]hc core ps[/bold]"
+        )
+        if not docker:
+            raise typer.Exit(code=0)
         m = mode.lower().strip()
         if m == "native":
             src = _resolve_source(console)

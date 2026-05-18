@@ -13,6 +13,7 @@ def test_config_roundtrip(tmp_path) -> None:
     import hc.config as config
 
     importlib.reload(config)
+    config.invalidate_config_cache()
 
     cfg = config.Config.load()
     assert cfg.core.host
@@ -61,6 +62,7 @@ def test_config_migrates_legacy_deploy_core_mode_image(tmp_path, monkeypatch) ->
     import hc.config as config
 
     importlib.reload(config)
+    config.invalidate_config_cache()
     cfg = config.Config.load()
     assert cfg.deploy.core_mode == "dev-image"
     saved = CONFIG_PATH.read_text(encoding="utf-8")
