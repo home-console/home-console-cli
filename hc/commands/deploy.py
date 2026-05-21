@@ -504,6 +504,137 @@ def _rollback_core_local(
         console.print("[green]✓[/green] rollback compose up выполнен")
 
 
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """Parse KEY=VALUE env file, skip comments and blank lines."""
+    result: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" in stripped:
+            key, _, val = stripped.partition("=")
+            result[key.strip()] = val
+    return result
+
+
+def _save_last_deploy(image: str, tag: str) -> None:
+    """Best-effort persist of last successful deploy tag for `hc rollback`."""
+    try:
+        cfg = Config.load()
+        cfg.deploy.last_tag = tag
+        cfg.deploy.last_image = image
+        cfg.save()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _do_rollout(
+    console: Console,
+    *,
+    image: str,
+    tag: str,
+    ssh: str | None,
+    path: str | None,
+    mode: str,
+    db: str | None,
+    cache: str | None,
+    wait: bool,
+    timeout: int,
+    interval: float,
+    health_url: str,
+    pull: bool,
+    rollback_on_failure: bool,
+    save_on_success: bool = True,
+    extra_env: dict[str, str] | None = None,
+) -> None:
+    """Shared rollout logic for core_rollout and hc rollback."""
+    src = _resolve_source(console)
+    full = f"{image}:{tag}"
+    compose_rel = src.compose_rel(mode)
+    do_pull = bool(pull and mode in IMAGE_MODES)
+    compose_overrides = {**_compose_env_overrides(db=db, cache=cache), **(extra_env or {})}
+
+    if ssh:
+        if not path:
+            console.print("[red]Ошибка:[/red] для --ssh нужен --path")
+            raise typer.Exit(code=2)
+        env_pairs = " ".join(
+            f"{k}={shlex.quote(v)}"
+            for k, v in {
+                "CORE_RUNTIME_IMAGE": full,
+                **compose_overrides,
+            }.items()
+        )
+        pull_cmd = (
+            f"{env_pairs} docker compose -f {compose_rel} pull core-runtime && "
+            if do_pull
+            else ""
+        )
+        remote = (
+            f"cd {shlex.quote(path)} && "
+            f"{pull_cmd}"
+            f"{env_pairs} docker compose -f {compose_rel} up -d"
+        )
+        console.print(f"Remote rollout on [bold]{ssh}[/bold]")
+        _run(_ssh_cmd(ssh, remote))
+        console.print("[green]✓[/green] remote rollout ok")
+        if wait:
+            _wait_core_healthy_remote(
+                console,
+                ssh=ssh,
+                path=path,
+                compose_rel=compose_rel,
+                timeout_s=timeout,
+                interval_s=interval,
+                health_url=health_url,
+                quiet=False,
+            )
+        if save_on_success:
+            _save_last_deploy(image, tag)
+        return
+
+    project = compose_project_from_source(console, src, mode=mode)
+    previous_image = _running_core_image(project.compose_file) if wait and rollback_on_failure else None
+    console.print(f"Local rollout: [bold]{full}[/bold]")
+    env = {**os.environ, "CORE_RUNTIME_IMAGE": full, **compose_overrides}
+    if do_pull:
+        _run_pull(
+            ["docker", "compose", "-f", str(project.compose_file), "pull", "core-runtime"],
+            cwd=project.cwd,
+            env=env,
+            image=full,
+        )
+    _run_env(
+        ["docker", "compose", "-f", str(project.compose_file), "up", "-d"],
+        cwd=project.cwd,
+        env=env,
+    )
+    console.print("[green]✓[/green] local rollout ok")
+    if wait:
+        try:
+            _wait_core_healthy_local(
+                console,
+                compose_file=project.compose_file,
+                timeout_s=timeout,
+                interval_s=interval,
+                health_url=health_url,
+                quiet=False,
+            )
+        except HealthyTimeoutError:
+            if rollback_on_failure and previous_image and previous_image != full:
+                _rollback_core_local(
+                    console,
+                    compose_file=project.compose_file,
+                    previous_image=previous_image,
+                    db=db,
+                    cache=cache,
+                    quiet=False,
+                )
+            raise
+    if save_on_success:
+        _save_last_deploy(image, tag)
+
+
 def register(app: typer.Typer) -> None:
     deploy_app = typer.Typer(
         help="Деплой: build/tag/push/rollout и sync platform frontend в core",
@@ -561,6 +692,9 @@ def register(app: typer.Typer) -> None:
             "--rollback-on-failure/--no-rollback-on-failure",
             help="При падении wait healthy откатить compose на предыдущий образ (local)",
         ),
+        env_file: Path | None = typer.Option(
+            None, "--env-file", help="Файл с дополнительными KEY=VALUE переменными (прокидываются в compose)"
+        ),
     ) -> None:
         """
         Если запущено как `hc deploy` без подкоманд — выполняет полный пайплайн:
@@ -584,6 +718,15 @@ def register(app: typer.Typer) -> None:
                 )
             resolved_ssh = ssh if ssh is not None else (cfg.deploy.ssh or None)
             resolved_path = path if path is not None else (cfg.deploy.path or None)
+            resolved_extra_env: dict[str, str] | None = None
+            if env_file is not None:
+                env_file_path = Path(env_file).expanduser().resolve()
+                if not env_file_path.exists():
+                    console.print(f"[red]Ошибка:[/red] --env-file не найден: {env_file_path}")
+                    raise typer.Exit(code=1)
+                resolved_extra_env = _parse_env_file(env_file_path)
+                if not quiet and not json_out:
+                    console.print(f"[dim]env-file:[/dim] {len(resolved_extra_env)} переменных из {env_file_path.name}")
 
             full = f"{resolved_image}:{tag}"
             target = f"remote {resolved_ssh}" if resolved_ssh else "local"
@@ -638,7 +781,8 @@ def register(app: typer.Typer) -> None:
 
             if rollout:
                 t0 = _step_start(console, "Rollout (compose pull + up -d)", quiet=quiet or json_out)
-                core_rollout(
+                _do_rollout(
+                    console,
                     image=resolved_image,
                     tag=tag,
                     ssh=resolved_ssh,
@@ -647,7 +791,14 @@ def register(app: typer.Typer) -> None:
                     db=db,
                     cache=cache,
                     wait=False,
-                )  # type: ignore[misc]
+                    timeout=timeout,
+                    interval=interval,
+                    health_url=health_url,
+                    pull=True,
+                    rollback_on_failure=rollback_on_failure,
+                    save_on_success=False,
+                    extra_env=resolved_extra_env,
+                )
                 dt = _step_ok(console, "Rollout", t0, quiet=quiet or json_out)
                 steps.append({"name": "rollout", "ok": True, "duration_s": dt})
 
@@ -688,6 +839,8 @@ def register(app: typer.Typer) -> None:
                     steps.append({"name": "wait", "ok": True, "duration_s": dt})
 
             total_dt = time.monotonic() - total_t0
+            if rollout:
+                _save_last_deploy(resolved_image, tag)
 
             if json_out:
                 payload = {
@@ -1528,6 +1681,9 @@ def register(app: typer.Typer) -> None:
             "--rollback-on-failure/--no-rollback-on-failure",
             help="При падении wait healthy откатить compose на предыдущий образ (local)",
         ),
+        env_file: Path | None = typer.Option(
+            None, "--env-file", help="Файл с дополнительными KEY=VALUE переменными (прокидываются в compose)"
+        ),
     ) -> None:
         """
         Rollout (compose pull + up -d) для core-runtime.
@@ -1538,7 +1694,6 @@ def register(app: typer.Typer) -> None:
         """
         console = Console()
         require_docker(console)
-        src = _resolve_source(console)
         cfg = Config.load()
         image = (image or cfg.deploy.core_image).strip()
         mode = normalize_deploy_core_mode(mode or cfg.deploy.core_mode)
@@ -1547,90 +1702,32 @@ def register(app: typer.Typer) -> None:
             raise typer.Exit(code=2)
         ssh = ssh if ssh is not None else (cfg.deploy.ssh or None)
         path = path if path is not None else (cfg.deploy.path or None)
-        full = f"{image}:{tag}"
+        resolved_extra_env: dict[str, str] | None = None
+        if env_file is not None:
+            env_file_path = Path(env_file).expanduser().resolve()
+            if not env_file_path.exists():
+                console.print(f"[red]Ошибка:[/red] --env-file не найден: {env_file_path}")
+                raise typer.Exit(code=1)
+            resolved_extra_env = _parse_env_file(env_file_path)
 
-        compose_rel = src.compose_rel(mode)
-        do_pull = bool(pull and mode in IMAGE_MODES)
-        if ssh:
-            if not path:
-                console.print("[red]Ошибка:[/red] для --ssh нужен --path")
-                raise typer.Exit(code=2)
-            env_pairs = " ".join(
-                f"{k}={shlex.quote(v)}"
-                for k, v in {
-                    "CORE_RUNTIME_IMAGE": full,
-                    **_compose_env_overrides(db=db, cache=cache),
-                }.items()
-            )
-            pull_cmd = (
-                f"{env_pairs} docker compose -f {compose_rel} pull core-runtime && "
-                if do_pull
-                else ""
-            )
-            remote = (
-                f"cd {shlex.quote(path)} && "
-                f"{pull_cmd}"
-                f"{env_pairs} docker compose -f {compose_rel} up -d"
-            )
-            console.print(f"Remote rollout on [bold]{ssh}[/bold]")
-            _run(_ssh_cmd(ssh, remote))
-            console.print("[green]✓[/green] remote rollout ok")
-            if wait:
-                _wait_core_healthy_remote(
-                    console,
-                    ssh=ssh,
-                    path=path,
-                    compose_rel=compose_rel,
-                    timeout_s=timeout,
-                    interval_s=interval,
-                    health_url=health_url,
-                    quiet=False,
-                )
-            return
-
-        # local rollout
-        project = compose_project_from_source(console, src, mode=mode)
-        previous_image = _running_core_image(project.compose_file) if wait and rollback_on_failure else None
-        console.print(f"Local rollout: [bold]{full}[/bold]")
-        env = {**os.environ, "CORE_RUNTIME_IMAGE": full, **_compose_env_overrides(db=db, cache=cache)}
-        if do_pull:
-            _run_pull(
-                ["docker", "compose", "-f", str(project.compose_file), "pull", "core-runtime"],
-                cwd=project.cwd,
-                env=env,
-                image=full,
-            )
-        _run_env(
-            ["docker", "compose", "-f", str(project.compose_file), "up", "-d"],
-            cwd=project.cwd,
-            env=env,
+        _do_rollout(
+            console,
+            image=image,
+            tag=tag,
+            ssh=ssh,
+            path=path,
+            mode=mode,
+            db=db,
+            cache=cache,
+            wait=wait,
+            timeout=timeout,
+            interval=interval,
+            health_url=health_url,
+            pull=pull,
+            rollback_on_failure=rollback_on_failure,
+            save_on_success=True,
+            extra_env=resolved_extra_env,
         )
-        console.print("[green]✓[/green] local rollout ok")
-        if wait:
-            try:
-                _wait_core_healthy_local(
-                    console,
-                    compose_file=project.compose_file,
-                    timeout_s=timeout,
-                    interval_s=interval,
-                    health_url=health_url,
-                    quiet=False,
-                )
-            except HealthyTimeoutError:
-                if (
-                    rollback_on_failure
-                    and previous_image
-                    and previous_image != full
-                ):
-                    _rollback_core_local(
-                        console,
-                        compose_file=project.compose_file,
-                        previous_image=previous_image,
-                        db=db,
-                        cache=cache,
-                        quiet=False,
-                    )
-                raise
 
     @core_app.command("wait")
     def core_wait(
@@ -1790,6 +1887,60 @@ def register(app: typer.Typer) -> None:
             health_url=health_url,
             pull=pull,
         )
+
+    @deploy_app.command("rollback")
+    def deploy_rollback(
+        tag: str | None = typer.Argument(None, help="Тег для отката (по умолчанию: последний задеплоенный из config)"),
+        image: str | None = typer.Option(None, "--image", help="Имя image без тега (по умолчанию из config)"),
+        ssh: str | None = typer.Option(None, "--ssh", help="user@host для удалённого rollout (по умолчанию из config)"),
+        path: str | None = typer.Option(None, "--path", help="remote path с compose (по умолчанию из config)"),
+        mode: str | None = typer.Option(None, "--mode", help=_MODE_HELP),
+        db: str | None = typer.Option(None, "--db", help="Vault DB backend: sqlite|postgres"),
+        cache: str | None = typer.Option(None, "--cache", help="Cache backend: memory|redis"),
+        wait: bool = typer.Option(True, "--wait/--no-wait", help="Дождаться healthy после rollout"),
+        timeout: int = typer.Option(180, "--timeout", help="Таймаут ожидания healthy (сек)"),
+        interval: float = typer.Option(1.0, "--interval", help="Интервал проверки healthy (сек)"),
+        health_url: str = typer.Option(
+            "http://localhost:8000/api/v1/monitor/health",
+            "--health-url",
+            help="URL health внутри контейнера core-runtime",
+        ),
+    ) -> None:
+        """Откатить core-runtime на тег. Без тега — берёт последний задеплоенный из config."""
+        console = Console()
+        require_docker(console)
+        cfg = Config.load()
+        resolved_image = (image or cfg.deploy.core_image).strip()
+        resolved_mode = normalize_deploy_core_mode(mode or cfg.deploy.core_mode)
+        if resolved_mode not in VALID_MODES:
+            console.print(f"[red]Ошибка:[/red] --mode {resolved_mode!r} недопустим. Допустимые: {' | '.join(sorted(VALID_MODES))}")
+            raise typer.Exit(code=2)
+        resolved_ssh = ssh if ssh is not None else (cfg.deploy.ssh or None)
+        resolved_path = path if path is not None else (cfg.deploy.path or None)
+        resolved_tag = tag or cfg.deploy.last_tag
+        if not resolved_tag:
+            console.print("[red]Ошибка:[/red] тег не указан и нет сохранённого last_tag.")
+            console.print("Укажи явно: [bold]hc deploy rollback v0.1.0[/bold]")
+            raise typer.Exit(code=1)
+        console.print(f"[yellow]→[/yellow] Rollback: [bold]{resolved_image}:{resolved_tag}[/bold]")
+        _do_rollout(
+            console,
+            image=resolved_image,
+            tag=resolved_tag,
+            ssh=resolved_ssh,
+            path=resolved_path,
+            mode=resolved_mode,
+            db=db,
+            cache=cache,
+            wait=wait,
+            timeout=timeout,
+            interval=interval,
+            health_url=health_url,
+            pull=True,
+            rollback_on_failure=False,
+            save_on_success=True,
+        )
+        console.print(f"[green]✓[/green] Rollback → {resolved_image}:{resolved_tag} done")
 
     deploy_app.add_typer(cfg_app, name="config")
     deploy_app.add_typer(core_app, name="core")

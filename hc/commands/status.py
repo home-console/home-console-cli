@@ -10,6 +10,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from hc.commands._client_helpers import require_client
+from hc.config import Config
 from hc.json_output import print_json
 
 
@@ -165,6 +166,9 @@ def register(app: typer.Typer) -> None:
                 col = "green" if ok == total else "yellow"
                 lines.append(Text.assemble(("Модулей:  ", "bold"), Text(f"{ok} / {total}", style=col)))
             lines.append(Text.assemble(("Uptime:   ", "bold"), (uptime, "")))
+            last_tag = Config.load().deploy.last_tag
+            if last_tag:
+                lines.append(Text.assemble(("Deployed: ", "bold"), (last_tag, "dim")))
 
             title = "HomeConsole"
             if watch:
@@ -194,6 +198,9 @@ def register(app: typer.Typer) -> None:
                     payload["plugins_active"] = active_plugins
                 if modules_stat is not None:
                     payload["modules"] = {"ok": modules_stat[0], "total": modules_stat[1]}
+                last_tag = Config.load().deploy.last_tag
+                if last_tag:
+                    payload["last_deployed_tag"] = last_tag
                 print_json(payload)
                 return
             console.print(_build_panel(health, active_plugins, modules_stat, latency_ms))

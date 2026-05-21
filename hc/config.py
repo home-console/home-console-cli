@@ -69,6 +69,8 @@ class DeployConfig:
     core_mode: str = "dev-image"  # dev | dev-reload | dev-image | prod
     ssh: str = ""  # user@host
     path: str = ""  # remote path with compose
+    last_tag: str = ""  # last successfully deployed tag (for `hc rollback`)
+    last_image: str = ""  # last successfully deployed image
 
 
 @dataclass(slots=True)
@@ -133,6 +135,8 @@ class Config:
                 core_mode=core_mode,
                 ssh=str(deploy.get("ssh", "")),
                 path=str(deploy.get("path", "")),
+                last_tag=str(deploy.get("last_tag", "")),
+                last_image=str(deploy.get("last_image", "")),
             ),
         )
         if migrate_legacy_image and CONFIG_PATH.exists():
@@ -158,6 +162,8 @@ class Config:
             "core_mode": self.deploy.core_mode,
             "ssh": self.deploy.ssh,
             "path": self.deploy.path,
+            "last_tag": self.deploy.last_tag,
+            "last_image": self.deploy.last_image,
         }
         payload = doc.as_string()
         tmp_path = CONFIG_PATH.with_suffix(".toml.tmp")
