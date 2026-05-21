@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from hc.config import Config
 from hc.core_ops import ComposeProject, compose_project_from_source, require_docker
 from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local, init_core_source
 from hc.env_state import load_last_env, save_last_env
@@ -1311,4 +1313,309 @@ def register(app: typer.Typer) -> None:
                 console.print(f"[dim]Подсказка:[/dim] {e.hint}")
             raise typer.Exit(code=int(e.exit_code or 1))
 
+    @env_app.command("clean")
+    def env_clean(
+        volumes: bool = typer.Option(False, "--volumes", help="Удалить также orphan volumes"),
+        all_images: bool = typer.Option(False, "--all-images", help="Удалить все неиспользуемые образы (не только dangling)"),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Показать что будет удалено без выполнения"),
+    ) -> None:
+        """Очистить orphan Docker ресурсы (dangling images, неиспользуемые volumes)."""
+        console = Console()
+        require_docker(console)
+
+        image_cmd = ["docker", "image", "prune", "-f"]
+        if all_images:
+            image_cmd.append("--all")
+
+        if dry_run:
+            console.print("[yellow]Dry run:[/yellow] будет выполнено:")
+            console.print(f"  {' '.join(image_cmd)}")
+            if volumes:
+                console.print("  docker volume prune -f")
+            return
+
+        console.print("[cyan]→[/cyan] Очистка Docker ресурсов...")
+        p = subprocess.run(image_cmd, capture_output=True, text=True, check=False)  # noqa: S603
+        out = (p.stdout or "").strip()
+        if p.returncode == 0:
+            console.print(f"[green]✓[/green] Images: {out or 'nothing to remove'}")
+        else:
+            console.print(f"[yellow]Images:[/yellow] {(p.stderr or '').strip()}")
+
+        if volumes:
+            p = subprocess.run(  # noqa: S603
+                ["docker", "volume", "prune", "-f"], capture_output=True, text=True, check=False
+            )
+            out = (p.stdout or "").strip()
+            if p.returncode == 0:
+                console.print(f"[green]✓[/green] Volumes: {out or 'nothing to remove'}")
+            else:
+                console.print(f"[yellow]Volumes:[/yellow] {(p.stderr or '').strip()}")
+
+    # --- hc env dotenv: управление .env файлом core-runtime-service ---
+
+    _SECRET_RE = re.compile(r"(KEY|SECRET|PASSWORD|TOKEN|PASS|PRIVATE|MASTER)", re.IGNORECASE)
+
+    def _dotenv_local_path() -> tuple[bool, "Path | None"]:
+        """Найти .env локально через _resolve_source. Возвращает (found, path)."""
+        from rich.console import Console as _C
+        try:
+            src = _resolve_source(_C(stderr=True))
+            env_path = src.path / ".env"
+            return True, env_path
+        except SystemExit:
+            return False, None
+
+    def _parse_dotenv(text: str) -> list[tuple[str, str, str]]:
+        """Parse .env → list of (raw_line, key, value). Preserves comments/blanks as ('line', '', '')."""
+        result = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                result.append((line, "", ""))
+            elif "=" in stripped:
+                key, _, val = stripped.partition("=")
+                result.append((line, key.strip(), val))
+            else:
+                result.append((line, "", ""))
+        return result
+
+    def _serialize_dotenv(entries: list[tuple[str, str, str]]) -> str:
+        return "\n".join(e[0] for e in entries) + "\n"
+
+    def _mask(key: str, val: str) -> str:
+        return "***" if _SECRET_RE.search(key) and val else val
+
+    dotenv_app = typer.Typer(
+        help="Управление .env файлом core-runtime-service",
+        context_settings={"help_option_names": ["-h", "--help"]},
+        no_args_is_help=True,
+    )
+
+    @dotenv_app.command("show")
+    def dotenv_show(
+        no_mask: bool = typer.Option(False, "--no-mask", help="Показать секреты без маскировки"),
+        ssh: str | None = typer.Option(None, "--ssh", help="user@host (по умолчанию из deploy config)"),
+        env_path: str | None = typer.Option(None, "--env-path", help="Путь к .env на удалённом сервере"),
+    ) -> None:
+        """Показать содержимое .env (секреты маскируются по умолчанию)."""
+        console = Console()
+        cfg = Config.load()
+        resolved_ssh = ssh or cfg.deploy.ssh or None
+
+        if resolved_ssh:
+            remote_file = env_path or (f"{cfg.deploy.path}/.env" if cfg.deploy.path else "")
+            if not remote_file:
+                console.print("[red]Ошибка:[/red] укажи --env-path или задай deploy.path в config.")
+                raise typer.Exit(code=1)
+            p = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat {remote_file}"],
+                capture_output=True, text=True, check=False,
+            )
+            if p.returncode != 0:
+                console.print(f"[red]SSH ошибка:[/red] {(p.stderr or '').strip()}")
+                raise typer.Exit(code=p.returncode)
+            text = p.stdout
+            console.print(f"[dim]{resolved_ssh}:{remote_file}[/dim]")
+        else:
+            found, path = _dotenv_local_path()
+            if not found or path is None:
+                raise typer.Exit(code=2)
+            if not path.exists():
+                console.print(f"[yellow].env не найден:[/yellow] {path}")
+                raise typer.Exit(code=0)
+            text = path.read_text(encoding="utf-8", errors="replace")
+            console.print(f"[dim]{path}[/dim]")
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                console.print(f"[dim]{line}[/dim]")
+            elif "=" in stripped:
+                key, _, val = stripped.partition("=")
+                display_val = val if no_mask else _mask(key.strip(), val)
+                console.print(f"[bold cyan]{key}[/bold cyan]={display_val}")
+            else:
+                console.print(line)
+
+    @dotenv_app.command("set")
+    def dotenv_set(
+        assignment: str = typer.Argument(..., help="KEY=VALUE"),
+        ssh: str | None = typer.Option(None, "--ssh", help="user@host (по умолчанию из deploy config)"),
+        env_path: str | None = typer.Option(None, "--env-path", help="Путь к .env на удалённом сервере"),
+    ) -> None:
+        """Добавить или обновить переменную в .env. Формат: KEY=VALUE."""
+        console = Console()
+        if "=" not in assignment:
+            console.print("[red]Ошибка:[/red] формат KEY=VALUE")
+            raise typer.Exit(code=1)
+        key, _, val = assignment.partition("=")
+        key = key.strip()
+        if not key:
+            console.print("[red]Ошибка:[/red] ключ не может быть пустым")
+            raise typer.Exit(code=1)
+
+        cfg = Config.load()
+        resolved_ssh = ssh or cfg.deploy.ssh or None
+
+        if resolved_ssh:
+            remote_file = env_path or (f"{cfg.deploy.path}/.env" if cfg.deploy.path else "")
+            if not remote_file:
+                console.print("[red]Ошибка:[/red] укажи --env-path или задай deploy.path в config.")
+                raise typer.Exit(code=1)
+            # Download, modify, upload
+            p = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat {remote_file} 2>/dev/null || true"],
+                capture_output=True, text=True, check=False,
+            )
+            text = p.stdout or ""
+        else:
+            found, path = _dotenv_local_path()
+            if not found or path is None:
+                raise typer.Exit(code=2)
+            text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+        entries = _parse_dotenv(text)
+        updated = False
+        new_line = f"{key}={val}"
+        for i, (raw, k, v) in enumerate(entries):
+            if k == key:
+                entries[i] = (new_line, key, val)
+                updated = True
+                break
+        if not updated:
+            entries.append((new_line, key, val))
+
+        new_text = _serialize_dotenv(entries)
+
+        if resolved_ssh:
+            remote_file = env_path or f"{cfg.deploy.path}/.env"
+            import shlex as _shlex
+            p2 = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_file)}"],
+                input=new_text, capture_output=True, text=True, check=False,
+            )
+            if p2.returncode != 0:
+                console.print(f"[red]SSH ошибка:[/red] {(p2.stderr or '').strip()}")
+                raise typer.Exit(code=p2.returncode)
+            console.print(f"[green]✓[/green] {key} {'обновлён' if updated else 'добавлен'} в {resolved_ssh}:{remote_file}")
+        else:
+            path.write_text(new_text, encoding="utf-8")  # type: ignore[union-attr]
+            console.print(f"[green]✓[/green] {key} {'обновлён' if updated else 'добавлен'} в {path}")
+
+    @dotenv_app.command("unset")
+    def dotenv_unset(
+        key: str = typer.Argument(..., help="Имя переменной для удаления"),
+        ssh: str | None = typer.Option(None, "--ssh", help="user@host"),
+        env_path: str | None = typer.Option(None, "--env-path", help="Путь к .env на сервере"),
+    ) -> None:
+        """Удалить переменную из .env."""
+        console = Console()
+        cfg = Config.load()
+        resolved_ssh = ssh or cfg.deploy.ssh or None
+
+        if resolved_ssh:
+            remote_file = env_path or (f"{cfg.deploy.path}/.env" if cfg.deploy.path else "")
+            if not remote_file:
+                console.print("[red]Ошибка:[/red] укажи --env-path или задай deploy.path в config.")
+                raise typer.Exit(code=1)
+            p = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat {remote_file} 2>/dev/null || true"],
+                capture_output=True, text=True, check=False,
+            )
+            text = p.stdout or ""
+        else:
+            found, path = _dotenv_local_path()
+            if not found or path is None:
+                raise typer.Exit(code=2)
+            if not path.exists():
+                console.print(f"[yellow].env не найден:[/yellow] {path}")
+                raise typer.Exit(code=0)
+            text = path.read_text(encoding="utf-8", errors="replace")
+
+        entries = _parse_dotenv(text)
+        before = len(entries)
+        entries = [(raw, k, v) for raw, k, v in entries if k != key]
+        if len(entries) == before:
+            console.print(f"[yellow]{key} не найден в .env[/yellow]")
+            raise typer.Exit(code=0)
+
+        new_text = _serialize_dotenv(entries)
+
+        if resolved_ssh:
+            import shlex as _shlex
+            remote_file = env_path or f"{cfg.deploy.path}/.env"
+            p2 = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_file)}"],
+                input=new_text, capture_output=True, text=True, check=False,
+            )
+            if p2.returncode != 0:
+                console.print(f"[red]SSH ошибка:[/red] {(p2.stderr or '').strip()}")
+                raise typer.Exit(code=p2.returncode)
+            console.print(f"[green]✓[/green] {key} удалён из {resolved_ssh}:{remote_file}")
+        else:
+            path.write_text(new_text, encoding="utf-8")  # type: ignore[union-attr]
+            console.print(f"[green]✓[/green] {key} удалён из {path}")
+
+    @dotenv_app.command("edit")
+    def dotenv_edit(
+        ssh: str | None = typer.Option(None, "--ssh", help="user@host"),
+        env_path: str | None = typer.Option(None, "--env-path", help="Путь к .env на сервере"),
+    ) -> None:
+        """Открыть .env в $EDITOR (для SSH — скачивает, редактирует, загружает)."""
+        import shlex as _shlex
+        import shutil as _shutil
+        import tempfile as _tempfile
+        console = Console()
+        cfg = Config.load()
+        resolved_ssh = ssh or cfg.deploy.ssh or None
+
+        editor = (os.environ.get("VISUAL") or os.environ.get("EDITOR") or "").strip()
+        if not editor:
+            for cand in ("nvim", "vim", "nano", "micro"):
+                if _shutil.which(cand):
+                    editor = cand
+                    break
+        if not editor:
+            console.print("[red]Ошибка:[/red] не задан редактор. Укажи переменную EDITOR или VISUAL.")
+            raise typer.Exit(code=2)
+
+        if resolved_ssh:
+            remote_file = env_path or (f"{cfg.deploy.path}/.env" if cfg.deploy.path else "")
+            if not remote_file:
+                console.print("[red]Ошибка:[/red] укажи --env-path или задай deploy.path в config.")
+                raise typer.Exit(code=1)
+            with _tempfile.NamedTemporaryFile(suffix=".env", delete=False) as tmp:
+                tmp_path = tmp.name
+            p = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat {remote_file} 2>/dev/null || true"],
+                capture_output=True, text=True, check=False,
+            )
+            open(tmp_path, "w").write(p.stdout or "")  # noqa: WPS515
+            cmd = [*_shlex.split(editor), tmp_path]
+            subprocess.run(cmd, check=False)  # noqa: S603
+            new_text = open(tmp_path).read()  # noqa: WPS515
+            os.unlink(tmp_path)
+            p2 = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_file)}"],
+                input=new_text, capture_output=True, text=True, check=False,
+            )
+            if p2.returncode != 0:
+                console.print(f"[red]SSH ошибка:[/red] {(p2.stderr or '').strip()}")
+                raise typer.Exit(code=p2.returncode)
+            console.print(f"[green]✓[/green] .env сохранён на {resolved_ssh}:{remote_file}")
+        else:
+            found, path = _dotenv_local_path()
+            if not found or path is None:
+                raise typer.Exit(code=2)
+            if not path.exists():
+                path.touch()
+            cmd = [*_shlex.split(editor), str(path)]
+            p = subprocess.run(cmd, check=False)  # noqa: S603
+            if p.returncode != 0:
+                console.print(f"[yellow]Редактор завершился с кодом {p.returncode}[/yellow]")
+            else:
+                console.print("[green]✓[/green] .env сохранён")
+
+    env_app.add_typer(dotenv_app, name="dotenv")
     app.add_typer(env_app, name="env")
