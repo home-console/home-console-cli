@@ -11,9 +11,9 @@ def test_request_json_optional_skips_first_prefix_on_404(monkeypatch) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
-        if request.url.path.startswith("/api/marketplace/index"):
-            return httpx.Response(404, text="no")
         if request.url.path.startswith("/api/v1/marketplace/index"):
+            return httpx.Response(404, text="no")
+        if request.url.path.startswith("/api/marketplace/index"):
             return httpx.Response(200, json=[{"name": "p", "version": "1"}])
         return httpx.Response(404, text="no")
 
@@ -29,9 +29,9 @@ def test_request_json_optional_skips_first_prefix_on_404(monkeypatch) -> None:
     c = HCClient(base_url="http://x", token="t")
     data = anyio.run(c.get_marketplace_index)
     assert data == [{"name": "p", "version": "1"}]
-    assert c.api_prefix == "/api/v1"
-    assert any("/api/marketplace/index" in u for u in calls)
+    assert c.api_prefix == "/api"
     assert any("/api/v1/marketplace/index" in u for u in calls)
+    assert any("/api/marketplace/index" in u for u in calls)
 
 
 def test_request_json_optional_returns_none_on_404_after_prefix_lock(monkeypatch) -> None:
