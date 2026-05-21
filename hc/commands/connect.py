@@ -5,6 +5,7 @@ import getpass
 import typer
 from rich.console import Console
 
+from hc import __version__
 from hc.client import HCClient
 from hc.config import Config
 
@@ -30,6 +31,17 @@ def connect_and_save(host: str, port: int, token: str, auth: str = "auto") -> di
         v = str(ver.get("version", "")).strip()
         if v:
             console.print(f"[dim]Core version:[/dim] {v}")
+            try:
+                cli_major = int(__version__.split(".")[0])
+                core_major = int(v.lstrip("v").split(".")[0])
+                if cli_major != core_major:
+                    console.print(
+                        f"[yellow]⚠ CLI {__version__} и Core {v} — разные major версии, "
+                        f"возможна несовместимость.[/yellow]"
+                    )
+                    console.print("[dim]Обнови CLI: pipx upgrade homeconsole-cli[/dim]")
+            except (ValueError, IndexError):
+                pass
 
     cfg.core.host = host
     cfg.core.port = port
@@ -48,7 +60,13 @@ def register(app: typer.Typer) -> None:
         auth: str = typer.Option("auto", "--auth", help="auto|bearer|api-key"),
     ) -> None:
         console = Console()
-        if token is None:
+        if token is not None:
+            console.print(
+                "[yellow]⚠ --token передан как аргумент командной строки — "
+                "токен попадёт в shell history.[/yellow]\n"
+                "[dim]Безопаснее: запусти без --token, токен будет запрошен через stdin.[/dim]"
+            )
+        else:
             token = getpass.getpass("Token: ").strip()
         if not token:
             console.print("[red]Ошибка: токен не задан[/red]")

@@ -30,7 +30,13 @@ def register(app: typer.Typer) -> None:
         cfg = Config.load()
         host = (host or cfg.core.host or "localhost").strip()
         port = int(port if port is not None else cfg.core.port)
-        if password is None:
+        if password is not None:
+            console.print(
+                "[yellow]⚠ --password передан как аргумент командной строки — "
+                "пароль попадёт в shell history.[/yellow]\n"
+                "[dim]Безопаснее: запусти без --password, пароль будет запрошен через stdin.[/dim]"
+            )
+        else:
             password = getpass.getpass("Password: ").strip()
         if not password:
             console.print("[red]Ошибка: пароль не задан[/red]")

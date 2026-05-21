@@ -14,6 +14,9 @@ def test_connect_and_save_uses_health_fallback(monkeypatch, isolated_home) -> No
         async def health(self):  # noqa: ANN001
             return {"status": "ok"}
 
+        async def core_version(self):  # noqa: ANN001
+            return None
+
     monkeypatch.setattr("hc.commands.connect.HCClient", _Client)
 
     cfg = isolated_home.Config.load()

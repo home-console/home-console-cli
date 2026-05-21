@@ -122,7 +122,9 @@ def register(app: typer.Typer) -> None:
     @plugin_app.command("list")
     def list_plugins(
         json_out: bool = typer.Option(False, "--json", help="Машинный вывод в JSON"),
+        orphans: bool = typer.Option(False, "--orphans", help="Только плагины, на которые никто не зависит"),
     ) -> None:
+        """Список установленных плагинов. --orphans: плагины без зависимых (кандидаты на удаление)."""
         console = Console()
         client = require_client(console)
 
@@ -148,11 +150,20 @@ def register(app: typer.Typer) -> None:
             console.print("[red]Ошибка:[/red] не удалось получить список плагинов.")
             raise typer.Exit(code=1)
 
+        if orphans:
+            # Plugins depended upon by at least one other installed plugin
+            depended: set[str] = set()
+            for p in plugins:
+                for dep in (p.get("dependencies") or []):
+                    depended.add(str(dep))
+            plugins = [p for p in plugins if str(p.get("name", "")) not in depended]
+
         if json_out:
             print_json({"ok": True, "plugins": plugins})
             return
 
-        table = Table(title="Plugins")
+        title = "Plugins (orphans)" if orphans else "Plugins"
+        table = Table(title=title)
         table.add_column("Плагин", style="bold")
         table.add_column("Версия")
         table.add_column("Статус")
@@ -167,6 +178,9 @@ def register(app: typer.Typer) -> None:
                 str(p.get("execution_mode", p.get("mode", ""))),
                 str(p.get("uptime", "")),
             )
+        if orphans and not plugins:
+            console.print("[green]✓[/green] Нет плагинов без зависимых.")
+            return
         console.print(table)
 
     @plugin_app.command("start")
@@ -282,6 +296,61 @@ def register(app: typer.Typer) -> None:
         console.print(Panel(table, title=f"[bold]Plugin: {name}[/bold]", expand=False))
         if extra:
             console.print(Panel(Pretty(extra, expand_all=True), title="metadata", expand=False))
+
+    @plugin_app.command("upgrade")
+    def upgrade(
+        name: str | None = typer.Argument(None, help="Имя плагина (без аргумента — показать доступные обновления)"),
+        all_plugins: bool = typer.Option(False, "--all", help="Обновить все плагины с доступными обновлениями"),
+        json_out: bool = typer.Option(False, "--json", help="JSON вывод"),
+    ) -> None:
+        """Обновить плагин(ы) до последней версии из marketplace."""
+        console = Console()
+        client = require_client(console)
+
+        if name is None and not all_plugins:
+            updates = anyio.run(client.get_marketplace_updates)
+            if not updates:
+                console.print("[green]✓[/green] Все установленные плагины актуальны.")
+                return
+            if json_out:
+                print_json({"ok": True, "updates": updates})
+                return
+            table = Table(title="Доступные обновления")
+            table.add_column("Плагин", style="bold")
+            table.add_column("Текущая")
+            table.add_column("Доступная")
+            for u in updates:
+                table.add_row(str(u["name"]), str(u["current"]), f"[green]{u['latest']}[/green]")
+            console.print(table)
+            console.print("\n[dim]→[/dim] [bold]hc plugin upgrade --all[/bold] или [bold]hc plugin upgrade <name>[/bold]")
+            return
+
+        targets: list[str]
+        if all_plugins:
+            updates = anyio.run(client.get_marketplace_updates)
+            if not updates:
+                console.print("[green]✓[/green] Все установленные плагины актуальны.")
+                return
+            targets = [str(u["name"]) for u in updates]
+            for u in updates:
+                console.print(f"  [cyan]{u['name']}[/cyan]: {u['current']} → {u['latest']}")
+        else:
+            targets = [name]  # type: ignore[list-item]
+
+        from rich.progress import Progress as _Progress, SpinnerColumn as _Spin, TextColumn as _Text
+
+        async def _upgrade_all() -> None:
+            with _Progress(_Spin(), _Text("{task.description}"), console=console) as p:
+                for plugin_name in targets:
+                    t = p.add_task(f"Обновление {plugin_name}...", total=None)
+                    async for msg in client.install_plugin(plugin_name):
+                        p.update(t, description=msg or f"Обновление {plugin_name}...")
+
+        anyio.run(_upgrade_all)
+        if len(targets) == 1:
+            console.print(f"[green]✓[/green] {targets[0]} обновлён")
+        else:
+            console.print(f"[green]✓[/green] Обновлено плагинов: {len(targets)}")
 
     @plugin_app.command("sync")
     def sync(

@@ -43,6 +43,9 @@ def test_connect_saves_config_via_connect_and_save(monkeypatch, runner: CliRunne
         async def health(self):  # noqa: ANN001
             return None
 
+        async def core_version(self):  # noqa: ANN001
+            return None
+
     monkeypatch.setattr("hc.commands.connect.Config.load", lambda: cfg)
     monkeypatch.setattr("hc.commands.connect.HCClient", _Client)
 
