@@ -16,6 +16,7 @@ from hc.commands.install import register as register_install
 from hc.commands.logs import register as register_logs
 from hc.commands.module import register as register_module
 from hc.commands.plugin import register as register_plugin
+from hc.commands import skill
 from hc.commands.remove import register as register_remove
 from hc.commands.search import register as register_search
 from hc.commands.setup import register as register_setup
@@ -32,6 +33,7 @@ from hc.commands.emergency import register as register_emergency
 from hc.commands.service import register as register_service
 from hc.commands.event import register as register_event
 from hc.commands.shell_config import register as register_shell_config
+from hc.commands.rollback import register as register_rollback
 from hc import __version__
 from hc.update_check import print_update_banner
 from hc.cli_registry import NAV_TREE
@@ -155,6 +157,7 @@ def _register_all() -> None:
     register_install(app)
     register_remove(app)
     register_plugin(app)
+    skill.register(app)
     register_module(app)
     register_logs(app)
     register_search(app)
@@ -171,6 +174,7 @@ def _register_all() -> None:
     register_service(app)
     register_event(app)
     register_shell_config(app)
+    register_rollback(app)
 
 
 _register_all()
