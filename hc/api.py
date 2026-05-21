@@ -19,6 +19,10 @@ MONITOR_HEALTH_LEGACY = "/monitor/health"
 # Admin (core API contract)
 ADMIN_STATUS = "/api/v1/admin/inspector/runtime"
 ADMIN_INSPECTOR_PLUGINS = "/api/v1/admin/inspector/plugins"
+
+SKILLS_LIST = "/api/v1/skills"
+SKILLS_GET = "/api/v1/skills/{skill_id}"
+SKILLS_INVOKE = "/api/v1/skills/{skill_id}/invoke"
 ADMIN_AUTH_API_KEYS = "/api/v1/admin/auth/api-keys"
 ADMIN_AUTH_API_KEYS_REVOKE = "/api/v1/admin/auth/api-keys/revoke"
 ADMIN_AUTH_API_KEYS_ROTATE = "/api/v1/admin/auth/api-keys/rotate"
