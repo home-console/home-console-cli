@@ -34,6 +34,10 @@ ADMIN_AUTH_SESSIONS_REVOKE_ALL = "/api/v1/admin/auth/sessions/revoke-all"
 # Marketplace admin — archive_path должен быть доступен процессу Core на сервере
 ADMIN_MARKETPLACE_INSTALL = "/api/v1/admin/marketplace/install"
 ADMIN_MARKETPLACE_INSTALL_UPLOAD = "/api/v1/admin/marketplace/install-upload"
+ADMIN_MARKETPLACE_INSTALL_FROM_REGISTRY = "/api/v1/admin/marketplace/install-from-registry"
+ADMIN_MARKETPLACE_UPDATE_FROM_REGISTRY = "/api/v1/admin/marketplace/update-from-registry"
+ADMIN_MARKETPLACE_INSTALL_FROM_REGISTRY = "/api/v1/admin/marketplace/install-from-registry"
+ADMIN_MARKETPLACE_UPDATE_FROM_REGISTRY = "/api/v1/admin/marketplace/update-from-registry"
 
 # Auth v1
 AUTH_BOOTSTRAP = "/api/v1/auth/bootstrap"
