@@ -53,7 +53,12 @@ def _get(conn: sqlite3.Connection, namespace: str, key: str) -> Any:
     ).fetchone()
     if row is None:
         return None
-    return json.loads(row["value"])
+    try:
+        return json.loads(row["value"])
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Повреждённые данные в БД (namespace={namespace!r}, key={key!r}): {exc}"
+        ) from exc
 
 
 def _set(conn: sqlite3.Connection, namespace: str, key: str, value: Any) -> None:

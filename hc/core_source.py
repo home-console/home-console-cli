@@ -102,10 +102,9 @@ def init_core_source(console: Console, repo_url: str | None, ref: str | None) ->
     if ref:
         cmd += ["--branch", ref]
     cmd += [repo_url, str(CORE_SRC_DIR)]
-    try:
-        subprocess.run(cmd, check=True, text=True)  # noqa: S603
-    except subprocess.CalledProcessError:
-        console.print("[red]Ошибка: не удалось клонировать репозиторий Core.[/red]")
+    r = subprocess.run(cmd, check=False, text=True, capture_output=True)  # noqa: S603
+    if r.returncode != 0:
+        _print_git_error(console, "clone", repo_url, r.stderr or r.stdout)
         raise typer.Exit(code=1)
 
     return CoreSource(path=CORE_SRC_DIR)
@@ -118,9 +117,25 @@ def update_core_source(console: Console) -> CoreSource:
         console.print("[red]Ошибка: локальная копия Core не инициализирована.[/red]")
         console.print("Сделай: `hc core init --repo <git-url>`")
         raise typer.Exit(code=1)
-    try:
-        subprocess.run(["git", "pull", "--ff-only"], cwd=str(src.path), check=True, text=True)  # noqa: S603
-    except subprocess.CalledProcessError:
-        console.print("[red]Ошибка: не удалось обновить репозиторий Core (git pull).[/red]")
+    r = subprocess.run(  # noqa: S603
+        ["git", "pull", "--ff-only"], cwd=str(src.path), check=False, text=True, capture_output=True
+    )
+    if r.returncode != 0:
+        _print_git_error(console, "pull", str(src.path), r.stderr or r.stdout)
         raise typer.Exit(code=1)
     return src
+
+
+def _print_git_error(console: Console, op: str, target: str, stderr: str) -> None:
+    s = (stderr or "").lower()
+    if "could not resolve host" in s or "unable to access" in s:
+        hint = "Нет доступа к серверу. Проверь интернет-соединение."
+    elif "authentication failed" in s or "403" in s or "denied" in s:
+        hint = "Ошибка аутентификации. Проверь права доступа к репозиторию."
+    elif "repository not found" in s or "not found" in s:
+        hint = f"Репозиторий не найден: {target}"
+    elif "already exists" in s:
+        hint = f"Директория уже существует: {CORE_SRC_DIR}"
+    else:
+        hint = (stderr or "").strip() or f"git {op} завершился с ошибкой."
+    console.print(f"[red]Ошибка git {op}:[/red] {hint}")

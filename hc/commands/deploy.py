@@ -99,8 +99,14 @@ def _resolve_platform_root(console: Console) -> Path:
 
 
 def _run(cmd: list[str], cwd: Path | None = None) -> None:
-    p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=False)  # noqa: S603
+    is_ssh = cmd[0] == "ssh"
+    p = subprocess.run(  # noqa: S603
+        cmd, cwd=str(cwd) if cwd else None, check=False,
+        capture_output=is_ssh, text=is_ssh,
+    )
     if p.returncode != 0:
+        if is_ssh:
+            _print_ssh_error(cmd, p.returncode, getattr(p, "stderr", "") or "")
         raise typer.Exit(code=p.returncode)
 
 
@@ -108,6 +114,24 @@ def _run_env(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | N
     p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=False)  # noqa: S603
     if p.returncode != 0:
         raise typer.Exit(code=p.returncode)
+
+
+def _print_ssh_error(cmd: list[str], code: int, stderr: str) -> None:
+    from rich.console import Console as _C
+    con = _C()
+    host = next((a for a in cmd if "@" in a), "сервер")
+    stderr_l = stderr.lower()
+    if "permission denied" in stderr_l or "publickey" in stderr_l:
+        hint = f"Ошибка аутентификации SSH. Проверь ключ: ssh-add ~/.ssh/id_rsa\n  ssh-copy-id {host}"
+    elif "could not resolve" in stderr_l or "name or service not known" in stderr_l:
+        hint = "Хост не найден. Проверь DNS и имя хоста."
+    elif "connection refused" in stderr_l:
+        hint = "Соединение отклонено. Проверь что SSH-сервер запущен на хосте."
+    elif "timed out" in stderr_l or "no route" in stderr_l:
+        hint = "Нет маршрута до хоста. Проверь сетевое соединение."
+    else:
+        hint = stderr.strip() or f"SSH завершился с кодом {code}."
+    con.print(f"[red]SSH ошибка:[/red] {hint}")
 
 
 def _run_pull(
@@ -195,6 +219,13 @@ def _resolve_stack_env(env: str | None, compose_rel: str) -> tuple[str, str]:
     return raw, resolved_compose
 
 
+def _require_curl(console: Console) -> None:
+    if shutil.which("curl") is None:
+        console.print("[red]Ошибка:[/red] curl не найден в PATH.")
+        console.print("Установи curl: sudo apt-get install -y curl  |  brew install curl")
+        raise typer.Exit(code=1)
+
+
 def _wait_http_ok(
     *,
     url: str,
@@ -206,6 +237,7 @@ def _wait_http_ok(
 ) -> None:
     deadline = time.time() + timeout_s
     started = time.monotonic()
+    _require_curl(console)
     next_tick = 0.0
     if not quiet:
         console.print(f"[cyan]→[/cyan] External check: GET {url} (timeout={timeout_s}s)")
@@ -242,6 +274,7 @@ def _wait_http_contains(
     quiet: bool,
     console: Console,
 ) -> None:
+    _require_curl(console)
     deadline = time.time() + timeout_s
     started = time.monotonic()
     next_tick = 0.0
@@ -1015,8 +1048,16 @@ def register(app: typer.Typer) -> None:
                 console.print("[red]Ошибка:[/red] для --ssh нужен --path (к core-runtime-service на сервере)")
                 raise typer.Exit(code=2)
             if shutil.which("rsync") is None:
-                console.print("[red]Ошибка:[/red] rsync не найден.")
-                console.print("Установи rsync и повтори (на macOS: `brew install rsync`).")
+                console.print("[red]Ошибка:[/red] rsync не найден локально.")
+                console.print("Установи rsync: sudo apt-get install -y rsync  |  brew install rsync")
+                raise typer.Exit(code=1)
+            chk = subprocess.run(  # noqa: S603
+                _ssh_cmd(ssh, "which rsync >/dev/null 2>&1 || echo MISSING"),
+                capture_output=True, text=True, check=False,
+            )
+            if "MISSING" in (chk.stdout or ""):
+                console.print(f"[red]Ошибка:[/red] rsync не найден на удалённом сервере {ssh}.")
+                console.print("Установи на сервере: sudo apt-get install -y rsync")
                 raise typer.Exit(code=1)
             remote_frontend = f"{path.rstrip('/')}/deploy/dev/frontend/"
             console.print(f"[cyan]→[/cyan] Remote sync dist → [bold]{ssh}[/bold]:{remote_frontend}")

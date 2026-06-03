@@ -66,8 +66,12 @@ def _prepare_local_staging(core_root: Path, source: Path, *, console: Console) -
         if source.suffix.lower() != ".zip":
             console.print("[red]Ошибка:[/red] поддерживается только .zip как архив.")
             raise typer.Exit(code=2)
-        with zipfile.ZipFile(source, "r") as zf:
-            zf.extractall(staging)
+        try:
+            with zipfile.ZipFile(source, "r") as zf:
+                zf.extractall(staging)
+        except (zipfile.BadZipFile, RuntimeError) as exc:
+            console.print(f"[red]Ошибка:[/red] архив повреждён или зашифрован: {exc}")
+            raise typer.Exit(code=1)
         return staging
 
     if not source.is_dir():
@@ -462,8 +466,12 @@ def register(app: typer.Typer) -> None:
                     if src.suffix.lower() != ".zip":
                         console.print("[red]Ошибка:[/red] для архива нужен .zip")
                         raise typer.Exit(code=2)
-                    with zipfile.ZipFile(src, "r") as zf:
-                        zf.extractall(unpack)
+                    try:
+                        with zipfile.ZipFile(src, "r") as zf:
+                            zf.extractall(unpack)
+                    except (zipfile.BadZipFile, RuntimeError) as exc:
+                        console.print(f"[red]Ошибка:[/red] архив повреждён или зашифрован: {exc}")
+                        raise typer.Exit(code=1)
                     rsync_cmd.extend([f"{str(unpack).rstrip('/')}/", remote_base])
                     console.print(
                         f"[cyan]→[/cyan] unpack zip → rsync staging → [bold]{resolved_ssh}[/bold]:…/{staging_rel}/"

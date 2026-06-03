@@ -105,7 +105,16 @@ class Config:
                 raw = fh.read()
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        data = parse(raw)
+        try:
+            data = parse(raw)
+        except Exception as exc:  # noqa: BLE001
+            from rich.console import Console as _Console
+            _Console().print(
+                f"[red]Ошибка:[/red] конфиг повреждён: {CONFIG_PATH}\n"
+                f"  [dim]{exc}[/dim]\n"
+                f"  Исправь файл или удали его (будет пересоздан с дефолтами)."
+            )
+            raise SystemExit(1) from exc
         core = data.get("core", {})
         display = data.get("display", {})
         recovery = data.get("recovery", {})

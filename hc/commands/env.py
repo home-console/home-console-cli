@@ -178,7 +178,12 @@ def _resolve_source(console: Console) -> CoreSource:
 
 def _run(cmd: list[str], *, cwd: Path | None = None, extra_env: dict[str, str] | None = None) -> None:
     env = {**os.environ, **extra_env} if extra_env else None
-    p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=False)  # noqa: S603
+    try:
+        p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=False)  # noqa: S603
+    except subprocess.TimeoutExpired:
+        from rich.console import Console as _C
+        _C().print(f"[red]Таймаут:[/red] команда зависла: {' '.join(cmd[:3])}\nПроверь что docker daemon запущен: docker info")
+        raise typer.Exit(code=1)
     if p.returncode != 0:
         raise typer.Exit(code=p.returncode)
 
