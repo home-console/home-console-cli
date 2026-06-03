@@ -24,12 +24,162 @@ class ComposeProject:
 
 
 def require_docker(console: Console) -> None:
+    """Проверить Docker до запуска; предложить фикс если нет или нет прав."""
     if shutil.which("docker") is None:
+        _handle_no_docker_binary(console)
+        return
+
+    r = subprocess.run(  # noqa: S603
+        ["docker", "info"],
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    if r.returncode == 0:
+        return
+
+    combined = (r.stderr or "") + (r.stdout or "")
+    if "permission denied" in combined.lower():
+        _handle_docker_no_permission(console)
+    else:
         raise DockerNotFoundError(
-            message="docker не найден.",
+            message="Docker daemon недоступен.",
             exit_code=1,
-            hint="Установи Docker/OrbStack и проверь, что `docker ps` работает.",
+            hint="Убедись что Docker/OrbStack запущен: docker info",
         )
+
+
+def _handle_no_docker_binary(console: Console) -> None:
+    import sys
+
+    console.print("[red]✗ Docker не установлен[/red] — команда `docker` не найдена в PATH.")
+
+    if not sys.stdin.isatty():
+        raise DockerNotFoundError(
+            message="Docker не установлен.",
+            exit_code=1,
+            hint="Установи Docker: https://docs.docker.com/engine/install/",
+        )
+
+    if shutil.which("apt-get"):
+        install_cmds = [
+            ["sudo", "apt-get", "update", "-qq"],
+            ["sudo", "apt-get", "install", "-y", "docker.io"],
+            ["sudo", "systemctl", "enable", "--now", "docker"],
+        ]
+        pkg = "apt"
+    elif shutil.which("dnf"):
+        install_cmds = [
+            ["sudo", "dnf", "install", "-y", "docker"],
+            ["sudo", "systemctl", "enable", "--now", "docker"],
+        ]
+        pkg = "dnf"
+    elif shutil.which("pacman"):
+        install_cmds = [
+            ["sudo", "pacman", "-S", "--noconfirm", "docker"],
+            ["sudo", "systemctl", "enable", "--now", "docker"],
+        ]
+        pkg = "pacman"
+    elif shutil.which("brew"):
+        install_cmds = [["brew", "install", "--cask", "docker"]]
+        pkg = "brew"
+    else:
+        install_cmds = []
+        pkg = None
+
+    try:
+        import questionary
+    except ImportError:
+        raise DockerNotFoundError(
+            message="Docker не установлен.",
+            exit_code=1,
+            hint="Установи Docker: https://docs.docker.com/engine/install/",
+        )
+
+    if install_cmds and pkg:
+        cmds_preview = " && ".join(" ".join(c) for c in install_cmds)
+        console.print(f"[dim]Установка через {pkg}:[/dim] {cmds_preview}")
+        answer = questionary.confirm("Установить Docker сейчас?", default=True).ask()
+        if answer is None:
+            raise typer.Abort()
+        if answer:
+            for cmd in install_cmds:
+                ret = subprocess.run(cmd, check=False).returncode  # noqa: S603
+                if ret != 0:
+                    console.print(f"[red]Ошибка:[/red] {' '.join(cmd)}")
+                    raise typer.Exit(code=1)
+            console.print("[green]✓[/green] Docker установлен.")
+            console.print("[yellow]![/yellow] Открой новую сессию или повтори команду.")
+            raise typer.Exit(code=0)
+    else:
+        console.print("[dim]Установи Docker вручную:[/dim] https://docs.docker.com/engine/install/")
+
+    raise DockerNotFoundError(
+        message="Docker не установлен.",
+        exit_code=1,
+        hint="Установи Docker: https://docs.docker.com/engine/install/",
+    )
+
+
+def _handle_docker_no_permission(console: Console) -> None:
+    import getpass
+    import sys
+
+    username = getpass.getuser()
+    console.print("[red]✗ Нет прав на Docker daemon socket[/red]")
+    console.print(f"  Пользователь [bold]{username}[/bold] не в группе [bold]docker[/bold].")
+    console.print("  Сокет: [dim]unix:///var/run/docker.sock[/dim]")
+
+    fix_cmd = ["sudo", "usermod", "-aG", "docker", username]
+    fix_str = " ".join(fix_cmd)
+
+    if not sys.stdin.isatty():
+        raise HcCliError(
+            message="Нет прав на Docker daemon socket.",
+            exit_code=1,
+            hint=f"Выполни: {fix_str}  и перелогинься.",
+        )
+
+    try:
+        import questionary
+    except ImportError:
+        raise HcCliError(
+            message="Нет прав на Docker daemon socket.",
+            exit_code=1,
+            hint=f"Выполни: {fix_str}  и перелогинься.",
+        )
+
+    console.print(f"\n[yellow]Фикс:[/yellow] [bold]{fix_str}[/bold]")
+    answer = questionary.confirm(
+        f"Добавить {username} в группу docker (потребуется sudo)?",
+        default=True,
+    ).ask()
+
+    if answer is None:
+        raise typer.Abort()
+
+    if not answer:
+        raise HcCliError(
+            message="Нет прав на Docker daemon socket.",
+            exit_code=1,
+            hint=f"Выполни вручную: {fix_str}  и перелогинься.",
+        )
+
+    ret = subprocess.run(fix_cmd, check=False).returncode  # noqa: S603
+    if ret != 0:
+        raise HcCliError(
+            message="Не удалось добавить пользователя в группу docker.",
+            exit_code=1,
+            hint=f"Выполни вручную: {fix_str}",
+        )
+
+    console.print(f"[green]✓[/green] Пользователь [bold]{username}[/bold] добавлен в группу [bold]docker[/bold].")
+    console.print()
+    console.print("[yellow]![/yellow] Группа применится после переоткрытия сессии.")
+    console.print("  Применить сейчас (откроет новый шелл): [bold]newgrp docker[/bold]")
+    console.print("  Или: выйди и зайди снова, затем повтори [bold]hc env up[/bold].")
+    raise typer.Exit(code=0)
 
 
 def compose_project_from_source(console: Console, src: CoreSource, mode: str | None = None) -> ComposeProject:
