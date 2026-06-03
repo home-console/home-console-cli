@@ -639,6 +639,200 @@ def _resolve_env_up_plan(
     )
 
 
+def _get_needed_ports(plan: EnvUpPlan) -> dict[int, str]:
+    """Return {host_port: service_name} for all services in the plan."""
+    import json
+
+    r = subprocess.run(  # noqa: S603
+        [
+            "docker", "compose", "-f", str(plan.project.compose_file),
+            *[arg for cp in sorted(plan.compose_profiles) for arg in ("--profile", cp)],
+            "config", "--format", "json",
+        ],
+        cwd=str(plan.project.cwd),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if r.returncode != 0:
+        return {}
+
+    try:
+        cfg = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+    result: dict[int, str] = {}
+    for svc_name in plan.service_names:
+        svc = cfg.get("services", {}).get(svc_name, {})
+        for p in svc.get("ports", []):
+            published = p.get("published") if isinstance(p, dict) else None
+            if published:
+                try:
+                    result[int(published)] = svc_name
+                except (ValueError, TypeError):
+                    pass
+    return result
+
+
+def _find_port_conflicts(
+    needed: dict[int, str],
+    project_cwd: Path,
+) -> list[dict[str, object]]:
+    """Find running containers (outside this project) that hold needed ports."""
+    import json
+
+    if not needed:
+        return []
+
+    project_name = project_cwd.name
+
+    r = subprocess.run(  # noqa: S603
+        ["docker", "ps", "--format", "{{json .}}"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if r.returncode != 0:
+        return []
+
+    conflicts: list[dict[str, object]] = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            c = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        labels = c.get("Labels", "")
+        if f"com.docker.compose.project={project_name}" in labels:
+            continue
+
+        ports_str = c.get("Ports", "")
+        held: set[int] = set()
+        for part in ports_str.split(","):
+            part = part.strip()
+            if "->" in part and ":" in part:
+                try:
+                    host_part = part.split(":")[1].split("->")[0]
+                    held.add(int(host_part))
+                except (ValueError, IndexError):
+                    pass
+
+        blocking = {p: needed[p] for p in held if p in needed}
+        if blocking:
+            conflicts.append({
+                "id": (c.get("ID") or "")[:12],
+                "name": c.get("Names", "?"),
+                "image": c.get("Image", "?"),
+                "ports": blocking,
+            })
+
+    return conflicts
+
+
+def _offer_resolve_conflicts(
+    conflicts: list[dict[str, object]],
+    console: Console,
+) -> None:
+    """Interactive menu: stop or remove containers that block our ports."""
+    console.print("\n[yellow]⚠ Конфликт портов[/yellow] — следующие контейнеры занимают нужные порты:\n")
+
+    for c in conflicts:
+        ports_info = ", ".join(
+            f"[bold]:{p}[/bold] (нужен для {svc})"
+            for p, svc in sorted(c["ports"].items())  # type: ignore[union-attr]
+        )
+        console.print(f"  [cyan]{c['name']}[/cyan]  {c['image']}  {ports_info}")
+
+    if not sys.stdin.isatty():
+        raise HcCliError(
+            message="Конфликт портов: есть чужие контейнеры на нужных портах.",
+            exit_code=1,
+            hint="Останови конфликтующие контейнеры вручную: docker stop <name>",
+        )
+
+    try:
+        import questionary
+        from questionary import Style as QStyle
+    except ImportError:
+        raise HcCliError(
+            message="Конфликт портов.",
+            exit_code=1,
+            hint="Останови контейнеры вручную: docker stop <name>",
+        )
+
+    style = QStyle([
+        ("qmark",       "fg:#00bfff bold"),
+        ("question",    "bold"),
+        ("pointer",     "fg:#00bfff bold"),
+        ("highlighted", "fg:#00bfff bold"),
+        ("selected",    "fg:#ffaa00"),
+        ("instruction", "fg:#808080 italic"),
+    ])
+
+    choices = [
+        questionary.Choice(
+            title=(
+                f"{c['name']}  [{c['image']}]  "
+                + ", ".join(f":{p}" for p in sorted(c["ports"]))  # type: ignore[union-attr]
+            ),
+            value=c,
+            checked=True,
+        )
+        for c in conflicts
+    ]
+
+    selected = questionary.checkbox(
+        "Выбери контейнеры для остановки (SPACE = вкл/выкл  ENTER = применить):",
+        choices=choices,
+        style=style,
+    ).ask()
+
+    if selected is None:
+        raise typer.Abort()
+
+    if not selected:
+        raise HcCliError(
+            message="Конфликт портов не разрешён.",
+            exit_code=1,
+            hint="Останови конфликтующие контейнеры вручную и повтори.",
+        )
+
+    action = questionary.select(
+        "Действие над выбранными контейнерами:",
+        choices=[
+            questionary.Choice("Остановить  (docker stop)", value="stop"),
+            questionary.Choice("Удалить     (docker rm -f)", value="rm"),
+        ],
+        style=style,
+    ).ask()
+
+    if action is None:
+        raise typer.Abort()
+
+    for c in selected:
+        cid = c["id"] or c["name"]
+        if action == "stop":
+            r = subprocess.run(["docker", "stop", cid], capture_output=True, check=False)  # noqa: S603
+            if r.returncode == 0:
+                console.print(f"[green]✓[/green] остановлен [bold]{c['name']}[/bold]")
+            else:
+                console.print(f"[red]✗[/red] не удалось остановить [bold]{c['name']}[/bold]")
+        else:
+            r = subprocess.run(["docker", "rm", "-f", cid], capture_output=True, check=False)  # noqa: S603
+            if r.returncode == 0:
+                console.print(f"[green]✓[/green] удалён [bold]{c['name']}[/bold]")
+            else:
+                console.print(f"[red]✗[/red] не удалось удалить [bold]{c['name']}[/bold]")
+
+    console.print()
+
+
 def _compose_base_cmd(plan: EnvUpPlan) -> list[str]:
     cmd = ["docker", "compose", "-f", str(plan.project.compose_file)]
     for cp in sorted(plan.compose_profiles):
@@ -843,6 +1037,11 @@ def register(app: typer.Typer) -> None:
                     cwd=plan.project.cwd,
                     extra_env=extra_env,
                 )
+
+            needed_ports = _get_needed_ports(plan)
+            conflicts = _find_port_conflicts(needed_ports, plan.project.cwd)
+            if conflicts:
+                _offer_resolve_conflicts(conflicts, console)
 
             up_cmd = [*base_cmd, "up"]
             if detach:
