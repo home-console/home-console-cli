@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -44,6 +45,7 @@ def run_cli_upgrade(console: Console, *, check_only: bool = False) -> int:
 
     if _upgrade_via_pipx(console):
         console.print(f"[green]✓[/green] Обновлено до {latest} (pipx)")
+        _reexec(console)
         return 0
 
     code = subprocess.run(  # noqa: S603
@@ -54,9 +56,19 @@ def run_cli_upgrade(console: Console, *, check_only: bool = False) -> int:
         console.print("[red]Ошибка:[/red] pip install завершился с ошибкой.")
         console.print(f"[dim]Вручную:[/dim] {upgrade_hint()}")
         return code
-    console.print("[green]✓[/green] Обновлено через pip. Перезапусти терминал.")
-    console.print("[dim]Проверка:[/dim] hc version")
+    console.print("[green]✓[/green] Обновлено через pip.")
+    _reexec(console)
     return 0
+
+
+def _reexec(console: Console) -> None:
+    """Заменить текущий процесс новой версией бинарника (без видимого перезапуска)."""
+    exe = shutil.which("hc") or sys.argv[0]
+    try:
+        console.print(f"[dim]↺ Перезапуск с новой версией...[/dim]")
+        os.execv(exe, [exe, *sys.argv[1:]])
+    except OSError:
+        console.print("[dim]Перезапусти сессию вручную: exec hc[/dim]")
 
 
 def register(app: typer.Typer) -> None:

@@ -833,6 +833,186 @@ def _offer_resolve_conflicts(
     console.print()
 
 
+def _check_disk_space(console: Console) -> None:
+    """Проверить свободное место; предупредить и предложить расширение если мало."""
+    import shutil as _shutil
+
+    stat = _shutil.disk_usage("/")
+    free_gb = stat.free / 1024 ** 3
+    total_gb = stat.total / 1024 ** 3
+    used_pct = stat.used / stat.total * 100
+
+    if free_gb >= 2.0:
+        return
+
+    color = "red" if free_gb < 0.5 else "yellow"
+    console.print(
+        f"\n[{color}]⚠ Мало места на диске[/{color}]  "
+        f"свободно [bold]{free_gb:.2f} GB[/bold] из {total_gb:.1f} GB "
+        f"([bold]{used_pct:.0f}%[/bold] занято)"
+    )
+    console.print(
+        "  [dim]Быстрая очистка:[/dim] "
+        "[bold]docker system prune -af --volumes[/bold]"
+    )
+
+    lvm = _detect_lvm_opportunity()
+    if lvm:
+        _offer_lvm_extend(console, lvm)
+    elif free_gb < 0.5:
+        if not sys.stdin.isatty():
+            from hc.errors import HcCliError
+            raise HcCliError(
+                message=f"Критически мало места: {free_gb:.2f} GB.",
+                exit_code=1,
+                hint="docker system prune -af --volumes",
+            )
+        try:
+            import questionary
+            if not questionary.confirm(
+                "Критически мало места. Продолжить всё равно?", default=False
+            ).ask():
+                raise typer.Exit(code=1)
+        except ImportError:
+            pass
+
+    console.print()
+
+
+def _detect_lvm_opportunity() -> dict | None:
+    """Вернуть info-словарь если / на LVM и в VG есть свободное место (>1 GB)."""
+    try:
+        df = subprocess.run(  # noqa: S603
+            ["df", "/", "--output=source"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        lines = [l for l in df.stdout.strip().splitlines() if l.strip() and not l.startswith("Source")]
+        if not lines or not lines[-1].startswith("/dev/mapper/"):
+            return None
+        dev = lines[-1].strip()
+
+        # Try vgs without sudo first, then with sudo -n (no-password)
+        for cmd_prefix in ([], ["sudo", "-n"]):
+            vgs = subprocess.run(  # noqa: S603
+                [*cmd_prefix, "vgs", "--units", "g", "--noheadings", "--nosuffix",
+                 "-o", "vg_name,vg_free"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if vgs.returncode == 0:
+                break
+        else:
+            # Can't read VGs — still LVM, report without sizes
+            return {"dev": dev, "lv_path": None, "vg_name": None, "vg_free_gb": None}
+
+        for line in vgs.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 2:
+                continue
+            try:
+                vg_free_gb = float(parts[1])
+            except ValueError:
+                continue
+            if vg_free_gb < 1.0:
+                continue
+            vg_name = parts[0]
+
+            lv_path = None
+            for lv_prefix in ([], ["sudo", "-n"]):
+                lvs = subprocess.run(  # noqa: S603
+                    [*lv_prefix, "lvs", "--noheadings", "-o", "lv_path,vg_name"],
+                    capture_output=True, text=True, timeout=5, check=False,
+                )
+                if lvs.returncode == 0:
+                    for lv_line in lvs.stdout.splitlines():
+                        lp = lv_line.strip().split()
+                        if len(lp) >= 2 and lp[1] == vg_name:
+                            lv_path = lp[0]
+                            break
+                    break
+
+            return {"dev": dev, "lv_path": lv_path, "vg_name": vg_name, "vg_free_gb": vg_free_gb}
+
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _offer_lvm_extend(console: Console, lvm: dict) -> None:
+    """Показать или выполнить расширение LVM раздела."""
+    vg_free: float | None = lvm.get("vg_free_gb")
+    lv_path: str | None = lvm.get("lv_path")
+    dev: str = lvm.get("dev", "")
+
+    if vg_free and vg_free > 1.0:
+        console.print(
+            f"\n[green]LVM:[/green] обнаружено [bold]{vg_free:.1f} GB[/bold] "
+            "свободного места в VG — можно расширить раздел."
+        )
+        lv = lv_path or "<lv_path>"
+        console.print(f"  [dim]1.[/dim] [bold]sudo lvextend -l +100%FREE {lv}[/bold]")
+        console.print(f"  [dim]2.[/dim] [bold]sudo resize2fs {dev}[/bold]")
+
+        if sys.stdin.isatty() and lv_path:
+            try:
+                import questionary
+                if questionary.confirm(
+                    f"Расширить LVM автоматически (+{vg_free:.1f} GB)?",
+                    default=True,
+                ).ask():
+                    r1 = subprocess.run(  # noqa: S603
+                        ["sudo", "lvextend", "-l", "+100%FREE", lv_path], check=False
+                    )
+                    if r1.returncode != 0:
+                        console.print("[red]✗[/red] lvextend завершился с ошибкой.")
+                        return
+                    r2 = subprocess.run(  # noqa: S603
+                        ["sudo", "resize2fs", dev], check=False
+                    )
+                    if r2.returncode == 0:
+                        import shutil as _shutil
+                        free_after = _shutil.disk_usage("/").free / 1024 ** 3
+                        console.print(
+                            f"[green]✓[/green] Диск расширен! "
+                            f"Свободно: [bold]{free_after:.1f} GB[/bold]"
+                        )
+                    else:
+                        console.print("[red]✗[/red] resize2fs завершился с ошибкой.")
+            except ImportError:
+                pass
+    else:
+        console.print("\n[dim]LVM обнаружен, но свободного места в VG нет.[/dim]")
+
+
+def _show_failure_logs(console: Console, plan: EnvUpPlan) -> None:
+    """После неудачного up показать логи упавших контейнеров."""
+    import json as _json
+
+    rows = _compose_ps_rows(plan.project)
+    failed: list[str] = []
+    for row in rows:
+        svc = str(row.get("Service") or row.get("Name") or "")
+        if svc not in plan.service_names:
+            continue
+        state = str(row.get("State") or row.get("Status") or "").lower()
+        health = str(row.get("Health") or "").lower()
+        if state in ("exited", "dead", "restarting") or health == "unhealthy":
+            failed.append(svc)
+
+    targets = failed if failed else plan.service_names
+
+    console.print(f"\n[red]── Логи упавших сервисов: {', '.join(targets)} ──[/red]\n")
+    subprocess.run(  # noqa: S603
+        [
+            "docker", "compose", "-f", str(plan.project.compose_file),
+            "logs", "--tail", "60", "--no-log-prefix",
+            *targets,
+        ],
+        cwd=str(plan.project.cwd),
+        check=False,
+    )
+    console.print(f"\n[dim]Полные логи: hc env logs --follow {' '.join(targets)}[/dim]")
+
+
 def _compose_base_cmd(plan: EnvUpPlan) -> list[str]:
     cmd = ["docker", "compose", "-f", str(plan.project.compose_file)]
     for cp in sorted(plan.compose_profiles):
@@ -995,6 +1175,7 @@ def register(app: typer.Typer) -> None:
         try:
             if not dry_run:
                 require_docker(console)
+                _check_disk_space(console)
             mode = mode.strip().lower()
             if mode not in _SERVICES:
                 console.print(f"[red]Ошибка:[/red] неизвестный режим {mode!r}. Допустимые: {' | '.join(_SERVICES)}")
@@ -1050,7 +1231,12 @@ def register(app: typer.Typer) -> None:
                 up_cmd.append("--build")
             up_cmd += plan.service_names
 
-            _run(up_cmd, cwd=plan.project.cwd, extra_env=extra_env)
+            try:
+                _run(up_cmd, cwd=plan.project.cwd, extra_env=extra_env)
+            except typer.Exit as exc:
+                if exc.exit_code != 0:
+                    _show_failure_logs(console, plan)
+                raise
 
             if detach:
                 console.print("[green]✓[/green] env up ok")
