@@ -17,6 +17,7 @@ from hc.commands._client_helpers import require_client
 from hc.config import Config
 from hc.constants import CONFIG_PATH, CORE_SRC_DIR, SETUP_LOG_PATH
 from hc.core_source import COMPOSE_MODES
+from hc.diagnostics import detect_issues, fetch_container_logs, list_compose_containers
 from hc.env_state import load_last_env
 from hc.json_output import print_json
 
@@ -278,6 +279,95 @@ def _checks_recovery_extras() -> list[DoctorCheck]:
     ]
 
 
+def _checks_runtime_logs() -> tuple[list[DoctorCheck], list[str]]:
+    """
+    Прогнать недавние логи core-runtime через каталог known issues.
+    Срабатывает только если стек запущен и compose-файл известен — иначе skip.
+
+    Если найдены известные проблемы — каждая попадает в issues, чтобы doctor
+    завершился с кодом 1 (нужно действие пользователя).
+    """
+    checks: list[DoctorCheck] = []
+    issues: list[str] = []
+
+    last = load_last_env()
+    if not last or not last.mode:
+        return checks, issues
+
+    rel = COMPOSE_MODES.get(last.mode)
+    if not rel:
+        return checks, issues
+
+    compose_file = CORE_SRC_DIR / rel
+    if not compose_file.exists():
+        return checks, issues
+
+    try:
+        containers = list_compose_containers(compose_file, compose_file.parent)
+    except Exception:  # noqa: BLE001
+        return checks, issues
+
+    runtime = next(
+        (c for c in containers if str(c.get("Service") or "") == "core-runtime"),
+        None,
+    )
+    if runtime is None:
+        return checks, issues
+
+    state = str(runtime.get("_effective_state") or runtime.get("State") or "").lower()
+    if state == "running":
+        # Здоровый running — заглянем в логи на всякий случай (короткий хвост),
+        # но фейлить doctor не будем.
+        try:
+            logs = fetch_container_logs(compose_file, compose_file.parent, "core-runtime", tail=50)
+        except Exception:  # noqa: BLE001
+            return checks, issues
+        found = detect_issues(logs, service="core-runtime")
+        if not found:
+            checks.append(DoctorCheck("Логи core-runtime", "ok", "известных ошибок не найдено"))
+            return checks, issues
+        # Running но в логах что-то подозрительное — warning, не error.
+        checks.append(
+            DoctorCheck(
+                "Логи core-runtime",
+                "warn",
+                f"найдено подозрительных шаблонов: {len(found)} (см. ниже)",
+            )
+        )
+        for det in found:
+            issues.append(f"core-runtime: {det.issue.title}")
+        return checks, issues
+
+    # Не running — это серьёзно. Подтянем больше логов.
+    try:
+        logs = fetch_container_logs(compose_file, compose_file.parent, "core-runtime", tail=200)
+    except Exception:  # noqa: BLE001
+        return checks, issues
+    found = detect_issues(logs, service="core-runtime")
+    if found:
+        checks.append(
+            DoctorCheck(
+                "Логи core-runtime",
+                "fail",
+                f"контейнер не running, найдено проблем: {len(found)}",
+            )
+        )
+        for det in found:
+            issues.append(
+                f"core-runtime: {det.issue.title} → см. `hc env up` для предложения по починке"
+            )
+    else:
+        checks.append(
+            DoctorCheck(
+                "Логи core-runtime",
+                "warn",
+                f"контейнер не running (state={state}), но известных ошибок не найдено",
+            )
+        )
+
+    return checks, issues
+
+
 def run_doctor(console: Console, *, scope: DoctorScope) -> DoctorReport:
     report = DoctorReport(scope=scope)
     cfg = Config.load() if CONFIG_PATH.exists() else Config()
@@ -313,6 +403,10 @@ def run_doctor(console: Console, *, scope: DoctorScope) -> DoctorReport:
         disk_checks, disk_issues = _checks_disk()
         report.checks.extend(disk_checks)
         report.issues.extend(disk_issues)
+
+        log_checks, log_issues = _checks_runtime_logs()
+        report.checks.extend(log_checks)
+        report.issues.extend(log_issues)
 
     if scope == "recovery":
         report.checks.extend(_checks_recovery_extras())

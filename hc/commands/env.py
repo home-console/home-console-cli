@@ -14,10 +14,23 @@ from rich.table import Table
 from hc.config import Config
 from hc.core_ops import ComposeProject, compose_project_from_source, require_docker
 from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local, init_core_source
+from hc.diagnostics import (
+    DetectedIssue,
+    detect_issues,
+    fetch_container_logs,
+    list_compose_containers,
+)
+from hc.env_bootstrap import ensure_core_env
 from hc.env_state import load_last_env, save_last_env
 from hc.errors import CoreSourcesNotFoundError, HcCliError
 from hc.hints import ENV_STACK_HELP, ENV_VS_CORE_DOTENV
 from hc.json_output import print_json
+from hc.vault_ops import (
+    DbKind,
+    detect_running_db,
+    reset_vault_postgres,
+    reset_vault_sqlite,
+)
 
 
 # ─── Service catalogue ────────────────────────────────────────────────────────
@@ -52,12 +65,34 @@ _SERVICES: dict[str, list[_Svc]] = {
     ],
 }
 
-_PROFILES: dict[str, list[str]] = {
-    "base":     ["core-runtime", "caddy", "edge"],
-    "backend":  ["redis", "core-runtime", "caddy", "edge"],
-    "platform": ["core-runtime", "edge", "platform-web"],
-    "hmr":      ["redis", "core-runtime", "caddy", "frontend-vite"],
-    "full":     ["redis", "core-runtime", "caddy", "edge", "platform-web", "frontend-vite"],
+_PROFILE_DEFAULT_MODE: dict[str, str] = {
+    "base": "dev-reload",
+    "backend": "dev-reload",
+    "platform": "dev-image",
+    "hmr": "dev-reload",
+    "full": "dev-image",
+}
+
+_PROFILES: dict[str, dict[str, list[str]]] = {
+    "base": {
+        "dev": ["core-runtime", "caddy"],
+        "dev-reload": ["core-runtime", "caddy"],
+        "dev-image": ["core-runtime", "edge"],
+    },
+    "backend": {
+        "dev": ["redis", "core-runtime", "caddy"],
+        "dev-reload": ["redis", "core-runtime", "caddy"],
+        "dev-image": ["redis", "core-runtime", "edge"],
+    },
+    "platform": {
+        "dev-image": ["core-runtime", "edge", "platform-web"],
+    },
+    "hmr": {
+        "dev-reload": ["redis", "core-runtime", "caddy", "frontend-vite"],
+    },
+    "full": {
+        "dev-image": ["redis", "core-runtime", "edge", "platform-web"],
+    },
 }
 
 
@@ -110,7 +145,7 @@ class EnvUpPlan:
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 _MODE_DEFAULT = "dev-reload"
-_MODE_HELP = "dev-reload | dev | dev-image  (по умолчанию: dev-reload = hot-reload)"
+_MODE_HELP = "dev-reload | dev | dev-image  (без --mode профиль может выбрать режим автоматически)"
 _PROFILE_HELP = (
     "Пресет: base | backend | platform | hmr | full  "
     "(без --profile: интерактивный выбор)"
@@ -186,6 +221,77 @@ def _run(cmd: list[str], *, cwd: Path | None = None, extra_env: dict[str, str] |
         raise typer.Exit(code=1)
     if p.returncode != 0:
         raise typer.Exit(code=p.returncode)
+
+
+# ─── Post-mortem after failed up ──────────────────────────────────────────────
+
+def _run_postmortem(console: Console, project: ComposeProject) -> list[DetectedIssue]:
+    """
+    Найти упавшие/unhealthy контейнеры, подтянуть их логи и распознать
+    известные ошибки через каталог diagnostics.
+
+    Возвращает список найденных известных проблем (может быть пустым).
+    """
+    try:
+        candidates = list_compose_containers(
+            project.compose_file,
+            project.cwd,
+            only_states=("exited", "unhealthy", "restarting", "dead"),
+        )
+    except Exception:  # noqa: BLE001
+        return []
+
+    if not candidates:
+        # На случай, если compose уже снёс контейнер до того, как мы успели посмотреть.
+        try:
+            candidates = list_compose_containers(project.compose_file, project.cwd)
+        except Exception:  # noqa: BLE001
+            return []
+        candidates = [c for c in candidates if c.get("_effective_state") != "running"]
+
+    found: list[DetectedIssue] = []
+    for cont in candidates:
+        service = str(cont.get("Service") or cont.get("Name") or "")
+        if not service:
+            continue
+        try:
+            logs = fetch_container_logs(project.compose_file, project.cwd, service, tail=200)
+        except Exception:  # noqa: BLE001
+            continue
+        found.extend(detect_issues(logs, service=service))
+
+    return found
+
+
+def _print_postmortem(console: Console, issues: list[DetectedIssue]) -> None:
+    """Красиво отрисовать найденные проблемы с готовыми командами для починки."""
+    if not issues:
+        console.print(
+            "\n[yellow]![/yellow] Стек поднялся не до конца, но известных шаблонов ошибок не нашёл."
+        )
+        console.print(
+            "  [dim]Посмотри полные логи:[/dim] [cyan]hc env logs core-runtime --tail 200[/cyan]"
+        )
+        return
+
+    console.print(
+        f"\n[bold red]✗ Обнаружено известных проблем: {len(issues)}[/bold red]\n"
+    )
+    for i, det in enumerate(issues, 1):
+        issue = det.issue
+        header = f"[bold]{i}. {issue.title}[/bold]"
+        if det.service:
+            header += f"  [dim](в {det.service})[/dim]"
+        console.print(header)
+        for line in issue.cause.splitlines():
+            console.print(f"   [dim]{line}[/dim]")
+        if det.matched_line:
+            console.print(f"   [dim]└ строка лога:[/dim] [yellow]{det.matched_line}[/yellow]")
+        if issue.fix_commands:
+            console.print("   [bold cyan]Что сделать:[/bold cyan]")
+            for cmd, desc in issue.fix_commands:
+                console.print(f"     [green]→[/green] [cyan]{cmd}[/cyan]   [dim]# {desc}[/dim]")
+        console.print()
 
 
 def pull_core_source(src: CoreSource, console: Console, *, quiet: bool = False) -> bool:
@@ -556,7 +662,15 @@ def _resolve_services(
         if preset is None:
             console.print(f"[red]Ошибка:[/red] неизвестный профиль {profile!r}. Допустимые: {' | '.join(sorted(_PROFILES))}")
             raise typer.Exit(code=2)
-        selected = [s for s in available if s.name in preset]
+        allowed = preset.get(mode)
+        if allowed is None:
+            preferred_mode = _PROFILE_DEFAULT_MODE.get(key)
+            hint = f" Попробуй `--mode {preferred_mode}`." if preferred_mode else ""
+            console.print(
+                f"[red]Ошибка:[/red] профиль {profile!r} не поддерживается в режиме {mode!r}.{hint}"
+            )
+            raise typer.Exit(code=2)
+        selected = [s for s in available if s.name in allowed]
         if not selected:
             console.print(
                 f"[yellow]Профиль {profile!r} не содержит сервисов для режима {mode!r}.[/yellow]\n"
@@ -601,6 +715,14 @@ def _resolve_db(
     if needs_db and last and last.mode == mode and last.db in _DB_KEY_MAP:
         return _DB_KEY_MAP[last.db]
     return _DB_KEY_MAP["sqlite"]
+
+
+def _resolve_mode(mode: str | None, profile: str | None) -> str:
+    if mode:
+        return mode.strip().lower()
+    if profile:
+        return _PROFILE_DEFAULT_MODE.get(profile.strip().lower(), _MODE_DEFAULT)
+    return _MODE_DEFAULT
 
 
 def _resolve_env_up_plan(
@@ -1156,7 +1278,7 @@ def register(app: typer.Typer) -> None:
 
     @env_app.command("up")
     def env_up(
-        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        mode: str | None = typer.Option(None, "--mode", "-m", help=_MODE_HELP),
         profile: str | None = typer.Option(None, "--profile", "-p", help=_PROFILE_HELP),
         db: str | None = typer.Option(None, "--db", help=_DB_HELP),
         pull: bool = typer.Option(False, "--pull/--no-pull", help="docker compose pull перед up"),
@@ -1181,12 +1303,14 @@ def register(app: typer.Typer) -> None:
             if not dry_run:
                 require_docker(console)
                 _check_disk_space(console)
-            mode = mode.strip().lower()
+            mode = _resolve_mode(mode, profile)
             if mode not in _SERVICES:
                 console.print(f"[red]Ошибка:[/red] неизвестный режим {mode!r}. Допустимые: {' | '.join(_SERVICES)}")
                 raise typer.Exit(code=2)
 
             src = _resolve_source(console)
+            if not dry_run:
+                ensure_core_env(console, src.path)
             if not dry_run:
                 _try_pull_source(src, console)
 
@@ -1238,9 +1362,14 @@ def register(app: typer.Typer) -> None:
 
             try:
                 _run(up_cmd, cwd=plan.project.cwd, extra_env=extra_env)
-            except typer.Exit as exc:
-                if exc.exit_code != 0:
+            except typer.Exit as exit_exc:
+                # docker compose ушёл с ошибкой:
+                #   1) Сначала покажем сырые логи упавших сервисов (контекст для человека).
+                #   2) Потом прогоним через детектор известных проблем и подскажем действия.
+                if (exit_exc.exit_code or 0) != 0:
                     _show_failure_logs(console, plan)
+                    issues = _run_postmortem(console, plan.project)
+                    _print_postmortem(console, issues)
                 raise
 
             if detach:
@@ -2008,4 +2137,157 @@ def register(app: typer.Typer) -> None:
                 console.print("[green]✓[/green] .env сохранён")
 
     env_app.add_typer(dotenv_app, name="dotenv")
+
+    # ─── hc env reset-vault ────────────────────────────────────────────────
+
+    @env_app.command("reset-vault")
+    def env_reset_vault(
+        db: str = typer.Option(
+            "auto",
+            "--db",
+            help="Какой vault сбрасывать: auto | sqlite | postgres (auto = по запущенному стеку)",
+        ),
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение"),
+        restart: bool = typer.Option(
+            True,
+            "--restart/--no-restart",
+            help="Перезапустить core-runtime после сброса",
+        ),
+    ) -> None:
+        """
+        Сбросить vault (шифрованное хранилище секретов) — нужно когда RUNTIME_MASTER_KEY
+        не совпадает с тем, которым зашифрованы существующие записи.
+
+        Что удаляется:
+          • sqlite:   /data/vault.db и /data/vault_secret.db (+ WAL/SHM)
+          • postgres: записи в storage с namespace в (secrets.store, _system.meta,
+                      _system.root_hash, _system.audit_log) + TRUNCATE storage_metadata
+
+        Что НЕ удаляется: данные core (runtime.db / основная схема Postgres) — их
+        миграции и пользовательские записи остаются нетронутыми.
+
+        После сброса core при следующем старте сгенерирует CSRF_SECRET и
+        OAUTH_ENCRYPTION_KEY заново и положит в новый vault с текущим RUNTIME_MASTER_KEY.
+
+        Примеры:
+          hc env reset-vault              # auto-detect + подтверждение
+          hc env reset-vault --db postgres --yes
+          hc env reset-vault --no-restart # сбросить, но не перезапускать
+        """
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+
+            db_key = db.strip().lower().replace("pg", "postgres")
+            resolved: DbKind
+            if db_key == "auto":
+                detected = detect_running_db(project.compose_file, project.cwd)
+                if detected is None:
+                    # Фоллбэк на last_env, если стек не запущен.
+                    last = load_last_env()
+                    if last and last.db in {"sqlite", "postgres"}:
+                        resolved = last.db  # type: ignore[assignment]
+                        console.print(
+                            f"[dim]Стек не запущен, использую db={resolved} из последнего env up[/dim]"
+                        )
+                    else:
+                        console.print(
+                            "[red]Ошибка:[/red] не удалось определить активную БД. "
+                            "Укажи явно: --db sqlite или --db postgres"
+                        )
+                        raise typer.Exit(code=2)
+                else:
+                    resolved = detected
+            elif db_key in {"sqlite", "postgres"}:
+                resolved = db_key  # type: ignore[assignment]
+            else:
+                console.print(
+                    f"[red]Ошибка:[/red] --db {db!r} неизвестен. Допустимые: auto | sqlite | postgres"
+                )
+                raise typer.Exit(code=2)
+
+            # Предупреждение пользователю.
+            console.print(
+                f"\n[yellow]![/yellow] Сейчас будет сброшен vault для [bold]{resolved}[/bold]."
+            )
+            if resolved == "postgres":
+                console.print(
+                    "  [dim]Удалятся записи storage из vault-namespaces + "
+                    "TRUNCATE storage_metadata.[/dim]"
+                )
+                console.print(
+                    "  [dim]Core-данные (схемы Alembic, прочие записи) остаются.[/dim]"
+                )
+            else:
+                console.print(
+                    "  [dim]Удалятся файлы /data/vault.db и /data/vault_secret.db "
+                    "(+ WAL/SHM) из volume core-data.[/dim]"
+                )
+                console.print("  [dim]Файл /data/runtime.db (core) остаётся.[/dim]")
+
+            if not yes and sys.stdin.isatty():
+                try:
+                    import questionary
+                    confirmed = questionary.confirm(
+                        "Продолжить сброс vault?",
+                        default=False,
+                    ).ask()
+                except ImportError:
+                    confirmed = False
+                if not confirmed:
+                    console.print("[dim]Отменено.[/dim]")
+                    raise typer.Exit(code=0)
+
+            # Сам сброс.
+            console.print(f"\n[cyan]→[/cyan] reset-vault [bold]{resolved}[/bold]")
+            if resolved == "postgres":
+                result = reset_vault_postgres(
+                    compose_file=project.compose_file,
+                    cwd=project.cwd,
+                )
+            else:
+                result = reset_vault_sqlite(
+                    compose_file=project.compose_file,
+                    cwd=project.cwd,
+                )
+
+            for action in result.actions:
+                console.print(f"  [dim]·[/dim] {action}")
+
+            if not result.success:
+                console.print(f"[red]✗[/red] reset-vault failed: {result.message}")
+                raise typer.Exit(code=1)
+
+            console.print(f"[green]✓[/green] vault сброшен ({result.db})")
+
+            # Перезапуск core-runtime — он пересоздаст vault и runtime-секреты.
+            if restart:
+                running = _get_running_services(project.compose_file, project.cwd)
+                if "core-runtime" in running:
+                    console.print("[cyan]→[/cyan] restart core-runtime")
+                    _run(
+                        ["docker", "compose", "-f", str(project.compose_file),
+                         "restart", "core-runtime"],
+                        cwd=project.cwd,
+                    )
+                    console.print("[green]✓[/green] core-runtime перезапущен")
+                    console.print(
+                        "  [dim]Проверь:[/dim] [cyan]hc env health[/cyan] "
+                        "или [cyan]hc env logs core-runtime --tail 50[/cyan]"
+                    )
+                else:
+                    console.print(
+                        "  [dim]core-runtime не запущен — подними его: [/dim][cyan]hc env up[/cyan]"
+                    )
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
     app.add_typer(env_app, name="env")
