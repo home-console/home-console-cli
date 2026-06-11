@@ -8,7 +8,15 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from hc.constants import CORE_SRC_DIR, DATA_DIR, DEFAULT_CORE_REF, DEFAULT_CORE_REPO
+from hc.constants import (
+    CORE_SRC_DIR,
+    DATA_DIR,
+    DEFAULT_CORE_REF,
+    DEFAULT_CORE_REPO,
+    DEFAULT_PLATFORM_REF,
+    DEFAULT_PLATFORM_REPO,
+    PLATFORM_SRC_DIR,
+)
 
 
 # ─── Канонический маппинг режимов → compose-файл ──────────────────────────────
@@ -124,6 +132,54 @@ def update_core_source(console: Console) -> CoreSource:
         _print_git_error(console, "pull", str(src.path), r.stderr or r.stdout)
         raise typer.Exit(code=1)
     return src
+
+
+def get_platform_source_local() -> Path | None:
+    """Возвращает путь к локально склонированному platform-home-console (или None)."""
+    return PLATFORM_SRC_DIR if (PLATFORM_SRC_DIR / "package.json").is_file() else None
+
+
+def init_platform_source(
+    console: Console,
+    repo_url: str | None = None,
+    ref: str | None = None,
+    target: Path | None = None,
+) -> Path:
+    """
+    Склонировать platform-home-console (нужен для сервиса frontend-vite).
+
+    По умолчанию клонирует в PLATFORM_SRC_DIR (sibling-папка к CORE_SRC_DIR).
+    Если target указан явно — клонирует туда (нужно для проверки на лету,
+    когда compose монтирует ../../../platform-home-console и target может
+    отличаться от стандартного PLATFORM_SRC_DIR).
+    """
+    _require_git(console)
+    target = target or PLATFORM_SRC_DIR
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if target.exists() and any(target.iterdir()):
+        console.print(f"[yellow]Папка уже не пустая:[/yellow] {target}")
+        return target
+
+    # Удаляем пустую папку чтобы git clone не ругался "already exists".
+    if target.exists():
+        try:
+            target.rmdir()
+        except OSError:
+            pass
+
+    repo_url = repo_url or DEFAULT_PLATFORM_REPO
+    ref = ref or DEFAULT_PLATFORM_REF
+
+    cmd = ["git", "clone", "--depth", "1", "--branch", ref, repo_url, str(target)]
+    console.print(f"[cyan]→ git clone {repo_url} → {target}[/cyan]")
+    r = subprocess.run(cmd, check=False, text=True, capture_output=True)  # noqa: S603
+    if r.returncode != 0:
+        _print_git_error(console, "clone", repo_url, r.stderr or r.stdout)
+        raise typer.Exit(code=1)
+
+    console.print(f"[green]✓[/green] platform-home-console склонирован: {target}")
+    return target
 
 
 def _print_git_error(console: Console, op: str, target: str, stderr: str) -> None:

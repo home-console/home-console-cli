@@ -14,6 +14,7 @@ SETUP_PID_PATH = CONFIG_DIR / "setup.pid"
 DATA_DIR = Path.home() / ".local" / "share" / "hc"
 STATE_DIR = Path.home() / ".local" / "state" / "hc"
 CORE_SRC_DIR = DATA_DIR / "core-runtime-service"
+PLATFORM_SRC_DIR = DATA_DIR / "platform-home-console"
 
 # Нативный `hc core up --mode native`: PID и лог процесса `python main.py`.
 NATIVE_CORE_PID_PATH = STATE_DIR / "native-core.pid"
@@ -21,6 +22,9 @@ NATIVE_CORE_LOG_PATH = STATE_DIR / "native-core.log"
 
 DEFAULT_CORE_REPO = "https://github.com/home-console/core-runtime-service"
 DEFAULT_CORE_REF = "master"
+
+DEFAULT_PLATFORM_REPO = "https://github.com/home-console/platform-home-console"
+DEFAULT_PLATFORM_REF = "master"
 
 # Образ для prod / dev-image rollout (Ghcr). Локально собранный тег задаёт через --image.
 DEFAULT_CORE_IMAGE = "ghcr.io/home-console/core-runtime-service"

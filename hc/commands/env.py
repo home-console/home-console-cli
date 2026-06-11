@@ -13,7 +13,13 @@ from rich.table import Table
 
 from hc.config import Config
 from hc.core_ops import ComposeProject, compose_project_from_source, require_docker
-from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local, init_core_source
+from hc.core_source import (
+    CoreSource,
+    get_core_source_from_repo,
+    get_core_source_local,
+    init_core_source,
+    init_platform_source,
+)
 from hc.diagnostics import (
     DetectedIssue,
     detect_issues,
@@ -1042,16 +1048,6 @@ def _check_frontend_workspace(
         )
         diag = "нет package.json"
 
-    console.print("\n  [bold cyan]Что можно сделать:[/bold cyan]")
-    console.print(
-        "    [green]→[/green] продолжить без frontend-vite "
-        "[dim](Vite HMR не нужен для большинства задач)[/dim]"
-    )
-    console.print(
-        f"    [yellow]$[/yellow] [bold]git clone https://github.com/home-console/platform-home-console "
-        f"{workspace}[/bold]   [dim]# склонировать рядом, потом hc env up[/dim]"
-    )
-
     if not sys.stdin.isatty():
         # В non-TTY режиме (CI/скрипты) — продолжаем БЕЗ удаления frontend-vite,
         # пусть compose упадёт сам, а пост-mortem подсветит проблему.
@@ -1060,20 +1056,55 @@ def _check_frontend_workspace(
 
     try:
         import questionary
-        continue_without = questionary.confirm(
-            "Продолжить без frontend-vite (он будет удалён из плана этого запуска)?",
-            default=True,
+
+        # Если папка существует но пустая — мы можем безопасно её снести и клонировать.
+        # Если папка не существует — сразу клонируем.
+        # Если в папке что-то есть и нет package.json — НЕ клонируем (опасно затереть).
+        can_clone = (not workspace.exists()) or (
+            workspace.exists() and not any(workspace.iterdir())
+        )
+
+        choices = []
+        if can_clone:
+            choices.append(
+                questionary.Choice(
+                    f"📥 Склонировать platform-home-console в {workspace} (рекомендуется)",
+                    value="clone",
+                )
+            )
+        choices.append(
+            questionary.Choice(
+                "⊖ Продолжить без frontend-vite (он будет убран из плана этого запуска)",
+                value="skip",
+            )
+        )
+        choices.append(questionary.Choice("✗ Отменить запуск", value="abort"))
+
+        action = questionary.select(
+            "Что делаем?",
+            choices=choices,
+            default=choices[0].value,
         ).ask()
     except ImportError:
-        continue_without = True
+        action = "skip"
 
-    if continue_without is None:
-        return False
-    if not continue_without:
-        console.print("[dim]Отменено. Склонируй platform-home-console и повтори.[/dim]")
+    if action is None or action == "abort":
+        console.print("[dim]Отменено.[/dim]")
         return False
 
-    # Удаляем frontend-vite из плана прямо in-place.
+    if action == "clone":
+        try:
+            init_platform_source(console, target=workspace)
+        except typer.Exit:
+            console.print(
+                "[red]Не удалось склонировать.[/red] "
+                "Запусти руками или выбери другой вариант."
+            )
+            return False
+        # После успешного клона — frontend-vite остаётся в плане.
+        return True
+
+    # action == "skip" — убираем frontend-vite из плана прямо in-place.
     plan.service_names[:] = [s for s in plan.service_names if s != "frontend-vite"]
     plan.compose_profiles[:] = [p for p in plan.compose_profiles if p != "frontend"]
     console.print("[green]✓[/green] frontend-vite убран из плана запуска\n")

@@ -57,14 +57,24 @@ def test_skips_frontend_in_non_tty_when_missing(tmp_path: Path, monkeypatch) -> 
     assert "frontend-vite" in plan.service_names
 
 
-def test_removes_frontend_when_user_confirms(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(env_mod.sys.stdin, "isatty", lambda: True)
-    # Мокаем questionary.confirm чтобы вернуть True (продолжить без vite)
-    fake_q = SimpleNamespace(
-        confirm=lambda *a, **kw: SimpleNamespace(ask=lambda: True)
+def _fake_questionary(answer: str):
+    """Сэмулировать questionary.select возвращающий заданный ответ."""
+
+    class _Choice:
+        def __init__(self, title=None, value=None, **_):
+            self.title = title
+            self.value = value
+
+    return SimpleNamespace(
+        Choice=_Choice,
+        select=lambda *a, **kw: SimpleNamespace(ask=lambda: answer),
     )
+
+
+def test_skip_action_removes_frontend(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(env_mod.sys.stdin, "isatty", lambda: True)
     import sys as _sys
-    monkeypatch.setitem(_sys.modules, "questionary", fake_q)
+    monkeypatch.setitem(_sys.modules, "questionary", _fake_questionary("skip"))
 
     plan = _make_plan(tmp_path, ["core-runtime", "frontend-vite", "caddy"])
     plan.compose_profiles = ["frontend"]
@@ -72,19 +82,39 @@ def test_removes_frontend_when_user_confirms(tmp_path: Path, monkeypatch) -> Non
     assert result is True
     assert "frontend-vite" not in plan.service_names
     assert "frontend" not in plan.compose_profiles
-    # core-runtime остаётся, и caddy тоже
     assert "core-runtime" in plan.service_names
     assert "caddy" in plan.service_names
 
 
-def test_blocks_when_user_declines(tmp_path: Path, monkeypatch) -> None:
+def test_abort_action_blocks_run(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(env_mod.sys.stdin, "isatty", lambda: True)
-    fake_q = SimpleNamespace(
-        confirm=lambda *a, **kw: SimpleNamespace(ask=lambda: False)
-    )
     import sys as _sys
-    monkeypatch.setitem(_sys.modules, "questionary", fake_q)
+    monkeypatch.setitem(_sys.modules, "questionary", _fake_questionary("abort"))
 
     plan = _make_plan(tmp_path, ["core-runtime", "frontend-vite"])
     result = env_mod._check_frontend_workspace(MagicMock(), plan)
     assert result is False
+
+
+def test_clone_action_invokes_init_platform_source(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(env_mod.sys.stdin, "isatty", lambda: True)
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, "questionary", _fake_questionary("clone"))
+
+    captured: dict = {}
+
+    def fake_init(console, target=None, **kw):
+        captured["target"] = target
+        # Сэмулировать успешный клон: создаём package.json
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "package.json").write_text("{}")
+        return target
+
+    monkeypatch.setattr(env_mod, "init_platform_source", fake_init)
+
+    plan = _make_plan(tmp_path, ["core-runtime", "frontend-vite"])
+    result = env_mod._check_frontend_workspace(MagicMock(), plan)
+    assert result is True
+    # После клона frontend-vite ОСТАЁТСЯ в плане
+    assert "frontend-vite" in plan.service_names
+    assert captured["target"] == tmp_path / "platform-home-console"
