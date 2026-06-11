@@ -308,8 +308,25 @@ def _print_postmortem(
             console.print(f"   [dim]└ строка лога:[/dim] [yellow]{det.matched_line}[/yellow]")
         if issue.fix_commands:
             console.print("   [bold cyan]Что сделать:[/bold cyan]")
-            for cmd, desc in issue.fix_commands:
-                console.print(f"     [green]→[/green] [cyan]{cmd}[/cyan]   [dim]# {desc}[/dim]")
+            has_shell = any(fix.kind == "shell" for fix in issue.fix_commands)
+            for fix in issue.fix_commands:
+                if fix.kind == "shell":
+                    # Shell-команда: явно показываем что это для обычного терминала,
+                    # а не для hc REPL (где доступны только `hc *`).
+                    console.print(
+                        f"     [yellow]$[/yellow] [bold]{fix.command}[/bold]"
+                        f"   [dim]# {fix.description} [shell, не hc][/dim]"
+                    )
+                else:
+                    console.print(
+                        f"     [green]→[/green] [cyan]{fix.command}[/cyan]"
+                        f"   [dim]# {fix.description}[/dim]"
+                    )
+            if has_shell:
+                console.print(
+                    "     [dim italic]Легенда: [green]→[/green] — можно ввести прямо в этом REPL · "
+                    "[yellow]$[/yellow] — выполни в обычном shell[/dim italic]"
+                )
         console.print()
 
 

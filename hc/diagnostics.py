@@ -15,10 +15,11 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
 
 __all__ = [
+    "FixCommand",
     "KnownIssue",
     "DetectedIssue",
     "KNOWN_ISSUES",
@@ -26,6 +27,40 @@ __all__ = [
     "fetch_container_logs",
     "list_compose_containers",
 ]
+
+
+FixKind = Literal["hc", "shell"]
+
+
+@dataclass(frozen=True, slots=True)
+class FixCommand:
+    """
+    Одна рекомендованная команда для починки.
+
+    kind:
+      "hc"    — команда `hc *`, её можно ввести прямо в REPL.
+      "shell" — обычная команда (ls, openssl, docker и т.п.); REPL её не выполнит,
+                нужно открыть отдельный shell.
+    """
+
+    command: str
+    description: str
+    kind: FixKind = "hc"
+
+
+# Backward-compat alias: разрешаем передавать (command, description) tuple или
+# (command, description, kind) tuple — преобразуется в FixCommand при загрузке.
+_FixSpec = tuple[str, str] | tuple[str, str, FixKind] | FixCommand
+
+
+def _to_fix_command(spec: _FixSpec) -> FixCommand:
+    if isinstance(spec, FixCommand):
+        return spec
+    if len(spec) == 2:
+        cmd, desc = spec
+        return FixCommand(command=cmd, description=desc, kind="hc")
+    cmd, desc, kind = spec
+    return FixCommand(command=cmd, description=desc, kind=kind)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +71,7 @@ class KnownIssue:
     title: str
     cause: str
     pattern: re.Pattern[str]
-    fix_commands: tuple[tuple[str, str], ...] = ()  # (command, short description)
+    fix_commands: tuple[FixCommand, ...] = ()
     severity: str = "error"  # error | warn | info
 
 
@@ -51,171 +86,210 @@ class DetectedIssue:
 
 # ─── Каталог известных проблем ────────────────────────────────────────────────
 
-KNOWN_ISSUES: list[KnownIssue] = [
-    KnownIssue(
-        id="master_key_mismatch",
-        title="RUNTIME_MASTER_KEY не совпадает с зашифрованным vault",
-        cause=(
-            "Vault БД содержит секреты, зашифрованные другим мастер-ключом.\n"
-            "AES-GCM не может проверить тег аутентификации → расшифровка невозможна.\n\n"
-            "Типичные причины:\n"
-            "  • переключение между sqlite/postgres (volume остался от прошлой установки)\n"
-            "  • RUNTIME_MASTER_KEY в .env изменился или потерян\n"
-            "  • vault БД восстановлена из бэкапа без соответствующего ключа"
+_RAW_ISSUES: list[tuple[KnownIssue, tuple[_FixSpec, ...]]] = [
+    (
+        KnownIssue(
+            id="master_key_mismatch",
+            title="RUNTIME_MASTER_KEY не совпадает с зашифрованным vault",
+            cause=(
+                "Vault БД содержит секреты, зашифрованные другим мастер-ключом.\n"
+                "AES-GCM не может проверить тег аутентификации → расшифровка невозможна.\n\n"
+                "Типичные причины:\n"
+                "  • переключение между sqlite/postgres (volume остался от прошлой установки)\n"
+                "  • RUNTIME_MASTER_KEY в .env изменился или потерян\n"
+                "  • vault БД восстановлена из бэкапа без соответствующего ключа"
+            ),
+            pattern=re.compile(
+                r"Decryption failed.*InvalidTag|vault was recreated|passphrase changed",
+                re.IGNORECASE,
+            ),
         ),
-        pattern=re.compile(
-            r"Decryption failed.*InvalidTag|vault was recreated|passphrase changed",
-            re.IGNORECASE,
-        ),
-        fix_commands=(
-            ("hc env reset-vault", "снести vault и пересоздать с текущим ключом (рекомендую для dev)"),
-            ("hc env logs core-runtime --tail 200", "полные логи если хочешь разобраться сам"),
+        (
+            ("hc env reset-vault", "снести vault и пересоздать с текущим ключом (рекомендую для dev)", "hc"),
+            ("hc env logs core-runtime --tail 200", "полные логи если хочешь разобраться сам", "hc"),
         ),
     ),
-    KnownIssue(
-        id="missing_required_secrets",
-        title="Не все обязательные секреты заданы",
-        cause=(
-            "Core при старте не нашёл обязательные секреты ни в SecretStore (vault), ни в .env.\n"
-            "Обычно это следствие master_key_mismatch — vault есть, но расшифровать нельзя,\n"
-            "а в .env эти значения не дублируются."
+    (
+        KnownIssue(
+            id="missing_required_secrets",
+            title="Не все обязательные секреты заданы",
+            cause=(
+                "Core при старте не нашёл обязательные секреты ни в SecretStore (vault), ни в .env.\n"
+                "Обычно это следствие master_key_mismatch — vault есть, но расшифровать нельзя,\n"
+                "а в .env эти значения не дублируются."
+            ),
+            pattern=re.compile(r"Missing required secrets", re.IGNORECASE),
         ),
-        pattern=re.compile(r"Missing required secrets", re.IGNORECASE),
-        fix_commands=(
-            ("hc env reset-vault", "если vault сломан — пересоздать"),
+        (
+            ("hc env reset-vault", "если vault сломан — пересоздать", "hc"),
+            ("openssl rand -hex 32", "сгенерировать значение секрета (выполни в shell)", "shell"),
             (
-                "hc env dotenv set CSRF_SECRET=$(openssl rand -hex 32)",
-                "или вручную задать секреты в .env (менее безопасно)",
+                "hc env dotenv set CSRF_SECRET=<вставь-значение-из-openssl>",
+                "положить секрет в .env вручную (менее безопасно)",
+                "hc",
             ),
         ),
     ),
-    KnownIssue(
-        id="master_key_missing",
-        title="RUNTIME_MASTER_KEY не задан",
-        cause=(
-            "Core требует RUNTIME_MASTER_KEY (или RUNTIME_MASTER_KEY_FILE) для работы SecretStore.\n"
-            "Без него невозможно ни прочитать, ни сохранить шифрованные секреты."
+    (
+        KnownIssue(
+            id="master_key_missing",
+            title="RUNTIME_MASTER_KEY не задан",
+            cause=(
+                "Core требует RUNTIME_MASTER_KEY (или RUNTIME_MASTER_KEY_FILE) для работы SecretStore.\n"
+                "Без него невозможно ни прочитать, ни сохранить шифрованные секреты."
+            ),
+            pattern=re.compile(r"RUNTIME_MASTER_KEY is required", re.IGNORECASE),
         ),
-        pattern=re.compile(r"RUNTIME_MASTER_KEY is required", re.IGNORECASE),
-        fix_commands=(
+        (
+            ("openssl rand -hex 32", "сгенерировать мастер-ключ (выполни в shell, скопируй вывод)", "shell"),
             (
-                "hc env dotenv set RUNTIME_MASTER_KEY=$(openssl rand -hex 32)",
-                "сгенерировать и сохранить мастер-ключ в .env",
+                "hc env dotenv set RUNTIME_MASTER_KEY=<вставь-значение-из-openssl>",
+                "сохранить мастер-ключ в .env",
+                "hc",
             ),
         ),
     ),
-    KnownIssue(
-        id="postgres_connection_refused",
-        title="core-runtime не может подключиться к PostgreSQL",
-        cause=(
-            "PostgreSQL ещё не готов или сетевая связь между контейнерами нарушена.\n"
-            "Чаще всего это race: core стартует быстрее, чем pg успевает поднять TCP."
+    (
+        KnownIssue(
+            id="postgres_connection_refused",
+            title="core-runtime не может подключиться к PostgreSQL",
+            cause=(
+                "PostgreSQL ещё не готов или сетевая связь между контейнерами нарушена.\n"
+                "Чаще всего это race: core стартует быстрее, чем pg успевает поднять TCP."
+            ),
+            pattern=re.compile(
+                r"could not connect to server.*connection refused|"
+                r"connection refused.*5432|"
+                r"OperationalError.*connection refused|"
+                r"psycopg2\.OperationalError",
+                re.IGNORECASE,
+            ),
         ),
-        pattern=re.compile(
-            r"could not connect to server.*connection refused|"
-            r"connection refused.*5432|"
-            r"OperationalError.*connection refused|"
-            r"psycopg2\.OperationalError",
-            re.IGNORECASE,
-        ),
-        fix_commands=(
-            ("hc env restart core-runtime", "просто перезапустить core когда pg уже healthy"),
-            ("hc env health", "проверить здоровье всех контейнеров"),
-        ),
-    ),
-    KnownIssue(
-        id="port_already_in_use",
-        title="Порт уже занят на хосте",
-        cause=(
-            "Один из портов, который пробрасывает compose, уже занят другим процессом\n"
-            "(например, второй запущенный стек, локальный postgres, или старый prod-edge на :80)."
-        ),
-        pattern=re.compile(
-            r"bind: address already in use|port is already allocated|"
-            r"Bind for 0\.0\.0\.0:\d+ failed",
-            re.IGNORECASE,
-        ),
-        fix_commands=(
-            ("hc doctor", "посмотреть какие порты заняты"),
-            ("hc env down", "остановить текущий стек если что-то висит"),
+        (
+            ("hc env restart core-runtime", "просто перезапустить core когда pg уже healthy", "hc"),
+            ("hc env health", "проверить здоровье всех контейнеров", "hc"),
         ),
     ),
-    KnownIssue(
-        id="alembic_migration_failed",
-        title="Не удалось применить миграции БД",
-        cause=(
-            "Alembic не смог применить миграцию (несовместимая схема, плохой downgrade, конфликт версий)."
+    (
+        KnownIssue(
+            id="port_already_in_use",
+            title="Порт уже занят на хосте",
+            cause=(
+                "Один из портов, который пробрасывает compose, уже занят другим процессом\n"
+                "(например, второй запущенный стек, локальный postgres, или старый prod-edge на :80)."
+            ),
+            pattern=re.compile(
+                r"bind: address already in use|port is already allocated|"
+                r"Bind for 0\.0\.0\.0:\d+ failed",
+                re.IGNORECASE,
+            ),
         ),
-        pattern=re.compile(r"alembic.*error|FAILED.*alembic|MultipleHeads", re.IGNORECASE),
-        fix_commands=(
-            ("hc env logs core-runtime --tail 200", "посмотреть полную трассировку миграции"),
-        ),
-    ),
-    KnownIssue(
-        id="storage_corruption",
-        title="Обнаружена коррупция secure storage",
-        cause=(
-            "Merkle root не сходится с записями в БД — кто-то менял данные мимо secure_set,\n"
-            "или файл БД повреждён."
-        ),
-        pattern=re.compile(
-            r"StorageCorruptionError|Root hash mismatch|Merkle.*mismatch",
-            re.IGNORECASE,
-        ),
-        fix_commands=(
-            ("hc env reset-vault", "пересоздать vault если это dev"),
-            ("hc env logs core-runtime --tail 500", "посмотреть детали повреждения"),
+        (
+            ("hc doctor", "посмотреть какие порты заняты", "hc"),
+            ("hc env down", "остановить текущий стек если что-то висит", "hc"),
         ),
     ),
-    KnownIssue(
-        id="docker_network_not_found",
-        title="Docker не нашёл network при старте контейнера (race)",
-        cause=(
-            "Docker создал контейнер, но к моменту его старта network уже не существует.\n"
-            "Типичные причины:\n"
-            "  • перезапуск Docker daemon во время поднятия стека\n"
-            "  • параллельный `compose down` стёр network пока другой `up` его использовал\n"
-            "  • остатки от старого запуска (network был пересоздан с новым ID)\n\n"
-            "Лечится полным пересозданием стека."
+    (
+        KnownIssue(
+            id="alembic_migration_failed",
+            title="Не удалось применить миграции БД",
+            cause=(
+                "Alembic не смог применить миграцию (несовместимая схема, плохой downgrade, конфликт версий)."
+            ),
+            pattern=re.compile(r"alembic.*error|FAILED.*alembic|MultipleHeads", re.IGNORECASE),
         ),
-        pattern=re.compile(
-            r"failed to set up container networking.*network.*not found|"
-            r"network [0-9a-f]{32,} not found",
-            re.IGNORECASE,
-        ),
-        fix_commands=(
-            ("hc env down && hc env up", "пересоздать network и поднять заново"),
-            ("docker network prune -f", "если down не помогает — снести orphan networks"),
+        (
+            ("hc env logs core-runtime --tail 200", "посмотреть полную трассировку миграции", "hc"),
         ),
     ),
-    KnownIssue(
-        id="frontend_workspace_missing",
-        title="frontend-vite не нашёл package.json в /workspace",
-        cause=(
-            "Контейнер frontend-vite ожидает смонтированный исходник фронтенда\n"
-            "(platform-home-console) в /workspace, но volume не примонтирован или\n"
-            "указывает не на ту папку.\n\n"
-            "Типичные причины:\n"
-            "  • запуск compose не из корня монорепы\n"
-            "  • platform-home-console отсутствует рядом с core-runtime-service\n"
-            "  • compose-файл собран для другой структуры репо"
+    (
+        KnownIssue(
+            id="storage_corruption",
+            title="Обнаружена коррупция secure storage",
+            cause=(
+                "Merkle root не сходится с записями в БД — кто-то менял данные мимо secure_set,\n"
+                "или файл БД повреждён."
+            ),
+            pattern=re.compile(
+                r"StorageCorruptionError|Root hash mismatch|Merkle.*mismatch",
+                re.IGNORECASE,
+            ),
         ),
-        pattern=re.compile(
-            r"ERR_PNPM_NO_PKG_MANIFEST|No package\.json found in /workspace",
-            re.IGNORECASE,
+        (
+            ("hc env reset-vault", "пересоздать vault если это dev", "hc"),
+            ("hc env logs core-runtime --tail 500", "посмотреть детали повреждения", "hc"),
         ),
-        fix_commands=(
+    ),
+    (
+        KnownIssue(
+            id="docker_network_not_found",
+            title="Docker не нашёл network при старте контейнера (race)",
+            cause=(
+                "Docker создал контейнер, но к моменту его старта network уже не существует.\n"
+                "Типичные причины:\n"
+                "  • перезапуск Docker daemon во время поднятия стека\n"
+                "  • параллельный `compose down` стёр network пока другой `up` его использовал\n"
+                "  • остатки от старого запуска (network был пересоздан с новым ID)\n\n"
+                "Лечится полным пересозданием стека."
+            ),
+            pattern=re.compile(
+                r"failed to set up container networking.*network.*not found|"
+                r"network [0-9a-f]{32,} not found",
+                re.IGNORECASE,
+            ),
+        ),
+        (
+            ("hc env down", "снести стек", "hc"),
+            ("hc env up", "поднять заново — network пересоздастся", "hc"),
+            ("docker network prune -f", "если down не помогает — снести orphan networks", "shell"),
+        ),
+    ),
+    (
+        KnownIssue(
+            id="frontend_workspace_missing",
+            title="frontend-vite не нашёл package.json в /workspace",
+            cause=(
+                "Контейнер frontend-vite ожидает смонтированный исходник фронтенда\n"
+                "(platform-home-console) в /workspace, но volume не примонтирован или\n"
+                "указывает не на ту папку.\n\n"
+                "Типичные причины:\n"
+                "  • запуск compose не из корня монорепы\n"
+                "  • platform-home-console отсутствует рядом с core-runtime-service\n"
+                "  • compose-файл собран для другой структуры репо"
+            ),
+            pattern=re.compile(
+                r"ERR_PNPM_NO_PKG_MANIFEST|No package\.json found in /workspace",
+                re.IGNORECASE,
+            ),
+        ),
+        (
             (
                 "hc env up --profile base",
                 "поднять без frontend-vite (Vite HMR не нужен для большинства задач)",
+                "hc",
             ),
             (
-                "ls platform-home-console/package.json",
-                "проверить что фронтенд-исходники на месте",
+                "ls -la platform-home-console/package.json",
+                "проверить что фронтенд-исходники на месте (выполни в shell)",
+                "shell",
             ),
         ),
     ),
 ]
+
+
+def _build_known_issues() -> list[KnownIssue]:
+    """Применить fix-команды к KnownIssue (через replace, т.к. dataclass frozen)."""
+    import dataclasses as _dc
+
+    out: list[KnownIssue] = []
+    for issue, specs in _RAW_ISSUES:
+        fixes = tuple(_to_fix_command(s) for s in specs)
+        out.append(_dc.replace(issue, fix_commands=fixes))
+    return out
+
+
+KNOWN_ISSUES: list[KnownIssue] = _build_known_issues()
 
 
 # ─── Детектор ─────────────────────────────────────────────────────────────────

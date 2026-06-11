@@ -86,6 +86,27 @@ def test_detect_docker_network_not_found() -> None:
     assert any(d.issue.id == "docker_network_not_found" for d in found)
 
 
+def test_fix_commands_have_correct_kind() -> None:
+    """Контракт: каждая команда в KNOWN_ISSUES имеет kind 'hc' или 'shell'.
+    'hc' команды можно вводить в REPL, 'shell' — только в обычном терминале.
+    """
+    from hc.diagnostics import KNOWN_ISSUES
+
+    for issue in KNOWN_ISSUES:
+        for fix in issue.fix_commands:
+            assert fix.kind in {"hc", "shell"}, (
+                f"{issue.id}: command {fix.command!r} has invalid kind={fix.kind!r}"
+            )
+            if fix.kind == "hc":
+                assert fix.command.startswith("hc "), (
+                    f"{issue.id}: command marked 'hc' but doesn't start with 'hc ': {fix.command!r}"
+                )
+            if fix.kind == "shell":
+                assert not fix.command.startswith("hc "), (
+                    f"{issue.id}: command marked 'shell' but starts with 'hc ': {fix.command!r}"
+                )
+
+
 def test_detect_frontend_workspace_missing() -> None:
     text = """
 ! Corepack is about to download https://registry.npmjs.org/pnpm/-/pnpm-11.1.2.tgz
