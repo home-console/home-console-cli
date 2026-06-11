@@ -167,6 +167,54 @@ KNOWN_ISSUES: list[KnownIssue] = [
             ("hc env logs core-runtime --tail 500", "посмотреть детали повреждения"),
         ),
     ),
+    KnownIssue(
+        id="docker_network_not_found",
+        title="Docker не нашёл network при старте контейнера (race)",
+        cause=(
+            "Docker создал контейнер, но к моменту его старта network уже не существует.\n"
+            "Типичные причины:\n"
+            "  • перезапуск Docker daemon во время поднятия стека\n"
+            "  • параллельный `compose down` стёр network пока другой `up` его использовал\n"
+            "  • остатки от старого запуска (network был пересоздан с новым ID)\n\n"
+            "Лечится полным пересозданием стека."
+        ),
+        pattern=re.compile(
+            r"failed to set up container networking.*network.*not found|"
+            r"network [0-9a-f]{32,} not found",
+            re.IGNORECASE,
+        ),
+        fix_commands=(
+            ("hc env down && hc env up", "пересоздать network и поднять заново"),
+            ("docker network prune -f", "если down не помогает — снести orphan networks"),
+        ),
+    ),
+    KnownIssue(
+        id="frontend_workspace_missing",
+        title="frontend-vite не нашёл package.json в /workspace",
+        cause=(
+            "Контейнер frontend-vite ожидает смонтированный исходник фронтенда\n"
+            "(platform-home-console) в /workspace, но volume не примонтирован или\n"
+            "указывает не на ту папку.\n\n"
+            "Типичные причины:\n"
+            "  • запуск compose не из корня монорепы\n"
+            "  • platform-home-console отсутствует рядом с core-runtime-service\n"
+            "  • compose-файл собран для другой структуры репо"
+        ),
+        pattern=re.compile(
+            r"ERR_PNPM_NO_PKG_MANIFEST|No package\.json found in /workspace",
+            re.IGNORECASE,
+        ),
+        fix_commands=(
+            (
+                "hc env up --profile base",
+                "поднять без frontend-vite (Vite HMR не нужен для большинства задач)",
+            ),
+            (
+                "ls platform-home-console/package.json",
+                "проверить что фронтенд-исходники на месте",
+            ),
+        ),
+    ),
 ]
 
 

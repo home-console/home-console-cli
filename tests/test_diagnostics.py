@@ -75,3 +75,24 @@ def test_detect_attaches_service_name() -> None:
     found = detect_issues("RUNTIME_MASTER_KEY is required", service="core-runtime")
     assert found
     assert found[0].service == "core-runtime"
+
+
+def test_detect_docker_network_not_found() -> None:
+    text = (
+        "Error response from daemon: failed to set up container networking: "
+        "network 838e2a1286e8efcac42309af0297505022a8ed53a31880cdf042254eb34f86b1 not found"
+    )
+    found = detect_issues(text)
+    assert any(d.issue.id == "docker_network_not_found" for d in found)
+
+
+def test_detect_frontend_workspace_missing() -> None:
+    text = """
+! Corepack is about to download https://registry.npmjs.org/pnpm/-/pnpm-11.1.2.tgz
+[ERR_PNPM_NO_PKG_MANIFEST] No package.json found in /workspace
+[ERR_PNPM_NO_PKG_MANIFEST] No package.json found in /workspace
+""".strip()
+    found = detect_issues(text, service="frontend-vite")
+    matched = [d for d in found if d.issue.id == "frontend_workspace_missing"]
+    assert matched
+    assert matched[0].service == "frontend-vite"

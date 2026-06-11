@@ -225,13 +225,8 @@ def _run(cmd: list[str], *, cwd: Path | None = None, extra_env: dict[str, str] |
 
 # ─── Post-mortem after failed up ──────────────────────────────────────────────
 
-def _run_postmortem(console: Console, project: ComposeProject) -> list[DetectedIssue]:
-    """
-    Найти упавшие/unhealthy контейнеры, подтянуть их логи и распознать
-    известные ошибки через каталог diagnostics.
-
-    Возвращает список найденных известных проблем (может быть пустым).
-    """
+def _collect_postmortem_targets(project: ComposeProject) -> list[str]:
+    """Имена сервисов, которые имеет смысл сканировать (упавшие/unhealthy)."""
     try:
         candidates = list_compose_containers(
             project.compose_file,
@@ -242,35 +237,59 @@ def _run_postmortem(console: Console, project: ComposeProject) -> list[DetectedI
         return []
 
     if not candidates:
-        # На случай, если compose уже снёс контейнер до того, как мы успели посмотреть.
         try:
             candidates = list_compose_containers(project.compose_file, project.cwd)
         except Exception:  # noqa: BLE001
             return []
         candidates = [c for c in candidates if c.get("_effective_state") != "running"]
 
-    found: list[DetectedIssue] = []
+    names: list[str] = []
     for cont in candidates:
         service = str(cont.get("Service") or cont.get("Name") or "")
-        if not service:
-            continue
+        if service and service not in names:
+            names.append(service)
+    return names
+
+
+def _run_postmortem(console: Console, project: ComposeProject) -> tuple[list[DetectedIssue], list[str]]:
+    """
+    Найти упавшие/unhealthy контейнеры, подтянуть их логи и распознать
+    известные ошибки через каталог diagnostics.
+
+    Возвращает (список найденных проблем, список просканированных сервисов).
+    """
+    services = _collect_postmortem_targets(project)
+    found: list[DetectedIssue] = []
+    for service in services:
         try:
             logs = fetch_container_logs(project.compose_file, project.cwd, service, tail=200)
         except Exception:  # noqa: BLE001
             continue
         found.extend(detect_issues(logs, service=service))
 
-    return found
+    return found, services
 
 
-def _print_postmortem(console: Console, issues: list[DetectedIssue]) -> None:
+def _print_postmortem(
+    console: Console,
+    issues: list[DetectedIssue],
+    *,
+    scanned_services: list[str] | None = None,
+) -> None:
     """Красиво отрисовать найденные проблемы с готовыми командами для починки."""
     if not issues:
         console.print(
             "\n[yellow]![/yellow] Стек поднялся не до конца, но известных шаблонов ошибок не нашёл."
         )
+        # Берём реальные имена упавших сервисов вместо хардкода core-runtime.
+        targets = scanned_services or ["core-runtime"]
+        targets_str = " ".join(targets)
         console.print(
-            "  [dim]Посмотри полные логи:[/dim] [cyan]hc env logs core-runtime --tail 200[/cyan]"
+            f"  [dim]Посмотри полные логи:[/dim] [cyan]hc env logs --follow {targets_str}[/cyan]"
+        )
+        console.print(
+            "  [dim]Если паттерн повторяется — открой issue с этим логом, "
+            "добавим в диагностику.[/dim]"
         )
         return
 
@@ -1368,8 +1387,8 @@ def register(app: typer.Typer) -> None:
                 #   2) Потом прогоним через детектор известных проблем и подскажем действия.
                 if (exit_exc.exit_code or 0) != 0:
                     _show_failure_logs(console, plan)
-                    issues = _run_postmortem(console, plan.project)
-                    _print_postmortem(console, issues)
+                    issues, scanned = _run_postmortem(console, plan.project)
+                    _print_postmortem(console, issues, scanned_services=scanned)
                 raise
 
             if detach:
