@@ -996,6 +996,90 @@ def _offer_resolve_conflicts(
     console.print()
 
 
+def _check_frontend_workspace(
+    console: Console,
+    plan: "EnvUpPlan",
+) -> bool:
+    """
+    Превентивная проверка: если в plan есть frontend-vite, убедиться что
+    platform-home-console лежит рядом с core-runtime-service (так требует
+    volume mount в compose: ../../../platform-home-console:/workspace).
+
+    Возвращает True если всё ок ИЛИ пользователь подтвердил продолжение без
+    frontend-vite. False — если пользователь отменил запуск.
+    """
+    if "frontend-vite" not in plan.service_names:
+        return True
+
+    # Volume mount фронта в compose: deploy/dev/../../../platform-home-console
+    # Это значит сам платформ-репо должен лежать как sibling core-runtime-service.
+    core_root = plan.project.cwd.parent.parent  # deploy/dev → core-runtime-service
+    workspace = core_root.parent / "platform-home-console"
+    pkg_json = workspace / "package.json"
+
+    if pkg_json.is_file():
+        return True
+
+    console.print("\n[yellow]⚠ frontend-vite не сможет запуститься[/yellow]")
+
+    if not workspace.exists():
+        console.print(
+            f"  Папка [bold]{workspace}[/bold] не существует.\n"
+            f"  Она нужна, потому что compose монтирует её внутрь контейнера как /workspace."
+        )
+        diag = "папка отсутствует"
+    elif not any(workspace.iterdir()):
+        console.print(
+            f"  Папка [bold]{workspace}[/bold] существует, но пустая.\n"
+            f"  Возможно, недокачался git submodule или клон прерван."
+        )
+        diag = "папка пустая"
+    else:
+        console.print(
+            f"  В папке [bold]{workspace}[/bold] нет [bold]package.json[/bold].\n"
+            f"  Похоже, там лежит что-то не то — это должен быть корень "
+            f"платформенного фронтенда (platform-home-console)."
+        )
+        diag = "нет package.json"
+
+    console.print("\n  [bold cyan]Что можно сделать:[/bold cyan]")
+    console.print(
+        "    [green]→[/green] продолжить без frontend-vite "
+        "[dim](Vite HMR не нужен для большинства задач)[/dim]"
+    )
+    console.print(
+        f"    [yellow]$[/yellow] [bold]git clone https://github.com/home-console/platform-home-console "
+        f"{workspace}[/bold]   [dim]# склонировать рядом, потом hc env up[/dim]"
+    )
+
+    if not sys.stdin.isatty():
+        # В non-TTY режиме (CI/скрипты) — продолжаем БЕЗ удаления frontend-vite,
+        # пусть compose упадёт сам, а пост-mortem подсветит проблему.
+        console.print(f"  [dim](non-interactive: продолжаю как есть, диагноз: {diag})[/dim]")
+        return True
+
+    try:
+        import questionary
+        continue_without = questionary.confirm(
+            "Продолжить без frontend-vite (он будет удалён из плана этого запуска)?",
+            default=True,
+        ).ask()
+    except ImportError:
+        continue_without = True
+
+    if continue_without is None:
+        return False
+    if not continue_without:
+        console.print("[dim]Отменено. Склонируй platform-home-console и повтори.[/dim]")
+        return False
+
+    # Удаляем frontend-vite из плана прямо in-place.
+    plan.service_names[:] = [s for s in plan.service_names if s != "frontend-vite"]
+    plan.compose_profiles[:] = [p for p in plan.compose_profiles if p != "frontend"]
+    console.print("[green]✓[/green] frontend-vite убран из плана запуска\n")
+    return True
+
+
 def _check_disk_space(console: Console) -> None:
     """Проверить свободное место; предупредить и предложить расширение если мало."""
     import shutil as _shutil
@@ -1383,6 +1467,15 @@ def register(app: typer.Typer) -> None:
                     cwd=plan.project.cwd,
                     extra_env=extra_env,
                 )
+
+            # Превентивная проверка для frontend-vite: лучше отговорить пользователя
+            # чем дать compose упасть с непонятным ERR_PNPM_NO_PKG_MANIFEST.
+            if not _check_frontend_workspace(console, plan):
+                raise typer.Exit(code=1)
+
+            # plan.service_names мог измениться после _check_frontend_workspace
+            # (если frontend-vite был выпилен) — пересобираем команду:
+            base_cmd = _compose_base_cmd(plan)
 
             needed_ports = _get_needed_ports(plan)
             conflicts = _find_port_conflicts(needed_ports, plan.project.cwd)

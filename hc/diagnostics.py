@@ -249,13 +249,14 @@ _RAW_ISSUES: list[tuple[KnownIssue, tuple[_FixSpec, ...]]] = [
             id="frontend_workspace_missing",
             title="frontend-vite не нашёл package.json в /workspace",
             cause=(
-                "Контейнер frontend-vite ожидает смонтированный исходник фронтенда\n"
-                "(platform-home-console) в /workspace, но volume не примонтирован или\n"
-                "указывает не на ту папку.\n\n"
-                "Типичные причины:\n"
-                "  • запуск compose не из корня монорепы\n"
-                "  • platform-home-console отсутствует рядом с core-runtime-service\n"
-                "  • compose-файл собран для другой структуры репо"
+                "Контейнер frontend-vite ожидает исходник фронтенда (platform-home-console)\n"
+                "смонтированным в /workspace. Compose монтирует sibling-папку\n"
+                "../../../platform-home-console — то есть platform-home-console должна лежать\n"
+                "РЯДОМ с core-runtime-service.\n\n"
+                "В standalone-установке через `hc core init` рядом ничего нет, поэтому /workspace\n"
+                "получается пустым, и pnpm падает на ERR_PNPM_NO_PKG_MANIFEST.\n\n"
+                "Утилита должна была отловить это ДО запуска через _check_frontend_workspace —\n"
+                "если ты это видишь, значит проверка прошла мимо, сообщи об issue."
             ),
             pattern=re.compile(
                 r"ERR_PNPM_NO_PKG_MANIFEST|No package\.json found in /workspace",
@@ -263,14 +264,17 @@ _RAW_ISSUES: list[tuple[KnownIssue, tuple[_FixSpec, ...]]] = [
             ),
         ),
         (
+            # Порядок важен: сначала путь "просто работает" (отключить vite),
+            # потом более сложный (склонировать платформу).
             (
                 "hc env up --profile base",
-                "поднять без frontend-vite (Vite HMR не нужен для большинства задач)",
+                "поднять без frontend-vite (рекомендуется — Vite HMR обычно не нужен)",
                 "hc",
             ),
             (
-                "ls -la platform-home-console/package.json",
-                "проверить что фронтенд-исходники на месте (выполни в shell)",
+                "git clone https://github.com/home-console/platform-home-console "
+                "~/.local/share/hc/platform-home-console",
+                "склонировать фронт рядом с core-runtime-service, потом hc env up",
                 "shell",
             ),
         ),
