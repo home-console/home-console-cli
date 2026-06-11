@@ -249,14 +249,13 @@ _RAW_ISSUES: list[tuple[KnownIssue, tuple[_FixSpec, ...]]] = [
             id="frontend_workspace_missing",
             title="frontend-vite не нашёл package.json в /workspace",
             cause=(
-                "Контейнер frontend-vite ожидает исходник фронтенда (platform-home-console)\n"
-                "смонтированным в /workspace. Compose монтирует sibling-папку\n"
-                "../../../platform-home-console — то есть platform-home-console должна лежать\n"
-                "РЯДОМ с core-runtime-service.\n\n"
-                "В standalone-установке через `hc core init` рядом ничего нет, поэтому /workspace\n"
-                "получается пустым, и pnpm падает на ERR_PNPM_NO_PKG_MANIFEST.\n\n"
-                "Утилита должна была отловить это ДО запуска через _check_frontend_workspace —\n"
-                "если ты это видишь, значит проверка прошла мимо, сообщи об issue."
+                "Контейнер frontend-vite не видит package.json в /workspace.\n"
+                "Типичные причины:\n"
+                "  • platform-home-console не смонтирован (нет исходников рядом с core-runtime-service)\n"
+                "  • старый контейнер с пустым bind-mount — исходники появились после его создания\n"
+                "  • docker network race — контейнер не стартовал, в логах остались старые ошибки\n\n"
+                "Проверь на хосте: ls ~/.local/share/hc/platform-home-console/package.json\n"
+                "Если файл есть — пересоздай стек: hc env down && hc env up"
             ),
             pattern=re.compile(
                 r"ERR_PNPM_NO_PKG_MANIFEST|No package\.json found in /workspace",

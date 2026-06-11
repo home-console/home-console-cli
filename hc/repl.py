@@ -12,6 +12,8 @@ import typer
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completion, Completer, WordCompleter
 from prompt_toolkit.formatted_text import HTML
+from pathlib import Path
+
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from rich.console import Console
@@ -27,6 +29,45 @@ from hc.update_check import print_update_banner
 
 
 _GROUPS = REPL_GROUPS
+
+
+class SafeFileHistory(FileHistory):
+    """
+    FileHistory, переживающий удаление parent-папки во время сессии.
+
+    Стандартный prompt_toolkit FileHistory падает с FileNotFoundError если
+    директория истории удалена после старта REPL (например, после `hc reset all`,
+    который сносит ~/.config/hc). А ещё крашится при первом запуске CLI на
+    свежей системе без ~/.config/hc.
+
+    Этот подкласс перед каждой операцией с файлом гарантирует наличие parent
+    директории, а при чтении возвращает пустую историю если файла нет.
+    """
+
+    def _ensure_parent(self) -> None:
+        try:
+            Path(self.filename).parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Если даже это не получилось — пусть базовый класс упадёт штатно
+            # (например, на read-only FS). Лучше явная ошибка, чем подмена.
+            pass
+
+    def load_history_strings(self):  # type: ignore[override]
+        if not Path(self.filename).exists():
+            return
+        try:
+            yield from super().load_history_strings()
+        except (FileNotFoundError, OSError):
+            return
+
+    def store_string(self, string: str) -> None:  # type: ignore[override]
+        self._ensure_parent()
+        try:
+            super().store_string(string)
+        except FileNotFoundError:
+            # Race: что-то снесло папку между mkdir и open. Повторим один раз.
+            self._ensure_parent()
+            super().store_string(string)
 
 
 class _HCCompleter(Completer):
@@ -376,7 +417,7 @@ def run_repl(app: typer.Typer) -> None:
 
     session: PromptSession = PromptSession(
         _make_prompt(),
-        history=FileHistory(str(HISTORY_PATH)),
+        history=SafeFileHistory(str(HISTORY_PATH)),
         completer=completer,
         style=_REPL_STYLE,
     )

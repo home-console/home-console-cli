@@ -1002,113 +1002,157 @@ def _offer_resolve_conflicts(
     console.print()
 
 
-def _check_frontend_workspace(
+def _frontend_workspace_path(plan: "EnvUpPlan") -> Path:
+    """Путь к platform-home-console (sibling core-runtime-service для volume mount)."""
+    core_root = plan.project.cwd.parent.parent  # deploy/dev → core-runtime-service
+    return core_root.parent / "platform-home-console"
+
+
+def _strip_frontend_from_plan(console: Console, plan: "EnvUpPlan") -> None:
+    plan.service_names[:] = [s for s in plan.service_names if s != "frontend-vite"]
+    plan.compose_profiles[:] = [p for p in plan.compose_profiles if p != "frontend"]
+    console.print("[yellow]![/yellow] frontend-vite убран из плана запуска")
+
+
+def _ensure_frontend_workspace(
     console: Console,
     plan: "EnvUpPlan",
-) -> bool:
+) -> tuple[bool, set[str]]:
     """
-    Превентивная проверка: если в plan есть frontend-vite, убедиться что
-    platform-home-console лежит рядом с core-runtime-service (так требует
-    volume mount в compose: ../../../platform-home-console:/workspace).
+    Если в plan есть frontend-vite — гарантировать исходники platform-home-console.
 
-    Возвращает True если всё ок ИЛИ пользователь подтвердил продолжение без
-    frontend-vite. False — если пользователь отменил запуск.
+    При отсутствии/пустой папке клонирует автоматически (как core init), без диалога.
+    Возвращает (ok, services_to_recreate) — второй элемент для --force-recreate
+    после свежего клона.
     """
     if "frontend-vite" not in plan.service_names:
-        return True
+        return True, set()
 
-    # Volume mount фронта в compose: deploy/dev/../../../platform-home-console
-    # Это значит сам платформ-репо должен лежать как sibling core-runtime-service.
-    core_root = plan.project.cwd.parent.parent  # deploy/dev → core-runtime-service
-    workspace = core_root.parent / "platform-home-console"
+    workspace = _frontend_workspace_path(plan)
     pkg_json = workspace / "package.json"
 
     if pkg_json.is_file():
-        return True
+        return True, set()
 
-    console.print("\n[yellow]⚠ frontend-vite не сможет запуститься[/yellow]")
+    can_clone = (not workspace.exists()) or (
+        workspace.exists() and not any(workspace.iterdir())
+    )
 
-    if not workspace.exists():
+    if can_clone:
         console.print(
-            f"  Папка [bold]{workspace}[/bold] не существует.\n"
-            f"  Она нужна, потому что compose монтирует её внутрь контейнера как /workspace."
+            f"[cyan]→[/cyan] Скачиваю platform-home-console в [bold]{workspace}[/bold] ..."
         )
-        diag = "папка отсутствует"
-    elif not any(workspace.iterdir()):
-        console.print(
-            f"  Папка [bold]{workspace}[/bold] существует, но пустая.\n"
-            f"  Возможно, недокачался git submodule или клон прерван."
-        )
-        diag = "папка пустая"
-    else:
-        console.print(
-            f"  В папке [bold]{workspace}[/bold] нет [bold]package.json[/bold].\n"
-            f"  Похоже, там лежит что-то не то — это должен быть корень "
-            f"платформенного фронтенда (platform-home-console)."
-        )
-        diag = "нет package.json"
-
-    if not sys.stdin.isatty():
-        # В non-TTY режиме (CI/скрипты) — продолжаем БЕЗ удаления frontend-vite,
-        # пусть compose упадёт сам, а пост-mortem подсветит проблему.
-        console.print(f"  [dim](non-interactive: продолжаю как есть, диагноз: {diag})[/dim]")
-        return True
-
-    try:
-        import questionary
-
-        # Если папка существует но пустая — мы можем безопасно её снести и клонировать.
-        # Если папка не существует — сразу клонируем.
-        # Если в папке что-то есть и нет package.json — НЕ клонируем (опасно затереть).
-        can_clone = (not workspace.exists()) or (
-            workspace.exists() and not any(workspace.iterdir())
-        )
-
-        choices = []
-        if can_clone:
-            choices.append(
-                questionary.Choice(
-                    f"📥 Склонировать platform-home-console в {workspace} (рекомендуется)",
-                    value="clone",
-                )
-            )
-        choices.append(
-            questionary.Choice(
-                "⊖ Продолжить без frontend-vite (он будет убран из плана этого запуска)",
-                value="skip",
-            )
-        )
-        choices.append(questionary.Choice("✗ Отменить запуск", value="abort"))
-
-        action = questionary.select(
-            "Что делаем?",
-            choices=choices,
-            default=choices[0].value,
-        ).ask()
-    except ImportError:
-        action = "skip"
-
-    if action is None or action == "abort":
-        console.print("[dim]Отменено.[/dim]")
-        return False
-
-    if action == "clone":
         try:
             init_platform_source(console, target=workspace)
         except typer.Exit:
+            console.print("[red]Не удалось скачать platform-home-console.[/red]")
+            _strip_frontend_from_plan(console, plan)
+            return True, set()
+        if not pkg_json.is_file():
             console.print(
-                "[red]Не удалось склонировать.[/red] "
-                "Запусти руками или выбери другой вариант."
+                "[red]Клон завершился, но package.json не найден — пропускаю frontend-vite.[/red]"
             )
-            return False
-        # После успешного клона — frontend-vite остаётся в плане.
-        return True
+            _strip_frontend_from_plan(console, plan)
+            return True, set()
+        # Свежий клон — контейнер надо пересоздать (старый мог смонтировать пустую папку).
+        return True, {"frontend-vite"}
 
-    # action == "skip" — убираем frontend-vite из плана прямо in-place.
-    plan.service_names[:] = [s for s in plan.service_names if s != "frontend-vite"]
-    plan.compose_profiles[:] = [p for p in plan.compose_profiles if p != "frontend"]
-    console.print("[green]✓[/green] frontend-vite убран из плана запуска\n")
-    return True
+    console.print(
+        f"\n[yellow]⚠[/yellow] В [bold]{workspace}[/bold] нет [bold]package.json[/bold] "
+        f"— frontend-vite не запустится."
+    )
+    console.print(
+        "  [dim]Папка не пустая, автоклон не делаю (может быть чужое содержимое).[/dim]"
+    )
+
+    if sys.stdin.isatty():
+        try:
+            import questionary
+
+            skip = questionary.confirm(
+                "Продолжить без frontend-vite?",
+                default=True,
+            ).ask()
+        except ImportError:
+            skip = True
+        if skip is None:
+            return False, set()
+        if skip:
+            _strip_frontend_from_plan(console, plan)
+            return True, set()
+        return False, set()
+
+    _strip_frontend_from_plan(console, plan)
+    return True, set()
+
+
+def _prune_non_running_compose_services(
+    console: Console,
+    plan: "EnvUpPlan",
+    *,
+    extra_force: set[str] | None = None,
+) -> None:
+    """
+    Удалить контейнеры сервисов из плана, которые не в состоянии running.
+
+    Лечит «network … not found» и старые bind-mount'ы (контейнер создан когда
+    /workspace был пуст, а исходники появились позже).
+    """
+    extra_force = extra_force or set()
+    try:
+        containers = list_compose_containers(plan.project.compose_file, plan.project.cwd)
+    except Exception:  # noqa: BLE001
+        return
+
+    by_service = {str(c.get("Service") or ""): c for c in containers if c.get("Service")}
+    to_rm: list[str] = []
+
+    for svc in plan.service_names:
+        cont = by_service.get(svc)
+        if not cont:
+            continue
+        state = str(cont.get("State") or cont.get("Status") or "").lower()
+        if svc in extra_force or not state.startswith("running"):
+            to_rm.append(svc)
+
+    to_rm = list(dict.fromkeys(to_rm))
+    if not to_rm:
+        return
+
+    base = _compose_base_cmd(plan)
+    console.print(f"[dim]→ пересоздаю контейнеры: {', '.join(to_rm)}[/dim]")
+    subprocess.run(  # noqa: S603
+        [*base, "rm", "-sf", *to_rm],
+        cwd=str(plan.project.cwd),
+        check=False,
+        capture_output=True,
+    )
+
+
+def _compose_up_with_stale_retry(
+    console: Console,
+    plan: "EnvUpPlan",
+    up_cmd: list[str],
+    *,
+    extra_env: dict[str, str] | None,
+    force_recreate: set[str] | None = None,
+) -> None:
+    """docker compose up; при сбое — снести не-running контейнеры и повторить один раз."""
+    _prune_non_running_compose_services(console, plan, extra_force=force_recreate or set())
+
+    try:
+        _run(up_cmd, cwd=plan.project.cwd, extra_env=extra_env)
+    except typer.Exit as first_err:
+        if (first_err.exit_code or 0) == 0:
+            raise
+        console.print(
+            "[yellow]→[/yellow] compose up не удался — очищаю зависшие контейнеры и повторяю ..."
+        )
+        _prune_non_running_compose_services(console, plan, extra_force=set(plan.service_names))
+        try:
+            _run(up_cmd, cwd=plan.project.cwd, extra_env=extra_env)
+        except typer.Exit:
+            raise first_err from None
 
 
 def _check_disk_space(console: Console) -> None:
@@ -1499,13 +1543,12 @@ def register(app: typer.Typer) -> None:
                     extra_env=extra_env,
                 )
 
-            # Превентивная проверка для frontend-vite: лучше отговорить пользователя
-            # чем дать compose упасть с непонятным ERR_PNPM_NO_PKG_MANIFEST.
-            if not _check_frontend_workspace(console, plan):
+            # frontend-vite в плане → автоклон platform-home-console (без диалога).
+            ok, recreate = _ensure_frontend_workspace(console, plan)
+            if not ok:
                 raise typer.Exit(code=1)
 
-            # plan.service_names мог измениться после _check_frontend_workspace
-            # (если frontend-vite был выпилен) — пересобираем команду:
+            # plan.service_names мог измениться — пересобираем команду:
             base_cmd = _compose_base_cmd(plan)
 
             needed_ports = _get_needed_ports(plan)
@@ -1521,7 +1564,13 @@ def register(app: typer.Typer) -> None:
             up_cmd += plan.service_names
 
             try:
-                _run(up_cmd, cwd=plan.project.cwd, extra_env=extra_env)
+                _compose_up_with_stale_retry(
+                    console,
+                    plan,
+                    up_cmd,
+                    extra_env=extra_env,
+                    force_recreate=recreate,
+                )
             except typer.Exit as exit_exc:
                 # docker compose ушёл с ошибкой:
                 #   1) Сначала покажем сырые логи упавших сервисов (контекст для человека).

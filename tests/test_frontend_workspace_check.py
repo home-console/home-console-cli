@@ -1,4 +1,4 @@
-"""Тесты для _check_frontend_workspace — превентивная проверка перед env up."""
+"""Тесты для _ensure_frontend_workspace — автоклон platform-home-console перед env up."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,16 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import typer
 
 import hc.commands.env as env_mod
 
 
 def _make_plan(tmp_path: Path, services: list[str]) -> SimpleNamespace:
-    """
-    Сэмулировать EnvUpPlan: project.cwd должен указывать на deploy/dev,
-    тогда _check_frontend_workspace будет искать platform-home-console
-    в tmp_path/platform-home-console.
-    """
     compose_cwd = tmp_path / "core-runtime-service" / "deploy" / "dev"
     compose_cwd.mkdir(parents=True, exist_ok=True)
     project = SimpleNamespace(
@@ -31,8 +27,9 @@ def _make_plan(tmp_path: Path, services: list[str]) -> SimpleNamespace:
 
 def test_skip_when_no_frontend_vite(tmp_path: Path) -> None:
     plan = _make_plan(tmp_path, ["core-runtime", "caddy"])
-    assert env_mod._check_frontend_workspace(MagicMock(), plan) is True
-    # План не тронут
+    ok, recreate = env_mod._ensure_frontend_workspace(MagicMock(), plan)
+    assert ok is True
+    assert recreate == set()
     assert "frontend-vite" not in plan.service_names
 
 
@@ -42,79 +39,73 @@ def test_pass_when_workspace_with_package_json_exists(tmp_path: Path) -> None:
     (workspace / "package.json").write_text("{}")
 
     plan = _make_plan(tmp_path, ["core-runtime", "frontend-vite"])
-    assert env_mod._check_frontend_workspace(MagicMock(), plan) is True
-    # frontend-vite остаётся в плане
+    ok, recreate = env_mod._ensure_frontend_workspace(MagicMock(), plan)
+    assert ok is True
+    assert recreate == set()
     assert "frontend-vite" in plan.service_names
 
 
-def test_skips_frontend_in_non_tty_when_missing(tmp_path: Path, monkeypatch) -> None:
-    """В неинтерактивном режиме (CI) утилита не блокирует запуск,
-    а оставляет план как есть — пусть упадёт сам, post-mortem подсветит."""
-    monkeypatch.setattr(env_mod.sys.stdin, "isatty", lambda: False)
-    plan = _make_plan(tmp_path, ["core-runtime", "frontend-vite"])
-    result = env_mod._check_frontend_workspace(MagicMock(), plan)
-    assert result is True
-    assert "frontend-vite" in plan.service_names
-
-
-def _fake_questionary(answer: str):
-    """Сэмулировать questionary.select возвращающий заданный ответ."""
-
-    class _Choice:
-        def __init__(self, title=None, value=None, **_):
-            self.title = title
-            self.value = value
-
-    return SimpleNamespace(
-        Choice=_Choice,
-        select=lambda *a, **kw: SimpleNamespace(ask=lambda: answer),
-    )
-
-
-def test_skip_action_removes_frontend(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(env_mod.sys.stdin, "isatty", lambda: True)
-    import sys as _sys
-    monkeypatch.setitem(_sys.modules, "questionary", _fake_questionary("skip"))
-
-    plan = _make_plan(tmp_path, ["core-runtime", "frontend-vite", "caddy"])
-    plan.compose_profiles = ["frontend"]
-    result = env_mod._check_frontend_workspace(MagicMock(), plan)
-    assert result is True
-    assert "frontend-vite" not in plan.service_names
-    assert "frontend" not in plan.compose_profiles
-    assert "core-runtime" in plan.service_names
-    assert "caddy" in plan.service_names
-
-
-def test_abort_action_blocks_run(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(env_mod.sys.stdin, "isatty", lambda: True)
-    import sys as _sys
-    monkeypatch.setitem(_sys.modules, "questionary", _fake_questionary("abort"))
-
-    plan = _make_plan(tmp_path, ["core-runtime", "frontend-vite"])
-    result = env_mod._check_frontend_workspace(MagicMock(), plan)
-    assert result is False
-
-
-def test_clone_action_invokes_init_platform_source(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(env_mod.sys.stdin, "isatty", lambda: True)
-    import sys as _sys
-    monkeypatch.setitem(_sys.modules, "questionary", _fake_questionary("clone"))
-
+def test_auto_clones_when_missing_without_dialog(tmp_path: Path, monkeypatch) -> None:
     captured: dict = {}
 
     def fake_init(console, target=None, **kw):
         captured["target"] = target
-        # Сэмулировать успешный клон: создаём package.json
         target.mkdir(parents=True, exist_ok=True)
-        (target / "package.json").write_text("{}")
+        (target / "package.json").write_text('{"name":"platform"}')
         return target
 
     monkeypatch.setattr(env_mod, "init_platform_source", fake_init)
 
     plan = _make_plan(tmp_path, ["core-runtime", "frontend-vite"])
-    result = env_mod._check_frontend_workspace(MagicMock(), plan)
-    assert result is True
-    # После клона frontend-vite ОСТАЁТСЯ в плане
+    ok, recreate = env_mod._ensure_frontend_workspace(MagicMock(), plan)
+    assert ok is True
+    assert recreate == {"frontend-vite"}
     assert "frontend-vite" in plan.service_names
     assert captured["target"] == tmp_path / "platform-home-console"
+
+
+def test_auto_clones_empty_dir_without_dialog(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "platform-home-console"
+    workspace.mkdir()
+
+    def fake_init(console, target=None, **kw):
+        (target / "package.json").write_text("{}")
+        return target
+
+    monkeypatch.setattr(env_mod, "init_platform_source", fake_init)
+
+    plan = _make_plan(tmp_path, ["frontend-vite"])
+    ok, recreate = env_mod._ensure_frontend_workspace(MagicMock(), plan)
+    assert ok is True
+    assert recreate == {"frontend-vite"}
+
+
+def test_clone_failure_strips_frontend(tmp_path: Path, monkeypatch) -> None:
+    def fake_init(console, target=None, **kw):
+        raise typer.Exit(code=1)
+
+    monkeypatch.setattr(env_mod, "init_platform_source", fake_init)
+
+    plan = _make_plan(tmp_path, ["core-runtime", "frontend-vite"])
+    ok, recreate = env_mod._ensure_frontend_workspace(MagicMock(), plan)
+    assert ok is True
+    assert recreate == set()
+    assert "frontend-vite" not in plan.service_names
+
+
+def test_non_tty_strips_when_cannot_clone(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(env_mod.sys.stdin, "isatty", lambda: False)
+    workspace = tmp_path / "platform-home-console"
+    workspace.mkdir()
+    (workspace / "README").write_text("not a frontend repo")
+
+    plan = _make_plan(tmp_path, ["frontend-vite"])
+    ok, recreate = env_mod._ensure_frontend_workspace(MagicMock(), plan)
+    assert ok is True
+    assert recreate == set()
+    assert "frontend-vite" not in plan.service_names
+
+
+def test_frontend_workspace_path(tmp_path: Path) -> None:
+    plan = _make_plan(tmp_path, ["core-runtime"])
+    assert env_mod._frontend_workspace_path(plan) == tmp_path / "platform-home-console"
