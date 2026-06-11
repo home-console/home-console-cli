@@ -191,6 +191,11 @@ def register(app: typer.Typer) -> None:
             "--source-repo",
             help="URL github-репо (по умолчанию берётся plugin.homepage_url)",
         ),
+        subpath: str | None = typer.Option(
+            None,
+            "--subpath",
+            help="Папка внутри репо до плагина (для монорепы), напр. plugins/oauth_yandex",
+        ),
         changelog: str | None = typer.Option(None, "--changelog", help="Текст changelog"),
         api: str | None = typer.Option(
             None,
@@ -230,6 +235,8 @@ def register(app: typer.Typer) -> None:
         }
         if source_repo:
             body["source_repo"] = source_repo
+        if subpath:
+            body["subpath"] = subpath
         if changelog:
             body["changelog"] = changelog
 
@@ -256,6 +263,8 @@ def register(app: typer.Typer) -> None:
             console.print(f"  [bold]SHA256:[/bold] {payload.get('sha256', '—')}")
             if payload.get("git_sha"):
                 console.print(f"  [bold]Commit:[/bold] {payload['git_sha']}")
+            if payload.get("source_subpath"):
+                console.print(f"  [bold]Subpath:[/bold] {payload['source_subpath']}")
             if payload.get("url"):
                 console.print(f"  [bold]URL:[/bold] {payload['url']}")
             raise typer.Exit(code=0)
