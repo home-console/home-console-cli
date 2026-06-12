@@ -24,12 +24,33 @@ from hc.json_output import print_json
 
 DoctorScope = Literal["full", "quick", "api", "recovery"]
 
+# Порты, по которым doctor пытается понять что слушает / отвечает.
+#
+# Соглашение:
+#   DEV-стек использует префикс «1» перед стандартным портом, чтобы можно
+#   было держать prod и dev на одной машине без конфликтов.
+#     18080 ← 8080  (UI caddy)
+#     18000 ← 8000  (Core API)
+#     15173 ← 5173  (Vite HMR)
+#     15432 ← 5432  (PostgreSQL)
+#     16379 ← 6379  (Redis)
+#
+#   PROD-стек публикует стандартные порты:
+#     8080 / 8443   (edge HTTP/HTTPS — не 80/443, чтобы запускать без root)
+#     8000          (Core API напрямую, если CORE_PORT раскомментирован)
+#     5432 / 6379   (PostgreSQL/Redis — если решено публиковать наружу)
 CHECK_PORTS: dict[int, str] = {
-    18080: "UI (caddy)",
-    18000: "Core API",
-    15173: "Vite HMR",
-    5432: "PostgreSQL",
-    6379: "Redis",
+    # ── DEV ─────────────────────────────────
+    18080: "UI (caddy, dev)",
+    18000: "Core API (dev)",
+    15173: "Vite HMR (dev)",
+    15432: "PostgreSQL (dev)",
+    16379: "Redis (dev)",
+    # ── PROD ────────────────────────────────
+    8080:  "UI (edge, prod)",
+    8000:  "Core API (prod)",
+    5432:  "PostgreSQL (prod)",
+    6379:  "Redis (prod)",
 }
 
 
@@ -222,8 +243,9 @@ def _checks_core_sources() -> tuple[list[DoctorCheck], list[str]]:
 # непустой ответ. Если порт открыт, но HTTP пуст/connection refused — это
 # симптом «caddy/vite живой, но upstream не отвечает».
 _HTTP_SMOKE_PORTS: dict[int, str] = {
-    18080: "UI (caddy)",
-    15173: "Vite HMR",
+    18080: "UI (caddy, dev)",
+    15173: "Vite HMR (dev)",
+    8080:  "UI (edge, prod)",
 }
 
 
@@ -272,9 +294,15 @@ def _checks_ports() -> tuple[list[DoctorCheck], list[str]]:
                         f"listening, но {detail}",
                     )
                 )
+                # Подсказка, чьи логи смотреть: dev-hc-* для dev, prod-hc-* для prod.
+                container_hint = {
+                    18080: "docker logs dev-hc-caddy",
+                    15173: "docker logs dev-hc-frontend-vite",
+                    8080: "docker logs prod-hc-edge",
+                }.get(port, "")
                 issues.append(
                     f":{port} {label} слушает, но HTTP не отвечает ({detail}). "
-                    f"Проверь логи: docker logs dev-hc-{'caddy' if port == 18080 else 'frontend-vite'}"
+                    + (f"Проверь логи: {container_hint}" if container_hint else "")
                 )
         else:
             checks.append(DoctorCheck(f"  :{port} {label}", "ok", "listening"))

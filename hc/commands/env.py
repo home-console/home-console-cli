@@ -123,7 +123,7 @@ _DB_OPTIONS: list[_DbOption] = [
     ),
     _DbOption(
         key="postgres",
-        label="PostgreSQL  (контейнер postgres, порт :5432)",
+        label="PostgreSQL  (контейнер postgres, dev порт :15432)",
         env={
             "RUNTIME_VAULT_STORAGE_TYPE": "postgresql",
             # sslmode=disable: skip SSL negotiation for local dev container
@@ -406,14 +406,17 @@ def _compose_with_profiles(
     return cmd
 
 
+# Дефолтные публичные порты для подсказок в `hc env ps` / status.
+# Стек DEV использует префикс «1» (18080/18000/15432/16379/15173), prod —
+# стандартные (8080/8000/5432/6379). dev-hc-* контейнеры → DEV порты.
 _KNOWN_ENDPOINTS: dict[str, str] = {
     "core-runtime": "http://localhost:18000",
     "caddy": "http://localhost:18080",
-    "edge": "http://localhost:18080",
+    "edge": "http://localhost:8080",
     "frontend-vite": "http://localhost:15173",
-    "postgres": "localhost:5432",
+    "postgres": "localhost:15432",
     "platform-web": "http://localhost:3000",
-    "redis": "localhost:6379",
+    "redis": "localhost:16379",
 }
 
 
@@ -1775,12 +1778,16 @@ def _print_summary(
         if "frontend-vite" in services and "caddy" not in services:
             urls.append(("HMR", "http://localhost:15173"))
         if "postgres" in services:
-            urls.append(("PG ", "localhost:5432"))
+            urls.append(("PG ", "localhost:15432"))
+        if "redis" in services:
+            urls.append(("RDS", "localhost:16379"))
     elif mode == "dev-image":
         if "edge" in services:
             urls.append(("UI ", "http://localhost:18080"))
         if "core-runtime" in services:
             urls.append(("API", "http://localhost:18000"))
+        if "redis" in services:
+            urls.append(("RDS", "localhost:16379"))
         if "platform-web" in services:
             urls.append(("App", "http://localhost:3000"))
 
