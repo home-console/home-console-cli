@@ -180,12 +180,14 @@ _RAW_ISSUES: list[tuple[KnownIssue, tuple[_FixSpec, ...]]] = [
             ),
             pattern=re.compile(
                 r"bind: address already in use|port is already allocated|"
-                r"Bind for 0\.0\.0\.0:\d+ failed",
+                r"Bind for 0\.0\.0\.0:\d+ failed|"
+                r"failed to bind host port.*address already in use",
                 re.IGNORECASE,
             ),
         ),
         (
-            ("hc doctor", "посмотреть какие порты заняты", "hc"),
+            ("hc env up", "повторить — CLI предложит освободить порт", "hc"),
+            ("lsof -ti :18000 | xargs kill", "убить процесс на :18000 вручную (shell)", "shell"),
             ("hc env down", "остановить текущий стек если что-то висит", "hc"),
         ),
     ),

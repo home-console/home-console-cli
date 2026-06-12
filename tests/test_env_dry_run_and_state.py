@@ -231,7 +231,7 @@ def test_env_up_creates_core_env_before_compose(env_modules, monkeypatch) -> Non
     # Disable upstream pre-flight side effects that would shell out to docker/lsof.
     monkeypatch.setattr(env_mod, "_check_disk_space", lambda console: None)
     monkeypatch.setattr(env_mod, "_get_needed_ports", lambda plan: {})
-    monkeypatch.setattr(env_mod, "_find_port_conflicts", lambda needed, cwd: [])
+    monkeypatch.setattr(env_mod, "_find_port_conflicts", lambda needed, plan: [])
 
     from hc.main import app
 

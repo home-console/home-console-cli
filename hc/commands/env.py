@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -845,17 +846,145 @@ def _get_needed_ports(plan: EnvUpPlan) -> dict[int, str]:
     return result
 
 
+def _parse_docker_labels(labels_val: object) -> dict[str, str]:
+    if isinstance(labels_val, dict):
+        return {str(k): str(v) for k, v in labels_val.items()}
+    out: dict[str, str] = {}
+    for part in str(labels_val or "").split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _parse_published_ports(ports_str: str) -> set[int]:
+    held: set[int] = set()
+    for m in re.finditer(r":(\d+)->", ports_str):
+        held.add(int(m.group(1)))
+    return held
+
+
+def _compose_project_name(plan: EnvUpPlan) -> str:
+    import json
+
+    base = _compose_base_cmd(plan)
+    r = subprocess.run(  # noqa: S603
+        [*base, "config", "--format", "json"],
+        cwd=str(plan.project.cwd),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if r.returncode == 0:
+        try:
+            name = json.loads(r.stdout).get("name")
+            if name:
+                return str(name)
+        except json.JSONDecodeError:
+            pass
+    return plan.project.cwd.name
+
+
+def _process_command_line(pid: int) -> str:
+    r = subprocess.run(  # noqa: S603
+        ["ps", "-p", str(pid), "-o", "args="],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    cmd = (r.stdout or "").strip()
+    return cmd or f"pid {pid}"
+
+
+def _find_host_listeners(port: int) -> list[dict[str, object]]:
+    """Процессы на хосте, слушающие TCP-порт (lsof / ss)."""
+    holders: list[dict[str, object]] = []
+    seen_pids: set[int] = set()
+
+    if shutil.which("lsof"):
+        r = subprocess.run(  # noqa: S603
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-F", "pcn"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            pid: int | None = None
+            comm = ""
+            name = ""
+            for line in r.stdout.splitlines():
+                if not line:
+                    continue
+                tag, val = line[0], line[1:]
+                if tag == "p":
+                    if pid is not None and pid not in seen_pids:
+                        holders.append({"pid": pid, "command": name or comm})
+                        seen_pids.add(pid)
+                    pid = int(val)
+                    comm = ""
+                    name = ""
+                elif tag == "c":
+                    comm = val
+                elif tag == "n":
+                    name = val
+            if pid is not None and pid not in seen_pids:
+                holders.append({"pid": pid, "command": name or comm})
+                seen_pids.add(pid)
+
+        if not holders:
+            r2 = subprocess.run(  # noqa: S603
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            for line in (r2.stdout or "").splitlines():
+                if line.strip().isdigit():
+                    pid = int(line.strip())
+                    if pid not in seen_pids:
+                        holders.append({"pid": pid, "command": _process_command_line(pid)})
+                        seen_pids.add(pid)
+
+    if not holders and shutil.which("ss"):
+        r3 = subprocess.run(  # noqa: S603
+            ["ss", "-tlnp", f"sport = :{port}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        for m in re.finditer(r"pid=(\d+)", r3.stdout or ""):
+            pid = int(m.group(1))
+            if pid not in seen_pids:
+                holders.append({"pid": pid, "command": _process_command_line(pid)})
+                seen_pids.add(pid)
+
+    return holders
+
+
 def _find_port_conflicts(
     needed: dict[int, str],
-    project_cwd: Path,
+    plan: EnvUpPlan,
 ) -> list[dict[str, object]]:
-    """Find running containers (outside this project) that hold needed ports."""
+    """
+  Найти кто занимает нужные порты: чужие контейнеры и процессы на хосте.
+
+  Порты, которые уже держит running-контейнер нашего compose-проекта
+  для сервиса из плана, не считаются конфликтом.
+    """
     import json
 
     if not needed:
         return []
 
-    project_name = project_cwd.name
+    project_name = _compose_project_name(plan)
+    conflicts: list[dict[str, object]] = []
+    legit_ports: set[int] = set()
+    docker_covered_ports: set[int] = set()
 
     r = subprocess.run(  # noqa: S603
         ["docker", "ps", "--format", "{{json .}}"],
@@ -864,65 +993,107 @@ def _find_port_conflicts(
         timeout=5,
         check=False,
     )
-    if r.returncode != 0:
-        return []
+    containers: list[dict] = []
+    if r.returncode == 0:
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                containers.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
 
-    conflicts: list[dict[str, object]] = []
-    for line in r.stdout.splitlines():
-        line = line.strip()
-        if not line:
+    for c in containers:
+        labels = _parse_docker_labels(c.get("Labels", ""))
+        svc = labels.get("com.docker.compose.service", "")
+        proj = labels.get("com.docker.compose.project", "")
+        held = _parse_published_ports(str(c.get("Ports", "")))
+        if proj == project_name and svc in plan.service_names:
+            for p in held:
+                if p in needed and needed[p] == svc:
+                    legit_ports.add(p)
+
+    for c in containers:
+        labels = _parse_docker_labels(c.get("Labels", ""))
+        held = _parse_published_ports(str(c.get("Ports", "")))
+        blocking = {
+            p: needed[p]
+            for p in held
+            if p in needed and p not in legit_ports
+        }
+        if not blocking:
             continue
-        try:
-            c = json.loads(line)
-        except json.JSONDecodeError:
+        docker_covered_ports.update(blocking)
+        conflicts.append({
+            "kind": "docker",
+            "id": (c.get("ID") or "")[:12],
+            "name": c.get("Names", "?"),
+            "image": c.get("Image", "?"),
+            "ports": blocking,
+        })
+
+    for port, svc in needed.items():
+        if port in legit_ports or port in docker_covered_ports:
             continue
-
-        labels = c.get("Labels", "")
-        if f"com.docker.compose.project={project_name}" in labels:
-            continue
-
-        ports_str = c.get("Ports", "")
-        held: set[int] = set()
-        for part in ports_str.split(","):
-            part = part.strip()
-            if "->" in part and ":" in part:
-                try:
-                    host_part = part.split(":")[1].split("->")[0]
-                    held.add(int(host_part))
-                except (ValueError, IndexError):
-                    pass
-
-        blocking = {p: needed[p] for p in held if p in needed}
-        if blocking:
+        for holder in _find_host_listeners(port):
+            cmd = str(holder.get("command", ""))
+            if "docker-proxy" in cmd:
+                continue
             conflicts.append({
-                "id": (c.get("ID") or "")[:12],
-                "name": c.get("Names", "?"),
-                "image": c.get("Image", "?"),
-                "ports": blocking,
+                "kind": "process",
+                "pid": holder["pid"],
+                "command": cmd,
+                "ports": {port: svc},
             })
 
     return conflicts
+
+
+def _kill_process(pid: int, *, signal_name: str) -> bool:
+    import signal
+
+    sig = signal.SIGKILL if signal_name == "kill" else signal.SIGTERM
+    try:
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
 
 
 def _offer_resolve_conflicts(
     conflicts: list[dict[str, object]],
     console: Console,
 ) -> None:
-    """Interactive menu: stop or remove containers that block our ports."""
-    console.print("\n[yellow]⚠ Конфликт портов[/yellow] — следующие контейнеры занимают нужные порты:\n")
+    """Интерактивно остановить контейнеры или убить процессы, занимающие порты."""
+    console.print("\n[yellow]⚠ Конфликт портов[/yellow] — порты заняты:\n")
 
     for c in conflicts:
         ports_info = ", ".join(
             f"[bold]:{p}[/bold] (нужен для {svc})"
             for p, svc in sorted(c["ports"].items())  # type: ignore[union-attr]
         )
-        console.print(f"  [cyan]{c['name']}[/cyan]  {c['image']}  {ports_info}")
+        if c.get("kind") == "process":
+            console.print(
+                f"  [yellow]процесс[/yellow]  PID [bold]{c['pid']}[/bold]  "
+                f"[dim]{c['command']}[/dim]  {ports_info}"
+            )
+        else:
+            console.print(
+                f"  [cyan]контейнер[/cyan]  {c['name']}  {c['image']}  {ports_info}"
+            )
 
     if not sys.stdin.isatty():
+        hints = []
+        for c in conflicts:
+            if c.get("kind") == "process":
+                hints.append(f"kill {c['pid']}")
+            else:
+                hints.append(f"docker stop {c['name']}")
         raise HcCliError(
-            message="Конфликт портов: есть чужие контейнеры на нужных портах.",
+            message="Конфликт портов: порты заняты другими процессами/контейнерами.",
             exit_code=1,
-            hint="Останови конфликтующие контейнеры вручную: docker stop <name>",
+            hint="Освободи порты: " + "; ".join(hints),
         )
 
     try:
@@ -932,7 +1103,7 @@ def _offer_resolve_conflicts(
         raise HcCliError(
             message="Конфликт портов.",
             exit_code=1,
-            hint="Останови контейнеры вручную: docker stop <name>",
+            hint="Останови контейнеры: docker stop <name>  или убей процесс: kill <pid>",
         )
 
     style = QStyle([
@@ -944,20 +1115,22 @@ def _offer_resolve_conflicts(
         ("instruction", "fg:#808080 italic"),
     ])
 
-    choices = [
-        questionary.Choice(
-            title=(
+    choices = []
+    for c in conflicts:
+        if c.get("kind") == "process":
+            title = (
+                f"PID {c['pid']}  {c['command'][:60]}  "
+                + ", ".join(f":{p}" for p in sorted(c["ports"]))  # type: ignore[union-attr]
+            )
+        else:
+            title = (
                 f"{c['name']}  [{c['image']}]  "
                 + ", ".join(f":{p}" for p in sorted(c["ports"]))  # type: ignore[union-attr]
-            ),
-            value=c,
-            checked=True,
-        )
-        for c in conflicts
-    ]
+            )
+        choices.append(questionary.Choice(title=title, value=c, checked=True))
 
     selected = questionary.checkbox(
-        "Выбери контейнеры для остановки (SPACE = вкл/выкл  ENTER = применить):",
+        "Выбери что освободить (SPACE = вкл/выкл  ENTER = применить):",
         choices=choices,
         style=style,
     ).ask()
@@ -969,24 +1142,50 @@ def _offer_resolve_conflicts(
         raise HcCliError(
             message="Конфликт портов не разрешён.",
             exit_code=1,
-            hint="Останови конфликтующие контейнеры вручную и повтори.",
+            hint="Останови конфликтующие процессы/контейнеры вручную и повтори.",
         )
 
-    action = questionary.select(
-        "Действие над выбранными контейнерами:",
-        choices=[
-            questionary.Choice("Остановить  (docker stop)", value="stop"),
-            questionary.Choice("Удалить     (docker rm -f)", value="rm"),
-        ],
-        style=style,
-    ).ask()
+    has_docker = any(c.get("kind") != "process" for c in selected)
+    has_process = any(c.get("kind") == "process" for c in selected)
 
-    if action is None:
-        raise typer.Abort()
+    docker_action = None
+    process_action = None
+
+    if has_docker:
+        docker_action = questionary.select(
+            "Действие для контейнеров:",
+            choices=[
+                questionary.Choice("Остановить  (docker stop)", value="stop"),
+                questionary.Choice("Удалить     (docker rm -f)", value="rm"),
+            ],
+            style=style,
+        ).ask()
+        if docker_action is None:
+            raise typer.Abort()
+
+    if has_process:
+        process_action = questionary.select(
+            "Действие для процессов:",
+            choices=[
+                questionary.Choice("Завершить  (SIGTERM)", value="term"),
+                questionary.Choice("Убить      (SIGKILL)", value="kill"),
+            ],
+            style=style,
+        ).ask()
+        if process_action is None:
+            raise typer.Abort()
 
     for c in selected:
+        if c.get("kind") == "process":
+            pid = int(c["pid"])
+            if _kill_process(pid, signal_name=str(process_action)):
+                console.print(f"[green]✓[/green] процесс [bold]{pid}[/bold] завершён")
+            else:
+                console.print(f"[red]✗[/red] не удалось завершить процесс [bold]{pid}[/bold]")
+            continue
+
         cid = c["id"] or c["name"]
-        if action == "stop":
+        if docker_action == "stop":
             r = subprocess.run(["docker", "stop", cid], capture_output=True, check=False)  # noqa: S603
             if r.returncode == 0:
                 console.print(f"[green]✓[/green] остановлен [bold]{c['name']}[/bold]")
@@ -1145,6 +1344,15 @@ def _compose_up_with_stale_retry(
     except typer.Exit as first_err:
         if (first_err.exit_code or 0) == 0:
             raise
+
+        needed_ports = _get_needed_ports(plan)
+        conflicts = _find_port_conflicts(needed_ports, plan)
+        if conflicts:
+            console.print("[yellow]→[/yellow] похоже, порты заняты — предлагаю освободить ...")
+            _offer_resolve_conflicts(conflicts, console)
+            _run(up_cmd, cwd=plan.project.cwd, extra_env=extra_env)
+            return
+
         console.print(
             "[yellow]→[/yellow] compose up не удался — очищаю зависшие контейнеры и повторяю ..."
         )
@@ -1552,7 +1760,7 @@ def register(app: typer.Typer) -> None:
             base_cmd = _compose_base_cmd(plan)
 
             needed_ports = _get_needed_ports(plan)
-            conflicts = _find_port_conflicts(needed_ports, plan.project.cwd)
+            conflicts = _find_port_conflicts(needed_ports, plan)
             if conflicts:
                 _offer_resolve_conflicts(conflicts, console)
 
