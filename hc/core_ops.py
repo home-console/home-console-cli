@@ -12,6 +12,7 @@ from hc.config import Config
 from hc.core_source import COMPOSE_MODES, VALID_MODES, CoreSource
 from hc.env_bootstrap import ensure_core_env
 from hc.errors import DockerNotFoundError, HcCliError
+from hc.vault_ops import reset_vault_sqlite
 
 
 @dataclass(slots=True)
@@ -183,7 +184,6 @@ def _handle_docker_no_permission(console: Console) -> None:
 
 
 def compose_project_from_source(console: Console, src: CoreSource, mode: str | None = None) -> ComposeProject:
-    ensure_core_env(console, src.path)
     if mode is None:
         mode = Config.load().recovery.mode
     try:
@@ -195,6 +195,11 @@ def compose_project_from_source(console: Console, src: CoreSource, mode: str | N
             exit_code=2,
             hint=f"Допустимые режимы: {valid}",
         ) from exc
+
+    created_env = ensure_core_env(console, src.path)
+    if created_env:
+        _reset_stale_vault(console, compose)
+
     if not compose.exists():
         available = [m for m, rel in COMPOSE_MODES.items() if (src.path / rel).exists()]
         hint = f"Режим {mode!r} → {src.compose_rel(mode)}. Файл не найден в {src.path}."
@@ -209,6 +214,23 @@ def compose_project_from_source(console: Console, src: CoreSource, mode: str | N
             hint=hint,
         )
     return ComposeProject(compose_file=compose)
+
+
+def _reset_stale_vault(console: Console, compose: Path) -> None:
+    """
+    Если только что сгенерирован новый `.env` с новым RUNTIME_MASTER_KEY, любой
+    vault, оставшийся в volume core-data от предыдущего стека, зашифрован под
+    старый (уже потерянный) ключ — core упадёт на preflight с InvalidTag.
+
+    Сбрасываем такой vault заранее (best-effort: только sqlite, volume может
+    и не существовать — тогда reset_vault_sqlite ничего не делает).
+    """
+    result = reset_vault_sqlite(compose_file=compose, cwd=compose.parent)
+    if result.success and result.actions and "не существует" not in result.actions[0]:
+        console.print(
+            "[yellow]![/yellow] Обнаружен старый vault от прошлого стека (новый RUNTIME_MASTER_KEY "
+            "не сможет его расшифровать) — сброшен автоматически."
+        )
 
 
 def run_compose(console: Console, args: list[str], cwd: Path) -> None:
