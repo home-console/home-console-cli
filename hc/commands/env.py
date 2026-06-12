@@ -1561,6 +1561,21 @@ _FRONTEND_VITE_OVERRIDE = "frontend-vite.hc.yml"
 
 
 def _render_frontend_override_body(core_root: Path) -> str:
+    # ВАЖНО: запускаем vite через `pnpm --filter=web exec vite`, а не через
+    # `pnpm --filter=web dev -- --host …`. Скрипт dev в apps/web сводится к
+    # `vite`, и `pnpm run … -- --host` добавляет лишний `--`, из-за чего vite
+    # получает `vite -- --host …` и игнорирует флаги — поднимается на
+    # localhost:5173 и Caddy не может достучаться (502).
+    #
+    # Перед exec собираем `@platform/*` пакеты (это делает скрипт dev,
+    # повторяем явно).
+    cmd = (
+        "corepack enable && "
+        "pnpm install --frozen-lockfile && "
+        "pnpm api:gen && "
+        "pnpm --filter='@platform/*' build && "
+        "pnpm --filter=web exec vite --host 0.0.0.0 --port 5173"
+    )
     return f"""\
 services:
   frontend-vite:
@@ -1568,8 +1583,7 @@ services:
       VITE_CORE_PROXY_TARGET: http://core-runtime:8000
     volumes:
       - {core_root}:/core-runtime-service:ro
-    command: >-
-      sh -c "corepack enable && pnpm install --frozen-lockfile && pnpm api:gen && pnpm --filter=web dev -- --host 0.0.0.0 --port 5173"
+    command: ["sh", "-c", "{cmd}"]
 """
 
 

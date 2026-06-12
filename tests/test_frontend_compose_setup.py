@@ -55,9 +55,14 @@ def test_write_frontend_override_content(tmp_path: Path, monkeypatch) -> None:
     path = env_mod._write_frontend_compose_override(plan)
     assert path is not None
     text = path.read_text(encoding="utf-8")
-    assert "pnpm --filter=web dev" in text
+    assert "pnpm --filter=web exec vite" in text
+    assert "--host 0.0.0.0" in text
+    assert "--port 5173" in text
     assert "pnpm api:gen" in text
     assert "VITE_CORE_PROXY_TARGET" in text
+    # Не должно быть `pnpm run dev -- --host` — pnpm добавляет лишний `--`
+    # и vite получает аргументы как `vite -- --host`, игнорируя их.
+    assert "pnpm --filter=web dev" not in text
 
 
 def test_override_mounts_core_runtime_for_api_gen(tmp_path: Path, monkeypatch) -> None:

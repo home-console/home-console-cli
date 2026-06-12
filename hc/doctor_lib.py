@@ -26,6 +26,7 @@ DoctorScope = Literal["full", "quick", "api", "recovery"]
 CHECK_PORTS: dict[int, str] = {
     18080: "UI (caddy)",
     18000: "Core API",
+    15173: "Vite HMR",
     5432: "PostgreSQL",
     6379: "Redis",
 }
@@ -186,20 +187,68 @@ def _checks_core_sources() -> tuple[list[DoctorCheck], list[str]]:
     return checks, issues
 
 
-def _checks_ports() -> list[DoctorCheck]:
+# HTTP smoke-check: какие порты, кроме TCP-listen, ещё дёргаем GET / и ждём
+# непустой ответ. Если порт открыт, но HTTP пуст/connection refused — это
+# симптом «caddy/vite живой, но upstream не отвечает».
+_HTTP_SMOKE_PORTS: dict[int, str] = {
+    18080: "UI (caddy)",
+    15173: "Vite HMR",
+}
+
+
+def _http_smoke(port: int, *, timeout: float = 1.5) -> tuple[bool, str]:
+    """Сделать GET / и вернуть (ok, краткий статус)."""
+    try:
+        import httpx
+
+        r = httpx.get(f"http://127.0.0.1:{port}/", timeout=timeout)
+        if r.status_code >= 500:
+            return False, f"HTTP {r.status_code} ({len(r.content)}B)"
+        if r.status_code in (200, 301, 302, 304, 404, 405):
+            return True, f"HTTP {r.status_code} ({len(r.content)}B)"
+        return True, f"HTTP {r.status_code}"
+    except httpx.RemoteProtocolError:
+        return False, "empty reply"
+    except httpx.ConnectError:
+        return False, "connection refused"
+    except httpx.TimeoutException:
+        return False, "timeout"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"err: {type(exc).__name__}"
+
+
+def _checks_ports() -> tuple[list[DoctorCheck], list[str]]:
     checks: list[DoctorCheck] = []
+    issues: list[str] = []
     for port, label in CHECK_PORTS.items():
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.3)
             in_use = s.connect_ex(("127.0.0.1", port)) == 0
-        checks.append(
-            DoctorCheck(
-                f"  :{port} {label}",
-                "ok" if in_use else "skip",
-                "listening" if in_use else "free",
-            )
-        )
-    return checks
+
+        if not in_use:
+            checks.append(DoctorCheck(f"  :{port} {label}", "skip", "free"))
+            continue
+
+        if port in _HTTP_SMOKE_PORTS:
+            ok, detail = _http_smoke(port)
+            if ok:
+                checks.append(DoctorCheck(f"  :{port} {label}", "ok", detail))
+            else:
+                checks.append(
+                    DoctorCheck(
+                        f"  :{port} {label}",
+                        "fail",
+                        f"listening, но {detail}",
+                    )
+                )
+                issues.append(
+                    f":{port} {label} слушает, но HTTP не отвечает ({detail}). "
+                    f"Проверь логи: docker logs dev-hc-{'caddy' if port == 18080 else 'frontend-vite'}"
+                )
+        else:
+            checks.append(DoctorCheck(f"  :{port} {label}", "ok", "listening"))
+
+    return checks, issues
 
 
 def _checks_disk() -> tuple[list[DoctorCheck], list[str]]:
@@ -399,7 +448,9 @@ def run_doctor(console: Console, *, scope: DoctorScope) -> DoctorReport:
         report.issues.extend(src_issues)
 
     if scope == "full":
-        report.checks.extend(_checks_ports())
+        port_checks, port_issues = _checks_ports()
+        report.checks.extend(port_checks)
+        report.issues.extend(port_issues)
         disk_checks, disk_issues = _checks_disk()
         report.checks.extend(disk_checks)
         report.issues.extend(disk_issues)
