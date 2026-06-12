@@ -1545,15 +1545,29 @@ def _show_failure_logs(console: Console, plan: EnvUpPlan) -> None:
 
 _FRONTEND_VITE_OVERRIDE = "frontend-vite.hc.yml"
 
-# Исправляет устаревший compose из core-runtime-service:
-# - pnpm dev (все apps) → pnpm --filter=web dev
-# - api:gen перед dev
-# - VITE_CORE_PROXY_TARGET для прокси /api внутри docker-сети
-_FRONTEND_VITE_OVERRIDE_BODY = """\
+# Исправляет проблемы compose из core-runtime-service для frontend-vite:
+#
+# 1. pnpm dev запускал ВСЕ apps (web + mobile + desktop) → меняем на
+#    pnpm --filter=web dev.
+#
+# 2. api:gen вызывает `openapi-typescript ../core-runtime-service/openapi.json …`
+#    Внутри контейнера cwd=/workspace, поэтому путь резолвится в
+#    /core-runtime-service/openapi.json. В upstream-compose примонтирован
+#    только /workspace — отсюда ENOENT. Монтируем core-runtime-service
+#    как /core-runtime-service:ro (read-only — vite туда писать не должен).
+#
+# 3. VITE_CORE_PROXY_TARGET — прокси /api на core-runtime через docker DNS,
+#    а не на localhost:18000 хоста.
+
+
+def _render_frontend_override_body(core_root: Path) -> str:
+    return f"""\
 services:
   frontend-vite:
     environment:
       VITE_CORE_PROXY_TARGET: http://core-runtime:8000
+    volumes:
+      - {core_root}:/core-runtime-service:ro
     command: >-
       sh -c "corepack enable && pnpm install --frozen-lockfile && pnpm api:gen && pnpm --filter=web dev -- --host 0.0.0.0 --port 5173"
 """
@@ -1565,10 +1579,16 @@ def _write_frontend_compose_override(plan: EnvUpPlan) -> Path | None:
         return None
     from hc.constants import DATA_DIR
 
+    # core_root — это абсолютный путь к core-runtime-service на хосте.
+    # _frontend_workspace_path делает parent.parent от compose cwd (deploy/dev),
+    # это core-runtime-service; нам нужен сам core-runtime-service.
+    core_root = plan.project.cwd.parent.parent
+    body = _render_frontend_override_body(core_root)
+
     path = DATA_DIR / "compose-overrides" / _FRONTEND_VITE_OVERRIDE
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists() or path.read_text(encoding="utf-8") != _FRONTEND_VITE_OVERRIDE_BODY:
-        path.write_text(_FRONTEND_VITE_OVERRIDE_BODY, encoding="utf-8")
+    if not path.exists() or path.read_text(encoding="utf-8") != body:
+        path.write_text(body, encoding="utf-8")
     return path
 
 

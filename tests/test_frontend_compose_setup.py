@@ -58,3 +58,28 @@ def test_write_frontend_override_content(tmp_path: Path, monkeypatch) -> None:
     assert "pnpm --filter=web dev" in text
     assert "pnpm api:gen" in text
     assert "VITE_CORE_PROXY_TARGET" in text
+
+
+def test_override_mounts_core_runtime_for_api_gen(tmp_path: Path, monkeypatch) -> None:
+    """api:gen из platform-home-console ищет ../core-runtime-service/openapi.json.
+
+    Внутри контейнера cwd=/workspace, поэтому путь = /core-runtime-service/openapi.json.
+    Override должен примонтировать core-runtime-service ровно по этому пути.
+    """
+    monkeypatch.setattr("hc.constants.DATA_DIR", tmp_path)
+
+    plan = _make_plan(tmp_path, ["frontend-vite"])
+    path = env_mod._write_frontend_compose_override(plan)
+    text = path.read_text(encoding="utf-8")
+
+    core_root = tmp_path / "core-runtime-service"
+    assert f"{core_root}:/core-runtime-service:ro" in text
+
+
+def test_override_body_changes_with_core_root() -> None:
+    """Содержимое override параметризовано путём к core-runtime-service."""
+    body_a = env_mod._render_frontend_override_body(Path("/a/core-runtime-service"))
+    body_b = env_mod._render_frontend_override_body(Path("/b/core-runtime-service"))
+    assert "/a/core-runtime-service:/core-runtime-service:ro" in body_a
+    assert "/b/core-runtime-service:/core-runtime-service:ro" in body_b
+    assert body_a != body_b
