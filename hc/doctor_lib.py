@@ -250,22 +250,29 @@ def _checks_core_sources() -> tuple[list[DoctorCheck], list[str]]:
     return checks, issues
 
 
-# HTTP smoke-check: какие порты, кроме TCP-listen, ещё дёргаем GET / и ждём
-# непустой ответ. Если порт открыт, но HTTP пуст/connection refused — это
-# симптом «caddy/vite живой, но upstream не отвечает».
+# HTTP smoke-check: какие порты, кроме TCP-listen, ещё дёргаем GET и ждём
+# валидный HTTP-ответ. Если порт открыт, но HTTP пуст/connection refused —
+# это симптом «caddy/vite/core живой, но upstream не отвечает».
+#
+# Для 18000/8000 (Core API) бьём конкретно /api/v1/monitor/health, потому
+# что корень `/` у FastAPI возвращает 404 — это не показатель здоровья.
 _HTTP_SMOKE_PORTS: dict[int, str] = {
     18080: "UI (caddy, dev)",
     15173: "Vite HMR (dev)",
+    18000: "Core API (dev)",
     8080:  "UI (edge, prod)",
+    8000:  "Core API (prod)",
 }
 
 
-def _http_smoke(port: int, *, timeout: float = 1.5) -> tuple[bool, str]:
-    """Сделать GET / и вернуть (ok, краткий статус)."""
+def _http_smoke(
+    port: int, *, path: str = "/", timeout: float = 1.5
+) -> tuple[bool, str]:
+    """GET http://127.0.0.1:<port><path> и вернуть (ok, краткий статус)."""
     try:
         import httpx
 
-        r = httpx.get(f"http://127.0.0.1:{port}/", timeout=timeout)
+        r = httpx.get(f"http://127.0.0.1:{port}{path}", timeout=timeout)
         if r.status_code >= 500:
             return False, f"HTTP {r.status_code} ({len(r.content)}B)"
         if r.status_code in (200, 301, 302, 304, 404, 405):
@@ -279,6 +286,21 @@ def _http_smoke(port: int, *, timeout: float = 1.5) -> tuple[bool, str]:
         return False, "timeout"
     except Exception as exc:  # noqa: BLE001
         return False, f"err: {type(exc).__name__}"
+
+
+# Конкретные health-endpoints для портов, где знаем что слушает.
+# Если порт указан здесь — smoke бьёт именно этот путь, иначе по «/».
+#
+# Для UI-портов (18080 dev / 8080 prod) бьём dedicated health-эндпоинты
+# самого Caddy — они отвечают 200 даже когда upstream-сервисы лежат, и это
+# верно: «edge живой, но core/web мёртв» — нам нужно различать эти случаи.
+# Core API даём свой health, потому что у FastAPI корень `/` это 404.
+_HTTP_HEALTH_PATHS: dict[int, str] = {
+    18080: "/_caddy/health",          # UI Caddy (dev)
+    8080:  "/_edge/health",           # UI edge (prod)
+    18000: "/api/v1/monitor/health",  # Core API (dev)
+    8000:  "/api/v1/monitor/health",  # Core API (prod, если опубликован)
+}
 
 
 def _detect_running_stacks() -> set[str]:
@@ -320,16 +342,22 @@ def _check_one_port(
     if not smoke:
         return DoctorCheck(f"  :{port} {label}", "ok", "listening"), None
 
-    ok, detail = _http_smoke(port)
+    path = _HTTP_HEALTH_PATHS.get(port, "/")
+    ok, detail = _http_smoke(port, path=path)
+    # Для health-endpoint покажем сам путь — понятнее чем «HTTP 200 (45B)».
+    display = f"{detail}  {path}" if path != "/" else detail
+
     if ok:
-        return DoctorCheck(f"  :{port} {label}", "ok", detail), None
+        return DoctorCheck(f"  :{port} {label}", "ok", display), None
 
     container_hint = {
         18080: "docker logs dev-hc-caddy",
+        18000: "docker logs dev-hc-core-runtime",
         15173: "docker logs dev-hc-frontend-vite",
-        8080: "docker logs prod-hc-edge",
+        8080:  "docker logs prod-hc-edge",
+        8000:  "docker logs prod-hc-core-runtime",
     }.get(port, "")
-    issue = f":{port} {label} слушает, но HTTP не отвечает ({detail})."
+    issue = f":{port} {label} слушает, но {path} не отвечает ({detail})."
     if container_hint:
         issue += f"  →  {container_hint}"
     return (

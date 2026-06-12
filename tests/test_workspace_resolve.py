@@ -115,3 +115,57 @@ def test_workspace_set_rejects_non_monorepo(
     r = runner.invoke(app, ["workspace", "set", str(tmp_path)])
     assert r.exit_code == 1
     assert "не похоже на монорепо" in r.output
+
+
+def test_git_summary_returns_none_for_non_git(tmp_path: Path) -> None:
+    """Не git-каталог → None (status тогда печатает `[не git]`)."""
+    from hc.commands.workspace import _git_summary
+
+    assert _git_summary(tmp_path) is None
+
+
+def test_git_summary_handles_missing_git_binary(tmp_path: Path, monkeypatch) -> None:
+    """Если бинарь git недоступен — функция не падает, а возвращает None."""
+    import hc.commands.workspace as ws_mod
+
+    (tmp_path / ".git").mkdir()
+
+    def _no_git(*args, **kwargs):  # noqa: ANN001, ARG001
+        raise FileNotFoundError("git not installed")
+
+    monkeypatch.setattr(ws_mod.subprocess, "run", _no_git)
+    assert ws_mod._git_summary(tmp_path) is None
+
+
+def test_git_summary_parses_branch_and_dirty(tmp_path: Path, monkeypatch) -> None:
+    """Парсинг: branch + dirty + ahead/behind."""
+    import hc.commands.workspace as ws_mod
+
+    (tmp_path / ".git").mkdir()
+
+    # Очередь ответов git в порядке вызова: branch, status, ahead/behind.
+    responses = [
+        types_stub(returncode=0, stdout="feature/foo\n", stderr=""),
+        types_stub(returncode=0, stdout=" M file.py\n", stderr=""),
+        types_stub(returncode=0, stdout="3\t1\n", stderr=""),
+    ]
+    calls = iter(responses)
+
+    def _fake_run(*args, **kwargs):  # noqa: ANN001, ARG001
+        return next(calls)
+
+    monkeypatch.setattr(ws_mod.subprocess, "run", _fake_run)
+
+    summary = ws_mod._git_summary(tmp_path)
+    assert summary is not None
+    assert "feature/foo" in summary
+    assert "*" in summary  # dirty flag
+    assert "3↑" in summary
+    assert "1↓" in summary
+
+
+def types_stub(*, returncode: int, stdout: str, stderr: str):  # noqa: ANN201
+    """Маленький stub под subprocess.CompletedProcess для моков."""
+    import types
+
+    return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)

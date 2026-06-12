@@ -17,7 +17,9 @@ def _patch_io(monkeypatch, *, running: set[str], listening: set[int]) -> None:
     monkeypatch.setattr(dl, "_detect_running_stacks", lambda: running)
     monkeypatch.setattr(dl, "_port_listening", lambda p: p in listening)
     # smoke не нужен — ни один порт не listening для http
-    monkeypatch.setattr(dl, "_http_smoke", lambda p, timeout=1.5: (True, "HTTP 200"))
+    monkeypatch.setattr(
+        dl, "_http_smoke", lambda p, path="/", timeout=1.5: (True, "HTTP 200")
+    )
 
 
 def _labels(checks: list[dl.DoctorCheck]) -> list[str]:
@@ -121,3 +123,39 @@ def test_deploy_doctor_alias(runner: CliRunner, monkeypatch, isolated_home) -> N
 
     r = runner.invoke(app, ["deploy", "doctor", "--json"])
     assert r.exit_code in (0, 1), r.output
+
+
+def test_http_health_paths_dispatched(monkeypatch) -> None:
+    """Для известных портов doctor бьёт не «/», а конкретный health-эндпоинт."""
+    calls: list[tuple[int, str]] = []
+
+    def _fake_smoke(port: int, *, path: str = "/", timeout: float = 1.5):
+        calls.append((port, path))
+        return True, "HTTP 200"
+
+    monkeypatch.setattr(dl, "_port_listening", lambda p: True)
+    monkeypatch.setattr(dl, "_http_smoke", _fake_smoke)
+
+    for port in (18080, 18000, 8080, 8000):
+        dl._check_one_port(port, "test", smoke=True)
+
+    paths = dict(calls)
+    assert paths[18080] == "/_caddy/health"
+    assert paths[18000] == "/api/v1/monitor/health"
+    assert paths[8080] == "/_edge/health"
+    assert paths[8000] == "/api/v1/monitor/health"
+
+
+def test_http_smoke_default_path(monkeypatch) -> None:
+    """Для неизвестных портов smoke остаётся на «/»."""
+    captured: dict[str, str] = {}
+
+    def _fake_smoke(port: int, *, path: str = "/", timeout: float = 1.5):
+        captured["path"] = path
+        return True, "HTTP 200"
+
+    monkeypatch.setattr(dl, "_port_listening", lambda p: True)
+    monkeypatch.setattr(dl, "_http_smoke", _fake_smoke)
+
+    dl._check_one_port(15173, "Vite HMR", smoke=True)
+    assert captured["path"] == "/"

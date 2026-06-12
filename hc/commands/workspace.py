@@ -23,6 +23,7 @@ hc workspace — управление привязкой CLI к локально
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import typer
@@ -35,6 +36,55 @@ from hc.core_source import (
     detect_workspace_root,
     resolve_workspace_root,
 )
+
+
+def _git_summary(repo: Path) -> str | None:
+    """Краткая сводка состояния git-репо: branch, dirty, ahead/behind.
+
+    Возвращает строку вида `master * (3↑1↓)` или None, если не git-репо
+    или git недоступен.
+    """
+    if not (repo / ".git").exists():
+        return None
+    try:
+        branch = subprocess.run(  # noqa: S603
+            ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=3, check=False,
+        ).stdout.strip() or "?"
+
+        dirty = bool(
+            subprocess.run(  # noqa: S603
+                ["git", "-C", str(repo), "status", "--porcelain"],
+                capture_output=True, text=True, timeout=3, check=False,
+            ).stdout.strip()
+        )
+
+        # ahead/behind upstream
+        ab = subprocess.run(  # noqa: S603
+            ["git", "-C", str(repo), "rev-list", "--left-right", "--count",
+             "HEAD...@{u}"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        ahead = behind = 0
+        if ab.returncode == 0 and ab.stdout.strip():
+            parts = ab.stdout.strip().split()
+            if len(parts) == 2:
+                ahead, behind = int(parts[0]), int(parts[1])
+
+        flags = []
+        if dirty:
+            flags.append("*")
+        if ahead or behind:
+            counts = []
+            if ahead:
+                counts.append(f"{ahead}↑")
+            if behind:
+                counts.append(f"{behind}↓")
+            flags.append(f"({''.join(counts)})")
+        suffix = (" " + " ".join(flags)) if flags else ""
+        return f"{branch}{suffix}"
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
 
 
 def _describe_source(path: Path | None) -> tuple[str, str]:
@@ -87,16 +137,19 @@ def register(app: typer.Typer) -> None:
             platform = root / "platform-home-console"
             lines.append("")
             lines.append("Компоненты:")
-            lines.append(
-                f"  core-runtime-service: "
-                + ("[green]✓[/green] " if core.is_dir() else "[red]✗[/red] ")
-                + str(core)
-            )
-            lines.append(
-                f"  platform-home-console: "
-                + ("[green]✓[/green] " if platform.is_dir() else "[yellow]—[/yellow] ")
-                + str(platform)
-            )
+            for label, p in (
+                ("core-runtime-service", core),
+                ("platform-home-console", platform),
+            ):
+                if not p.is_dir():
+                    icon = "[red]✗[/red]" if label == "core-runtime-service" else "[yellow]—[/yellow]"
+                    lines.append(f"  {icon} {label}: {p}")
+                    continue
+                git_info = _git_summary(p)
+                git_suffix = f"  [dim][{git_info}][/dim]" if git_info else "  [dim][не git][/dim]"
+                lines.append(f"  [green]✓[/green] {label}: {p}{git_suffix}")
+            lines.append("")
+            lines.append("[dim]Легенда git:[/dim] [dim]master * (3↑1↓) — branch, dirty, ahead/behind upstream[/dim]")
         else:
             lines.append("")
             lines.append("[yellow]Workspace не задан.[/yellow] CLI работает с")
