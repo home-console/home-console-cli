@@ -1543,11 +1543,106 @@ def _show_failure_logs(console: Console, plan: EnvUpPlan) -> None:
     console.print(f"\n[dim]Полные логи: hc env logs --follow {' '.join(targets)}[/dim]")
 
 
+_FRONTEND_VITE_OVERRIDE = "frontend-vite.hc.yml"
+
+# Исправляет устаревший compose из core-runtime-service:
+# - pnpm dev (все apps) → pnpm --filter=web dev
+# - api:gen перед dev
+# - VITE_CORE_PROXY_TARGET для прокси /api внутри docker-сети
+_FRONTEND_VITE_OVERRIDE_BODY = """\
+services:
+  frontend-vite:
+    environment:
+      VITE_CORE_PROXY_TARGET: http://core-runtime:8000
+    command: >-
+      sh -c "corepack enable && pnpm install --frozen-lockfile && pnpm api:gen && pnpm --filter=web dev -- --host 0.0.0.0 --port 5173"
+"""
+
+
+def _write_frontend_compose_override(plan: EnvUpPlan) -> Path | None:
+    """Сгенерировать compose-override для корректной сборки web-приложения."""
+    if "frontend-vite" not in plan.service_names:
+        return None
+    from hc.constants import DATA_DIR
+
+    path = DATA_DIR / "compose-overrides" / _FRONTEND_VITE_OVERRIDE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() or path.read_text(encoding="utf-8") != _FRONTEND_VITE_OVERRIDE_BODY:
+        path.write_text(_FRONTEND_VITE_OVERRIDE_BODY, encoding="utf-8")
+    return path
+
+
+def _build_compose_env(plan: EnvUpPlan) -> dict[str, str]:
+    """Переменные окружения для docker compose (DB + frontend/caddy)."""
+    env = dict(plan.db_option.env or {})
+    if "frontend-vite" in plan.service_names:
+        # Caddy должен проксировать UI на Vite, а не на пустую ./frontend
+        env.setdefault("CADDYFILE_PATH", "./Caddyfile.hmr")
+    return env
+
+
 def _compose_base_cmd(plan: EnvUpPlan) -> list[str]:
     cmd = ["docker", "compose", "-f", str(plan.project.compose_file)]
+    override = _write_frontend_compose_override(plan)
+    if override:
+        cmd += ["-f", str(override)]
     for cp in sorted(plan.compose_profiles):
         cmd += ["--profile", cp]
     return cmd
+
+
+def _ensure_frontend_static_build(console: Console, plan: EnvUpPlan) -> None:
+    """
+    Если caddy в плане без frontend-vite — нужна статика в deploy/dev/frontend.
+    Собираем pnpm build:web в одноразовом node-контейнере, если index.html нет.
+    """
+    if "frontend-vite" in plan.service_names or "caddy" not in plan.service_names:
+        return
+
+    frontend_dir = plan.project.cwd / "frontend"
+    if (frontend_dir / "index.html").is_file():
+        return
+
+    workspace = _frontend_workspace_path(plan)
+    if not (workspace / "package.json").is_file():
+        console.print(
+            "\n[yellow]![/yellow] [bold]deploy/dev/frontend[/bold] пуст — UI через caddy (:18080) "
+            "не будет работать.\n"
+            "  Добавь [cyan]frontend-vite[/cyan] в env up или склонируй platform-home-console."
+        )
+        return
+
+    hc_root = workspace.parent
+    console.print(
+        f"\n[cyan]→[/cyan] Собираю статику платформы → [bold]{frontend_dir}[/bold] …"
+    )
+    frontend_dir.mkdir(parents=True, exist_ok=True)
+    script = (
+        "set -e; corepack enable; pnpm install --frozen-lockfile; "
+        "pnpm build:web; cp -r apps/web/dist/. /out/"
+    )
+    r = subprocess.run(  # noqa: S603
+        [
+            "docker", "run", "--rm",
+            "-v", f"{hc_root}:/hc",
+            "-v", f"{frontend_dir}:/out",
+            "-w", "/hc/platform-home-console",
+            "node:22-alpine",
+            "sh", "-c", script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    if r.returncode != 0 or not (frontend_dir / "index.html").is_file():
+        err = (r.stderr or r.stdout or "build failed").strip()
+        console.print(f"[red]Не удалось собрать frontend:[/red] {err[:500]}")
+        console.print(
+            "[dim]Подсказка: выбери frontend-vite в env up для HMR вместо статики.[/dim]"
+        )
+        return
+    console.print("[green]✓[/green] Статика платформы собрана")
 
 
 def _print_env_up_dry_run(
@@ -1652,7 +1747,7 @@ def _print_summary(
             urls.append(("UI ", "http://localhost:18080"))
         if "core-runtime" in services:
             urls.append(("API", "http://localhost:18000"))
-        if "frontend-vite" in services:
+        if "frontend-vite" in services and "caddy" not in services:
             urls.append(("HMR", "http://localhost:15173"))
         if "postgres" in services:
             urls.append(("PG ", "localhost:5432"))
@@ -1666,6 +1761,12 @@ def _print_summary(
 
     for label, url in urls:
         console.print(f"  [dim]{label}:[/dim]      [cyan]{url}[/cyan]")
+
+    if mode in ("dev", "dev-reload") and "frontend-vite" in services and "caddy" in services:
+        console.print(
+            "  [dim]vite:[/dim]    [dim]HMR через caddy → :18080 "
+            "(прямой :15173 — только отладка)[/dim]"
+        )
 
     console.print(f"\n  [dim]compose:[/dim] {compose_file}\n")
 
@@ -1741,8 +1842,17 @@ def register(app: typer.Typer) -> None:
                 f"services=[bold]{', '.join(plan.service_names)}[/bold]"
             )
 
+            # frontend-vite в плане → автоклон platform-home-console (без диалога).
+            ok, recreate = _ensure_frontend_workspace(console, plan)
+            if not ok:
+                raise typer.Exit(code=1)
+
+            # caddy без vite → собрать статику в deploy/dev/frontend если пусто.
+            _ensure_frontend_static_build(console, plan)
+
+            # plan.service_names / compose override могли измениться — пересобираем:
             base_cmd = _compose_base_cmd(plan)
-            extra_env = plan.db_option.env or {}
+            extra_env = _build_compose_env(plan)
 
             if pull:
                 _run(
@@ -1750,14 +1860,6 @@ def register(app: typer.Typer) -> None:
                     cwd=plan.project.cwd,
                     extra_env=extra_env,
                 )
-
-            # frontend-vite в плане → автоклон platform-home-console (без диалога).
-            ok, recreate = _ensure_frontend_workspace(console, plan)
-            if not ok:
-                raise typer.Exit(code=1)
-
-            # plan.service_names мог измениться — пересобираем команду:
-            base_cmd = _compose_base_cmd(plan)
 
             needed_ports = _get_needed_ports(plan)
             conflicts = _find_port_conflicts(needed_ports, plan)
