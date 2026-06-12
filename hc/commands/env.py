@@ -2534,10 +2534,8 @@ def register(app: typer.Typer) -> None:
 
             platform_result = PullResult(updated=False)
             if has_platform:
-                # platform часто редактируется руками — не автостешим, просто
-                # пропускаем pull при грязном дереве и предупреждаем.
                 platform_result = pull_git_repo(
-                    platform_path, console, label="platform-home-console", quiet=False, autostash=False
+                    platform_path, console, label="platform-home-console", quiet=False, autostash=True
                 )
 
             changed = [*core_result.changed_files, *platform_result.changed_files]
