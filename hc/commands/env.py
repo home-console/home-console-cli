@@ -588,6 +588,131 @@ def _env_ps_entries(project: ComposeProject) -> list[dict[str, str]]:
     return entries
 
 
+def _print_env_status_dashboard(console: Console, project: ComposeProject) -> None:
+    """Компактный dashboard: статус каждого сервиса + health + uptime + URL.
+
+    Отличается от `env ps` тем, что:
+    - группирует сервисы по состоянию (running/exited/restarting/created),
+    - подсвечивает state цветом,
+    - выводит health-колонку (healthy/unhealthy/starting/—),
+    - в конце даёт блок «URL endpoints» для быстрого копирования.
+    """
+    rows = _compose_ps_rows(project)
+
+    if not rows:
+        console.print(
+            "[yellow]![/yellow] Стек не запущен. Подними: "
+            "[cyan]hc env up[/cyan]"
+        )
+        console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
+        return
+
+    # Сводка по состояниям.
+    state_counts: dict[str, int] = {}
+    for r in rows:
+        state = str(r.get("State") or "unknown").lower()
+        state_counts[state] = state_counts.get(state, 0) + 1
+
+    def _state_chip(state: str, count: int) -> str:
+        colors = {
+            "running":    "green",
+            "exited":     "red",
+            "dead":       "red",
+            "restarting": "yellow",
+            "created":    "dim",
+            "paused":     "yellow",
+        }
+        color = colors.get(state, "white")
+        return f"[{color}]{count} {state}[/{color}]"
+
+    summary = "  ".join(_state_chip(s, n) for s, n in sorted(state_counts.items()))
+    console.print(f"\n[bold]Стек:[/bold]  {summary}")
+
+    table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+    table.add_column("Сервис", min_width=22)
+    table.add_column("State")
+    table.add_column("Health")
+    table.add_column("Uptime", style="dim")
+    table.add_column("URL / порт", style="cyan")
+
+    state_color = {
+        "running":    "green",
+        "exited":     "red",
+        "dead":       "red",
+        "restarting": "yellow",
+        "created":    "dim",
+        "paused":     "yellow",
+    }
+    health_icon = {
+        "healthy":   "[green]✓ healthy[/green]",
+        "unhealthy": "[red]✗ unhealthy[/red]",
+        "starting":  "[yellow]… starting[/yellow]",
+        "":          "[dim]—[/dim]",
+        "none":      "[dim]—[/dim]",
+    }
+
+    # Сортируем для стабильного порядка: running → restarting → exited → прочее.
+    state_order = {"running": 0, "restarting": 1, "exited": 2, "dead": 3}
+    rows_sorted = sorted(
+        rows, key=lambda r: (state_order.get(str(r.get("State") or "").lower(), 9),
+                              str(r.get("Service") or ""))
+    )
+
+    for r in rows_sorted:
+        service = str(r.get("Service") or r.get("Name") or "?")
+        state = str(r.get("State") or "?").lower()
+        health = str(r.get("Health") or "").lower()
+        uptime = str(r.get("RunningFor") or r.get("Status") or "—")
+        url = _KNOWN_ENDPOINTS.get(service, "")
+        ports = str(r.get("Publishers") or r.get("Ports") or "")
+        if not url and ports and ports != "[]":
+            url = ports
+
+        color = state_color.get(state, "white")
+        table.add_row(
+            service,
+            f"[{color}]{state}[/{color}]",
+            health_icon.get(health, f"[dim]{health}[/dim]"),
+            uptime,
+            url or "—",
+        )
+
+    console.print(table)
+
+    # Блок URL endpoints — для быстрого копирования.
+    running_urls = [
+        (str(r.get("Service")), _KNOWN_ENDPOINTS.get(str(r.get("Service") or ""), ""))
+        for r in rows_sorted
+        if str(r.get("State") or "").lower() == "running"
+    ]
+    running_urls = [(s, u) for s, u in running_urls if u]
+    if running_urls:
+        console.print("\n[bold]URL:[/bold]")
+        for s, u in running_urls:
+            console.print(f"  [dim]{s:22}[/dim] {u}")
+
+    # Подсказки при проблемах.
+    troubled = [r for r in rows if str(r.get("State") or "").lower() in {"exited", "dead", "restarting"}]
+    unhealthy = [r for r in rows if str(r.get("Health") or "").lower() == "unhealthy"]
+    if troubled or unhealthy:
+        console.print()
+        for r in troubled:
+            svc = r.get("Service") or "?"
+            console.print(
+                f"[yellow]![/yellow] {svc}: state={r.get('State')}  → "
+                f"[cyan]hc env logs {svc} --tail 200[/cyan]"
+            )
+        for r in unhealthy:
+            svc = r.get("Service") or "?"
+            console.print(
+                f"[yellow]![/yellow] {svc}: unhealthy  → "
+                f"[cyan]hc env logs {svc} --tail 200[/cyan]"
+            )
+        console.print("[dim]Полная диагностика:[/dim] [cyan]hc doctor[/cyan]")
+
+    console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
+
+
 def _print_env_ps(console: Console, project: ComposeProject, *, json_out: bool = False) -> None:
     rows = _compose_ps_rows(project)
     if json_out:
@@ -2164,8 +2289,28 @@ def register(app: typer.Typer) -> None:
         mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
         follow: bool = typer.Option(False, "-f", "--follow", help="Следить за логами"),
         tail: int = typer.Option(100, "--tail", help="Кол-во последних строк"),
+        grep: str | None = typer.Option(
+            None,
+            "--grep",
+            "-g",
+            help="Фильтр regex (case-insensitive) по строкам лога. Работает и с -f.",
+        ),
+        invert: bool = typer.Option(
+            False,
+            "--invert",
+            "-v",
+            help="Инверсия фильтра --grep (показывать строки, НЕ соответствующие).",
+        ),
     ) -> None:
-        """Логи сервисов dev-окружения."""
+        """Логи сервисов dev-окружения.
+
+        Примеры:
+          hc env logs -f                          — стрим всех сервисов
+          hc env logs core-runtime --tail 500     — последние 500 строк ядра
+          hc env logs caddy -f --grep "/api/v1"   — стрим только запросов к API
+          hc env logs core-runtime -g ERROR -g WARN  — несколько паттернов: OR (пока один)
+          hc env logs core-runtime -g 200 -v      — всё кроме «200» в строке
+        """
         console = Console()
         try:
             require_docker(console)
@@ -2182,7 +2327,45 @@ def register(app: typer.Typer) -> None:
             if service:
                 cmd.append(service)
 
-            _run(cmd, cwd=project.cwd)
+            # Простой случай — без фильтра: пробросим вывод docker напрямую, чтобы
+            # сохранить цвета и читаемость. Фильтр включается только когда нужно.
+            if not grep:
+                _run(cmd, cwd=project.cwd)
+                return
+
+            # Фильтрация: подписываемся на stdout/stderr docker compose построчно
+            # и пропускаем через regex. `-f` отлично работает потому что мы
+            # не ждём завершения процесса, а итерируемся по строкам.
+            import re as _re
+
+            try:
+                pattern = _re.compile(grep, _re.IGNORECASE)
+            except _re.error as exc:
+                console.print(f"[red]Ошибка:[/red] невалидный regex '{grep}': {exc}")
+                raise typer.Exit(code=2)
+
+            proc = subprocess.Popen(  # noqa: S603
+                cmd,
+                cwd=str(project.cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            try:
+                assert proc.stdout is not None  # noqa: S101 (для типов)
+                for line in proc.stdout:
+                    match = bool(pattern.search(line))
+                    if match ^ invert:
+                        # Сохраняем перевод строки от docker.
+                        console.file.write(line)
+                        console.file.flush()
+            except KeyboardInterrupt:
+                proc.terminate()
+            finally:
+                rc = proc.wait()
+                if rc not in (0, -15):  # 0 = OK, -15 = SIGTERM (наш Ctrl-C)
+                    raise typer.Exit(code=rc)
 
         except HcCliError as e:
             console.print(f"[red]Ошибка:[/red] {e.message}")
@@ -2194,40 +2377,56 @@ def register(app: typer.Typer) -> None:
     def env_restart(
         service: str | None = typer.Argument(None, help="Сервис (пусто = все запущенные)"),
         mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
-        build: bool = typer.Option(False, "--build", help="Пересобрать образ перед рестартом (только для сервисов build из src)"),
+        build: bool = typer.Option(
+            False,
+            "--build",
+            help="Пересобрать образ перед рестартом (только для сервисов build из src)",
+        ),
+        recreate: bool = typer.Option(
+            False,
+            "--recreate",
+            help=(
+                "Пересоздать контейнер (применяет новые volume mounts / env / "
+                "конфиг-файлы вроде Caddyfile, которые `restart` не подхватит)."
+            ),
+        ),
     ) -> None:
-        """Перезапустить сервис(ы). С --build: пересобрать образ и поднять заново."""
+        """Перезапустить сервис(ы).
+
+        Различия:
+          (по умолчанию)  — `docker compose restart`: быстрый рестарт процесса
+                            в том же контейнере. НЕ подхватит изменения в
+                            Caddyfile, mount, env или env_file.
+          --recreate      — `docker compose up -d --force-recreate`: пересоздаёт
+                            контейнер. Нужно когда поменял Caddyfile, volumes,
+                            env, или хочешь сбросить состояние FS контейнера.
+          --build         — пересобрать образ и поднять заново (для build-из-src).
+        """
         console = Console()
         try:
             require_docker(console)
             mode = mode.strip().lower()
             src = _resolve_source(console)
             project = compose_project_from_source(console, src, mode=mode)
+            base = ["docker", "compose", "-f", str(project.compose_file)]
+            targets = [service] if service else []
+            label = f"[bold]{service}[/bold]" if service else "all"
 
             if build:
-                # rebuild + up (replaces the container)
-                build_targets = [service] if service else []
-                console.print(f"[cyan]→[/cyan] build {'[bold]' + service + '[/bold]' if service else 'all'}")
-                _run(
-                    ["docker", "compose", "-f", str(project.compose_file), "build", *build_targets],
-                    cwd=project.cwd,
-                )
-                up_targets = [service] if service else []
-                _run(
-                    ["docker", "compose", "-f", str(project.compose_file), "up", "-d", *up_targets],
-                    cwd=project.cwd,
-                )
+                console.print(f"[cyan]→[/cyan] build {label}")
+                _run([*base, "build", *targets], cwd=project.cwd)
+                _run([*base, "up", "-d", *targets], cwd=project.cwd)
                 console.print("[green]✓[/green] rebuild + up ok")
                 return
 
-            cmd = ["docker", "compose", "-f", str(project.compose_file), "restart"]
-            if service:
-                cmd.append(service)
-                console.print(f"[cyan]→[/cyan] restart [bold]{service}[/bold]")
-            else:
-                console.print("[cyan]→[/cyan] restart all")
+            if recreate:
+                console.print(f"[cyan]→[/cyan] recreate {label}")
+                _run([*base, "up", "-d", "--force-recreate", *targets], cwd=project.cwd)
+                console.print("[green]✓[/green] recreate ok")
+                return
 
-            _run(cmd, cwd=project.cwd)
+            console.print(f"[cyan]→[/cyan] restart {label}")
+            _run([*base, "restart", *targets], cwd=project.cwd)
             console.print("[green]✓[/green] restart ok")
 
         except HcCliError as e:
@@ -2235,6 +2434,18 @@ def register(app: typer.Typer) -> None:
             if e.hint:
                 console.print(f"[dim]Подсказка:[/dim] {e.hint}")
             raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("reload")
+    def env_reload(
+        service: str | None = typer.Argument(None, help="Сервис (пусто = все запущенные)"),
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+    ) -> None:
+        """Алиас для `restart --recreate` — пересоздать контейнер с новым конфигом.
+
+        Удобно сразу после правки Caddyfile / mount / env. Эквивалент:
+          hc env restart [SERVICE] --recreate
+        """
+        env_restart(service=service, mode=mode, build=False, recreate=True)
 
     @env_app.command("rebuild")
     def env_rebuild(
@@ -2419,8 +2630,15 @@ def register(app: typer.Typer) -> None:
     @env_app.command("status")
     def env_status(
         mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        raw: bool = typer.Option(
+            False, "--raw", help="Сырой `docker compose ps` без обработки."
+        ),
     ) -> None:
-        """Статус контейнеров dev-окружения (сырой docker compose ps)."""
+        """Компактный dashboard dev-стека: контейнеры, health, URL, uptime.
+
+        По умолчанию печатает богатую таблицу + блок URL endpoints. С --raw
+        печатает оригинальный `docker compose ps`.
+        """
         console = Console()
         try:
             require_docker(console)
@@ -2428,13 +2646,17 @@ def register(app: typer.Typer) -> None:
             src = _resolve_source(console)
             project = compose_project_from_source(console, src, mode=mode)
 
-            subprocess.run(  # noqa: S603
-                ["docker", "compose", "-f", str(project.compose_file), "ps"],
-                cwd=str(project.cwd),
-                check=False,
-            )
-            console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
-            console.print(ENV_VS_CORE_DOTENV)
+            if raw:
+                subprocess.run(  # noqa: S603
+                    ["docker", "compose", "-f", str(project.compose_file), "ps"],
+                    cwd=str(project.cwd),
+                    check=False,
+                )
+                console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
+                console.print(ENV_VS_CORE_DOTENV)
+                return
+
+            _print_env_status_dashboard(console, project)
 
         except HcCliError as e:
             console.print(f"[red]Ошибка:[/red] {e.message}")
