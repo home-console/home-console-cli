@@ -17,6 +17,7 @@ REPL_GROUPS: frozenset[str] = frozenset(
         "secrets",
         "marketplace",
         "config",
+        "workspace",
     }
 )
 
@@ -95,6 +96,15 @@ NAV_TREE: dict[str, dict[str, object]] = {
             "edit": {"desc": "Открыть в редакторе", "children": {}},
         },
     },
+    "workspace": {
+        "desc": "Привязка к локальному монорепо разработчика",
+        "children": {
+            "status": {"desc": "Активный workspace и его источник", "children": {}},
+            "set": {"desc": "Записать workspace.path в config", "children": {}},
+            "use": {"desc": "Алиас для set", "children": {}},
+            "unset": {"desc": "Убрать workspace.path из config", "children": {}},
+        },
+    },
     "version": {"desc": "Версия CLI и проверка PyPI", "children": {}},
     "upgrade": {"desc": "Обновить homeconsole-cli", "children": {}},
     "repl": {"desc": "Интерактивный режим", "children": {}},
@@ -126,6 +136,7 @@ _REPL_PRIMARY: tuple[str, ...] = (
     "recovery",
     "reset",
     "config",
+    "workspace",
     "version",
     "upgrade",
     "nav",

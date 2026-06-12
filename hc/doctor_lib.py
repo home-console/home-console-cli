@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import subprocess
@@ -162,10 +163,40 @@ def _checks_modes(cfg: Config | None = None) -> tuple[list[DoctorCheck], dict[st
 def _checks_core_sources() -> tuple[list[DoctorCheck], list[str]]:
     issues: list[str] = []
     checks: list[DoctorCheck] = []
-    if CORE_SRC_DIR.exists():
-        checks.append(DoctorCheck("Core исходники", "ok", str(CORE_SRC_DIR)))
+
+    # Show active workspace first — это даёт сразу понять, монтируется ли
+    # IDE-копия (твой рабочий монорепо) или managed-клон в ~/.local/share/hc.
+    from hc.core_source import resolve_workspace_root
+
+    workspace = resolve_workspace_root()
+    if workspace:
+        source = (
+            "HC_WORKSPACE"
+            if os.environ.get("HC_WORKSPACE", "").strip()
+            else "cwd/config"
+        )
+        checks.append(
+            DoctorCheck(
+                "Workspace (dev)",
+                "ok",
+                f"{workspace}  [{source}]",
+            )
+        )
+        core_root = workspace / "core-runtime-service"
+    else:
+        checks.append(
+            DoctorCheck(
+                "Workspace (dev)",
+                "skip",
+                "не задан → managed-клон  (hc workspace set)",
+            )
+        )
+        core_root = CORE_SRC_DIR
+
+    if core_root.exists():
+        checks.append(DoctorCheck("Core исходники", "ok", str(core_root)))
         for mode, rel in COMPOSE_MODES.items():
-            cf = CORE_SRC_DIR / rel
+            cf = core_root / rel
             checks.append(
                 DoctorCheck(
                     f"  compose [{mode}]",
@@ -173,7 +204,7 @@ def _checks_core_sources() -> tuple[list[DoctorCheck], list[str]]:
                     rel if cf.exists() else f"{rel}  ← не найден",
                 )
             )
-        env_file = CORE_SRC_DIR / ".env"
+        env_file = core_root / ".env"
         checks.append(
             DoctorCheck(
                 "  .env",

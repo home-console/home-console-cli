@@ -59,6 +59,19 @@ class RecoveryConfig:
 
 
 @dataclass(slots=True)
+class WorkspaceConfig:
+    """Привязка к локальному монорепо разработчика.
+
+    Когда задано, hc env/core/etc. используют исходники из этой папки
+    (`<path>/core-runtime-service`, `<path>/platform-home-console`) вместо
+    managed-копий в ~/.local/share/hc. Это позволяет редактировать код
+    в IDE и видеть изменения в контейнерах (live volume mount + watchfiles).
+    """
+
+    path: str = ""  # абсолютный путь к корню монорепо
+
+
+@dataclass(slots=True)
 class DeployConfig:
     # Режим compose для `hc deploy core ...` (deploy-пайплайн: build→push→rollout).
     # dev-image  → deploy/dev/docker-compose.image.yml    (образ + dev-инфра)
@@ -79,6 +92,7 @@ class Config:
     display: DisplayConfig = field(default_factory=DisplayConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     deploy: DeployConfig = field(default_factory=DeployConfig)
+    workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
 
     @classmethod
     def load(cls) -> Self:
@@ -119,6 +133,7 @@ class Config:
         display = data.get("display", {})
         recovery = data.get("recovery", {})
         deploy = data.get("deploy", {})
+        workspace = data.get("workspace", {})
         raw_core_mode = str(deploy.get("core_mode", "dev-image"))
         core_mode = normalize_deploy_core_mode(raw_core_mode)
         migrate_legacy_image = raw_core_mode.strip().lower() == "image"
@@ -147,6 +162,9 @@ class Config:
                 last_tag=str(deploy.get("last_tag", "")),
                 last_image=str(deploy.get("last_image", "")),
             ),
+            workspace=WorkspaceConfig(
+                path=str(workspace.get("path", "")),
+            ),
         )
         if migrate_legacy_image and CONFIG_PATH.exists():
             inst.save()
@@ -174,6 +192,7 @@ class Config:
             "last_tag": self.deploy.last_tag,
             "last_image": self.deploy.last_image,
         }
+        doc["workspace"] = {"path": self.workspace.path}
         payload = doc.as_string()
         tmp_path = CONFIG_PATH.with_suffix(".toml.tmp")
         with _config_lock:

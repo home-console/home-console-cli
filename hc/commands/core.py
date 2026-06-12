@@ -11,6 +11,7 @@ from hc.core_source import (
     get_core_source_from_repo,
     get_core_source_local,
     init_core_source,
+    resolve_workspace_root,
     update_core_source,
 )
 from hc.core_ops import (
@@ -25,14 +26,6 @@ from hc.env_bootstrap import core_env_path, ensure_core_env
 from hc.hints import CORE_DOTENV_HELP, ENV_VS_CORE_DOTENV
 from hc.native_core import native_down, native_logs, native_ps, native_signal, native_up
 
-def _find_repo_root() -> Path | None:
-    here = Path(__file__).resolve()
-    for p in [here, *here.parents]:
-        if (p / "core-runtime-service").exists():
-            return p
-    return None
-
-
 def register(app: typer.Typer) -> None:
     core_app = typer.Typer(
         help="Управление CoreRuntime (docker/native)",
@@ -40,7 +33,7 @@ def register(app: typer.Typer) -> None:
     )
 
     def _resolve_source(console: Console) -> CoreSource:
-        repo_root = _find_repo_root()
+        repo_root = resolve_workspace_root()
         if repo_root:
             src = get_core_source_from_repo(repo_root)
             if src:

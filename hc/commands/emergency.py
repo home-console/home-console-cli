@@ -15,7 +15,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from hc.core_source import get_core_source_from_repo, get_core_source_local
+from hc.core_source import (
+    get_core_source_from_repo,
+    get_core_source_local,
+    resolve_workspace_root,
+)
 from hc.emergency_db import (
     inspect_storage,
     list_api_keys,
@@ -27,16 +31,8 @@ from hc.emergency_db import (
 )
 
 
-def _find_repo_root() -> Path | None:
-    here = Path.cwd().resolve()
-    for p in [here, *here.parents]:
-        if (p / "core-runtime-service").is_dir():
-            return p
-    return None
-
-
 def _resolve_core_root(console: Console) -> Path:
-    repo = _find_repo_root()
+    repo = resolve_workspace_root()
     if repo:
         src = get_core_source_from_repo(repo)
         if src:

@@ -34,6 +34,7 @@ from hc.commands.service import register as register_service
 from hc.commands.event import register as register_event
 from hc.commands.shell_config import register as register_shell_config
 from hc.commands.rollback import register as register_rollback
+from hc.commands.workspace import register as register_workspace
 from hc import __version__
 from hc.update_check import print_update_banner
 from hc.cli_registry import NAV_TREE
@@ -175,6 +176,7 @@ def _register_all() -> None:
     register_event(app)
     register_shell_config(app)
     register_rollback(app)
+    register_workspace(app)
 
 
 _register_all()

@@ -20,6 +20,7 @@ from hc.core_source import (
     get_core_source_local,
     init_core_source,
     init_platform_source,
+    resolve_workspace_root,
 )
 from hc.diagnostics import (
     DetectedIssue,
@@ -162,22 +163,12 @@ _DB_HELP = "sqlite | postgres  (без --db: интерактивный выбо
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-# Known siblings of core-runtime-service that confirm we're in the monorepo root.
-# Without them, a standalone core-runtime-service clone in any parent dir would be mistaken for monorepo.
-_MONOREPO_SIBLINGS = frozenset({"home-console-cli", "packages", "platform-home-console"})
-
-
-def _find_repo_root() -> Path | None:
-    here = Path(__file__).resolve()
-    for p in [here, *here.parents]:
-        if (p / "core-runtime-service").exists():
-            if any((p / s).exists() for s in _MONOREPO_SIBLINGS):
-                return p
-    return None
+# `_find_repo_root` / `_MONOREPO_SIBLINGS` переехали в hc.core_source.
+# Используй `resolve_workspace_root()` — он смотрит HC_WORKSPACE, cwd и конфиг.
 
 
 def _resolve_source(console: Console) -> CoreSource:
-    repo_root = _find_repo_root()
+    repo_root = resolve_workspace_root()
     if repo_root:
         src = get_core_source_from_repo(repo_root)
         if src:
@@ -1869,12 +1860,23 @@ def register(app: typer.Typer) -> None:
                 _print_env_up_dry_run(console, plan, pull=pull, build=build, detach=detach)
                 return
 
+            # Источник исходников: workspace (dev-монорепо) vs managed-клон.
+            # Если используется workspace — печатаем явно, чтобы человек понимал,
+            # что контейнер смонтирует именно его рабочую копию.
+            workspace = resolve_workspace_root()
+            src_path = Path(plan.project.cwd).parent.parent.resolve()
+            if workspace and src_path == (workspace / "core-runtime-service").resolve():
+                src_label = f"[green]workspace[/green] {workspace}"
+            else:
+                src_label = f"managed-клон {src_path}"
+
             console.print(
                 f"\n[cyan]→[/cyan] env up  "
                 f"mode=[bold]{plan.mode}[/bold]  "
                 f"db=[bold]{plan.db_option.key}[/bold]  "
                 f"services=[bold]{', '.join(plan.service_names)}[/bold]"
             )
+            console.print(f"   [dim]src:[/dim] {src_label}")
 
             # frontend-vite в плане → автоклон platform-home-console (без диалога).
             ok, recreate = _ensure_frontend_workspace(console, plan)

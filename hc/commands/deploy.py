@@ -20,6 +20,7 @@ from hc.core_source import (
     CoreSource,
     get_core_source_from_repo,
     get_core_source_local,
+    resolve_workspace_root,
 )
 from hc.errors import (
     CoreSourcesNotFoundError,
@@ -52,29 +53,15 @@ _STACK_ENV_COMPOSE: dict[str, str] = {
 }
 
 
-_MONOREPO_SIBLINGS = frozenset({"home-console-cli", "packages", "platform-home-console"})
-
-
-def _find_repo_root() -> Path | None:
-    here = Path(__file__).resolve()
-    for p in [here, *here.parents]:
-        if (p / "core-runtime-service").exists():
-            if any((p / s).exists() for s in _MONOREPO_SIBLINGS):
-                return p
-    return None
-
-
 def _find_platform_root() -> Path | None:
-    here = Path(__file__).resolve()
-    for p in [here, *here.parents]:
-        candidate = p / "platform-home-console"
-        if candidate.exists():
-            return candidate
+    repo = resolve_workspace_root()
+    if repo and (repo / "platform-home-console").exists():
+        return repo / "platform-home-console"
     return None
 
 
 def _resolve_source(console: Console) -> CoreSource:
-    repo_root = _find_repo_root()
+    repo_root = resolve_workspace_root()
     if repo_root:
         src = get_core_source_from_repo(repo_root)
         if src:

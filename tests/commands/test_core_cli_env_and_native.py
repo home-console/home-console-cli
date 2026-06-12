@@ -22,7 +22,7 @@ def _fake_core_src(tmp_path: Path) -> Path:
 
 def _patch_resolve_local_core(monkeypatch, core_src: Path) -> None:
     """Без монорепы и без кэшированного CORE_SRC_DIR в `hc.core_source`."""
-    monkeypatch.setattr("hc.commands.core._find_repo_root", lambda: None)
+    monkeypatch.setattr("hc.commands.core.resolve_workspace_root", lambda: None)
     monkeypatch.setattr(
         "hc.commands.core.get_core_source_local",
         lambda: CoreSource(path=core_src),

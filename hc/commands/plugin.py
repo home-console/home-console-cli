@@ -20,21 +20,13 @@ from hc.commands._client_helpers import require_client
 from hc.json_output import print_json
 from hc.config import Config
 from hc.core_ops import require_docker
-from hc.core_source import get_core_source_from_repo
+from hc.core_source import get_core_source_from_repo, resolve_workspace_root
 
 _LEVEL_RE = re.compile(r"\s(DEBUG|INFO|WARNING|ERROR)\s")
 
 
-def _find_repo_root() -> Path | None:
-    here = Path.cwd().resolve()
-    for p in [here, *here.parents]:
-        if (p / "core-runtime-service").is_dir():
-            return p
-    return None
-
-
 def _resolve_core_root(console: Console) -> Path:
-    repo = _find_repo_root()
+    repo = resolve_workspace_root()
     if repo:
         src = get_core_source_from_repo(repo)
         if src:

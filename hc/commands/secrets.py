@@ -30,7 +30,12 @@ from rich.console import Console
 from rich.table import Table
 
 from hc.config import Config
-from hc.core_source import COMPOSE_MODES as _COMPOSE_BY_MODE, get_core_source_from_repo, get_core_source_local
+from hc.core_source import (
+    COMPOSE_MODES as _COMPOSE_BY_MODE,
+    get_core_source_from_repo,
+    get_core_source_local,
+    resolve_workspace_root,
+)
 from hc.errors import HcCliError, json_error_payload
 
 
@@ -38,14 +43,6 @@ from hc.errors import HcCliError, json_error_payload
 
 _TOOL = "/app/scripts/secrets_tool.py"
 _SERVICE = "core-runtime"
-
-
-def _find_repo_root() -> Path | None:
-    here = Path(__file__).resolve()
-    for p in [here, *here.parents]:
-        if (p / "core-runtime-service").exists():
-            return p
-    return None
 
 
 def _resolve_compose(mode: str) -> str:
@@ -60,7 +57,7 @@ def _resolve_compose(mode: str) -> str:
 
 
 def _resolve_core_path() -> Path | None:
-    repo = _find_repo_root()
+    repo = resolve_workspace_root()
     if repo:
         src = get_core_source_from_repo(repo)
         if src:

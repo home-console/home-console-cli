@@ -15,7 +15,11 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from hc.config import Config
 from hc.commands.connect import connect_and_save
 from hc.commands._client_helpers import require_client
-from hc.core_source import get_core_source_from_repo, get_core_source_local
+from hc.core_source import (
+    get_core_source_from_repo,
+    get_core_source_local,
+    resolve_workspace_root,
+)
 from hc.core_ops import compose_project_from_source, core_up, require_docker
 from hc import __version__
 from hc.hints import SETUP_ENV_HINT
@@ -66,16 +70,8 @@ def _autofix_port(host: str, port: int, verify_ssl: bool) -> tuple[int, str] | N
     return found, url
 
 
-def _find_repo_root() -> Path | None:
-    here = Path(__file__).resolve()
-    for p in [here, *here.parents]:
-        if (p / "core-runtime-service").exists():
-            return p
-    return None
-
-
 def _maybe_start_core(console: Console, background: bool) -> SetupProcess | None:
-    repo_root = _find_repo_root()
+    repo_root = resolve_workspace_root()
     core_src = None
     if repo_root:
         core_src = get_core_source_from_repo(repo_root)

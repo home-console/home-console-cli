@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -17,6 +18,85 @@ from hc.constants import (
     DEFAULT_PLATFORM_REPO,
     PLATFORM_SRC_DIR,
 )
+
+# Сиблинги, которые подтверждают что найденная папка с core-runtime-service
+# действительно является корнем монорепо разработчика (а не случайным клоном
+# самого core-runtime-service в произвольном parent-каталоге).
+_MONOREPO_SIBLINGS: frozenset[str] = frozenset(
+    {"home-console-cli", "packages", "platform-home-console"}
+)
+
+
+def _looks_like_monorepo(root: Path) -> bool:
+    """True если в `root` есть core-runtime-service + хотя бы один из siblings."""
+    if not (root / "core-runtime-service").is_dir():
+        return False
+    return any((root / s).exists() for s in _MONOREPO_SIBLINGS)
+
+
+def _scan_upwards_for_monorepo(start: Path) -> Path | None:
+    """Подняться вверх от `start` и вернуть первый каталог, похожий на монорепо."""
+    try:
+        start = start.resolve()
+    except (OSError, RuntimeError):
+        return None
+    for p in [start, *start.parents]:
+        if _looks_like_monorepo(p):
+            return p
+    return None
+
+
+def detect_workspace_root() -> Path | None:
+    """
+    Найти корень монорепо разработчика без чтения конфига.
+
+    Источники (в порядке убывания приоритета):
+      1. `HC_WORKSPACE` — явная переменная окружения.
+      2. Текущая рабочая директория (cwd) и её родители.
+      3. Расположение исходников самого CLI (для `pip install -e .`).
+
+    Возвращает None, если ничего не найдено.
+    """
+    env_path = os.environ.get("HC_WORKSPACE", "").strip()
+    if env_path:
+        p = Path(env_path).expanduser()
+        if _looks_like_monorepo(p):
+            return p.resolve()
+
+    cwd_root = _scan_upwards_for_monorepo(Path.cwd())
+    if cwd_root:
+        return cwd_root
+
+    cli_root = _scan_upwards_for_monorepo(Path(__file__).resolve().parent)
+    if cli_root:
+        return cli_root
+
+    return None
+
+
+def resolve_workspace_root() -> Path | None:
+    """То же, что `detect_workspace_root`, но плюс читает workspace.path из конфига.
+
+    Конфиг имеет наинизший приоритет: HC_WORKSPACE и cwd важнее. Это нужно
+    чтобы можно было одноразово переопределить workspace через cd в другую
+    папку, не редактируя конфиг.
+    """
+    found = detect_workspace_root()
+    if found:
+        return found
+
+    try:
+        from hc.config import Config
+
+        cfg_path = Config.load().workspace.path.strip()
+    except Exception:
+        cfg_path = ""
+
+    if cfg_path:
+        p = Path(cfg_path).expanduser()
+        if _looks_like_monorepo(p):
+            return p.resolve()
+    return None
 
 
 # ─── Канонический маппинг режимов → compose-файл ──────────────────────────────

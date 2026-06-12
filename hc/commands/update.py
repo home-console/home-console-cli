@@ -13,7 +13,13 @@ from rich.panel import Panel
 
 from hc.config import Config, normalize_deploy_core_mode
 from hc.core_ops import compose_project_from_source, require_docker
-from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local, VALID_MODES
+from hc.core_source import (
+    VALID_MODES,
+    CoreSource,
+    get_core_source_from_repo,
+    get_core_source_local,
+    resolve_workspace_root,
+)
 from hc.errors import (
     CoreSourcesNotFoundError,
     HealthyTimeoutError,
@@ -23,20 +29,8 @@ from hc.errors import (
 )
 
 
-_MONOREPO_SIBLINGS = frozenset({"home-console-cli", "packages", "platform-home-console"})
-
-
-def _find_repo_root() -> Path | None:
-    here = Path(__file__).resolve()
-    for p in [here, *here.parents]:
-        if (p / "core-runtime-service").exists():
-            if any((p / s).exists() for s in _MONOREPO_SIBLINGS):
-                return p
-    return None
-
-
 def _resolve_source(console: Console) -> CoreSource:
-    repo_root = _find_repo_root()
+    repo_root = resolve_workspace_root()
     if repo_root:
         src = get_core_source_from_repo(repo_root)
         if src:

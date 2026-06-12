@@ -10,7 +10,12 @@ from rich.console import Console
 from rich.panel import Panel
 from hc.constants import CONFIG_PATH, SETUP_LOG_PATH
 from hc.core_ops import compose_project_from_source, require_docker
-from hc.core_source import CoreSource, get_core_source_from_repo, get_core_source_local
+from hc.core_source import (
+    CoreSource,
+    get_core_source_from_repo,
+    get_core_source_local,
+    resolve_workspace_root,
+)
 
 from hc.commands._compose_helpers import compose_file_args, read_env_kv
 
@@ -18,11 +23,7 @@ from hc.commands._compose_helpers import compose_file_args, read_env_kv
 @dataclass(slots=True)
 class RecoveryContext:
     def find_repo_root(self) -> Path | None:
-        here = Path(__file__).resolve()
-        for p in [here, *here.parents]:
-            if (p / "core-runtime-service").exists():
-                return p
-        return None
+        return resolve_workspace_root()
 
     def resolve_source(self, console: Console) -> CoreSource:
         repo_root = self.find_repo_root()

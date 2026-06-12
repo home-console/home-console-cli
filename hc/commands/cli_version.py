@@ -53,26 +53,53 @@ def run_cli_upgrade(console: Console, *, check_only: bool = False) -> int:
             return 0
         console.print("[yellow]pipx не установил новую версию, пробую pip…[/yellow]")
 
-    code = subprocess.run(  # noqa: S603
-        [sys.executable, "-m", "pip", "install", "--upgrade", _PYPI_PACKAGE],
-        check=False,
-    ).returncode
-    if code != 0:
+    proc = _run_quiet(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", _PYPI_PACKAGE]
+    )
+    if proc.returncode != 0:
         console.print("[red]Ошибка:[/red] pip install завершился с ошибкой.")
+        _dump_output(console, proc)
         console.print(f"[dim]Вручную:[/dim] {upgrade_hint()}")
-        return code
+        return proc.returncode
 
     new_ver = _disk_package_version() or __version__
     if _is_newer(latest, new_ver):
         console.print(
             f"[red]Ошибка:[/red] после pip всё ещё {new_ver}, ожидалась {latest}."
         )
+        _dump_output(console, proc)
         console.print(f"[dim]Вручную:[/dim] {upgrade_hint()}")
         return 1
 
     console.print(f"[green]✓[/green] Обновлено до {new_ver} (pip)")
     _reexec(console)
     return 0
+
+
+def _run_quiet(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    """Запустить команду молча, перехватив stdout/stderr."""
+    return subprocess.run(  # noqa: S603
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _dump_output(console: Console, proc: subprocess.CompletedProcess[str]) -> None:
+    """Показать stdout/stderr команды отступом, только если есть содержимое."""
+    for stream_name, data in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+        text = (data or "").strip()
+        if not text:
+            continue
+        # Показываем только последние 20 строк — этого хватает, чтобы понять
+        # ошибку, и не зальёт консоль установкой зависимостей.
+        lines = text.splitlines()
+        if len(lines) > 20:
+            lines = ["…", *lines[-20:]]
+        console.print(f"[dim]── {stream_name} ──[/dim]")
+        for line in lines:
+            console.print(f"[dim]  {line}[/dim]")
 
 
 def _disk_package_version() -> str | None:
@@ -144,32 +171,36 @@ def _upgrade_via_pipx(console: Console, pipx: str, target: str) -> str | None:
     pipx upgrade может завершиться с кодом 0 и текстом «already at latest»,
     хотя на PyPI уже есть новее (устаревший индекс pip). Поэтому всегда
     проверяем фактическую версию и при необходимости делаем --force install.
+
+    ВАЖНО про --pip-args: pipx использует argparse, для которого значения,
+    начинающиеся с `--`, выглядят как новые опции. Поэтому передаём ОДНИМ
+    токеном через `=` (--pip-args=--no-cache-dir), иначе ловим
+    «pipx: error: argument --pip-args: expected one argument».
     """
-    # 1) Обычный upgrade с принудительным обновлением индекса pip.
-    subprocess.run(  # noqa: S603
-        [pipx, "upgrade", _PYPI_PACKAGE, "--pip-args", "--no-cache-dir"],
-        check=False,
-    )
+    # 1) Обычный upgrade (тихо, в случае ошибки покажем хвост лога).
+    proc = _run_quiet([pipx, "upgrade", _PYPI_PACKAGE, "--pip-args=--no-cache-dir"])
     installed = _pipx_package_version(pipx)
     if _version_reached(target, installed):
         return installed
+    if proc.returncode != 0:
+        _dump_output(console, proc)
 
     # 2) Принудительная переустановка конкретной версии с PyPI.
     console.print(f"[dim]→ принудительная переустановка {_PYPI_PACKAGE}=={target}…[/dim]")
-    subprocess.run(  # noqa: S603
+    proc = _run_quiet(
         [
             pipx,
             "install",
             f"{_PYPI_PACKAGE}=={target}",
             "--force",
-            "--pip-args",
-            "--no-cache-dir",
-        ],
-        check=False,
+            "--pip-args=--no-cache-dir",
+        ]
     )
     installed = _pipx_package_version(pipx)
     if _version_reached(target, installed):
         return installed
+    if proc.returncode != 0:
+        _dump_output(console, proc)
 
     return None
 
