@@ -23,6 +23,10 @@ from hc.env_state import load_last_env
 from hc.json_output import print_json
 
 DoctorScope = Literal["full", "quick", "api", "recovery"]
+# Какой набор портов проверяем:
+#   auto — определяется по docker ps (dev-hc-* / prod-hc-*)
+#   dev / prod / all — явный выбор
+PortStack = Literal["auto", "dev", "prod", "all"]
 
 # Порты, по которым doctor пытается понять что слушает / отвечает.
 #
@@ -39,18 +43,25 @@ DoctorScope = Literal["full", "quick", "api", "recovery"]
 #     8080 / 8443   (edge HTTP/HTTPS — не 80/443, чтобы запускать без root)
 #     8000          (Core API напрямую, если CORE_PORT раскомментирован)
 #     5432 / 6379   (PostgreSQL/Redis — если решено публиковать наружу)
+_DEV_PORTS: dict[int, str] = {
+    18080: "UI (caddy)",
+    18000: "Core API",
+    15173: "Vite HMR",
+    15432: "PostgreSQL",
+    16379: "Redis",
+}
+
+_PROD_PORTS: dict[int, str] = {
+    8080: "UI (edge)",
+    8000: "Core API",
+    5432: "PostgreSQL",
+    6379: "Redis",
+}
+
+# Старая константа для обратной совместимости с тестами/импортами.
 CHECK_PORTS: dict[int, str] = {
-    # ── DEV ─────────────────────────────────
-    18080: "UI (caddy, dev)",
-    18000: "Core API (dev)",
-    15173: "Vite HMR (dev)",
-    15432: "PostgreSQL (dev)",
-    16379: "Redis (dev)",
-    # ── PROD ────────────────────────────────
-    8080:  "UI (edge, prod)",
-    8000:  "Core API (prod)",
-    5432:  "PostgreSQL (prod)",
-    6379:  "Redis (prod)",
+    **{p: f"{lbl} (dev)" for p, lbl in _DEV_PORTS.items()},
+    **{p: f"{lbl} (prod)" for p, lbl in _PROD_PORTS.items()},
 }
 
 
@@ -270,42 +281,135 @@ def _http_smoke(port: int, *, timeout: float = 1.5) -> tuple[bool, str]:
         return False, f"err: {type(exc).__name__}"
 
 
-def _checks_ports() -> tuple[list[DoctorCheck], list[str]]:
+def _detect_running_stacks() -> set[str]:
+    """Какие стеки сейчас крутятся: {'dev'} / {'prod'} / {'dev','prod'} / set()."""
+    try:
+        r = subprocess.run(  # noqa: S603
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return set()
+    if r.returncode != 0:
+        return set()
+    names = [n.strip() for n in (r.stdout or "").splitlines() if n.strip()]
+    stacks: set[str] = set()
+    if any(n.startswith("dev-hc-") for n in names):
+        stacks.add("dev")
+    if any(n.startswith("prod-hc-") for n in names):
+        stacks.add("prod")
+    return stacks
+
+
+def _port_listening(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _check_one_port(
+    port: int, label: str, *, smoke: bool
+) -> tuple[DoctorCheck, str | None]:
+    """Вернёт (check, issue_message_or_None)."""
+    if not _port_listening(port):
+        return DoctorCheck(f"  :{port} {label}", "skip", "free"), None
+
+    if not smoke:
+        return DoctorCheck(f"  :{port} {label}", "ok", "listening"), None
+
+    ok, detail = _http_smoke(port)
+    if ok:
+        return DoctorCheck(f"  :{port} {label}", "ok", detail), None
+
+    container_hint = {
+        18080: "docker logs dev-hc-caddy",
+        15173: "docker logs dev-hc-frontend-vite",
+        8080: "docker logs prod-hc-edge",
+    }.get(port, "")
+    issue = f":{port} {label} слушает, но HTTP не отвечает ({detail})."
+    if container_hint:
+        issue += f"  →  {container_hint}"
+    return (
+        DoctorCheck(f"  :{port} {label}", "fail", f"listening, но {detail}"),
+        issue,
+    )
+
+
+def _checks_ports(
+    stack: PortStack = "auto",
+) -> tuple[list[DoctorCheck], list[str]]:
+    """Собрать проверки портов с разбиением на DEV/PROD секции.
+
+    `stack`:
+      auto — определяется по запущенным контейнерам (dev-hc-* / prod-hc-*).
+             Если стек выключен → показываются ТОЛЬКО его listening-порты
+             (свободные скрываются, чтобы не засорять вывод).
+      dev / prod — явный фильтр.
+      all  — показать обе секции полностью (включая free).
+    """
     checks: list[DoctorCheck] = []
     issues: list[str] = []
-    for port, label in CHECK_PORTS.items():
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.3)
-            in_use = s.connect_ex(("127.0.0.1", port)) == 0
 
-        if not in_use:
-            checks.append(DoctorCheck(f"  :{port} {label}", "skip", "free"))
+    running = _detect_running_stacks() if stack == "auto" else set()
+    if stack == "auto":
+        show_dev = "dev" in running or "prod" not in running  # default → dev
+        show_prod = "prod" in running
+        hide_free_dev = not show_dev or "dev" not in running
+        hide_free_prod = not show_prod or "prod" not in running
+    elif stack == "dev":
+        show_dev, show_prod = True, False
+        hide_free_dev = hide_free_prod = False
+    elif stack == "prod":
+        show_dev, show_prod = False, True
+        hide_free_dev = hide_free_prod = False
+    else:  # all
+        show_dev = show_prod = True
+        hide_free_dev = hide_free_prod = False
+
+    sections: list[tuple[str, dict[int, str], bool]] = []
+    if show_dev:
+        sections.append(("DEV", _DEV_PORTS, hide_free_dev))
+    if show_prod:
+        sections.append(("PROD", _PROD_PORTS, hide_free_prod))
+
+    for header, ports, hide_free in sections:
+        section_checks: list[DoctorCheck] = []
+        for port, label in ports.items():
+            check, issue = _check_one_port(
+                port, label, smoke=port in _HTTP_SMOKE_PORTS
+            )
+            if hide_free and check.status == "skip":
+                continue
+            section_checks.append(check)
+            if issue:
+                issues.append(issue)
+
+        if not section_checks:
             continue
 
-        if port in _HTTP_SMOKE_PORTS:
-            ok, detail = _http_smoke(port)
-            if ok:
-                checks.append(DoctorCheck(f"  :{port} {label}", "ok", detail))
-            else:
-                checks.append(
-                    DoctorCheck(
-                        f"  :{port} {label}",
-                        "fail",
-                        f"listening, но {detail}",
-                    )
+        # Заголовок секции (без статуса, в детали — подсказка).
+        tag = "(stopped)" if header.lower() not in running and stack == "auto" else ""
+        checks.append(
+            DoctorCheck(
+                f"Порты [{header}]",
+                "info",
+                tag.strip(),
+            )
+        )
+        checks.extend(section_checks)
+
+    if stack == "auto" and not running:
+        # Если ни один стек не поднят — добавим info-строку, чтобы не выглядело
+        # будто вообще ничего не проверилось.
+        if not checks:
+            checks.append(
+                DoctorCheck(
+                    "Порты", "info", "контейнеры не запущены — нечего слушать"
                 )
-                # Подсказка, чьи логи смотреть: dev-hc-* для dev, prod-hc-* для prod.
-                container_hint = {
-                    18080: "docker logs dev-hc-caddy",
-                    15173: "docker logs dev-hc-frontend-vite",
-                    8080: "docker logs prod-hc-edge",
-                }.get(port, "")
-                issues.append(
-                    f":{port} {label} слушает, но HTTP не отвечает ({detail}). "
-                    + (f"Проверь логи: {container_hint}" if container_hint else "")
-                )
-        else:
-            checks.append(DoctorCheck(f"  :{port} {label}", "ok", "listening"))
+            )
 
     return checks, issues
 
@@ -476,7 +580,12 @@ def _checks_runtime_logs() -> tuple[list[DoctorCheck], list[str]]:
     return checks, issues
 
 
-def run_doctor(console: Console, *, scope: DoctorScope) -> DoctorReport:
+def run_doctor(
+    console: Console,
+    *,
+    scope: DoctorScope,
+    stack: PortStack = "auto",
+) -> DoctorReport:
     report = DoctorReport(scope=scope)
     cfg = Config.load() if CONFIG_PATH.exists() else Config()
 
@@ -507,7 +616,7 @@ def run_doctor(console: Console, *, scope: DoctorScope) -> DoctorReport:
         report.issues.extend(src_issues)
 
     if scope == "full":
-        port_checks, port_issues = _checks_ports()
+        port_checks, port_issues = _checks_ports(stack=stack)
         report.checks.extend(port_checks)
         report.issues.extend(port_issues)
         disk_checks, disk_issues = _checks_disk()

@@ -1970,6 +1970,16 @@ def register(app: typer.Typer) -> None:
         )
         console.print(f"[green]✓[/green] Rollback → {resolved_image}:{resolved_tag} done")
 
+    @deploy_app.command("doctor")
+    def deploy_doctor(
+        quick: bool = typer.Option(False, "--quick", "-q"),
+        json_out: bool = typer.Option(False, "--json"),
+    ) -> None:
+        """Алиас `hc doctor --prod` — диагностика PROD-стека."""
+        from hc.commands.doctor import run_doctor_cmd
+
+        run_doctor_cmd(quick=quick, prod=True, json_out=json_out)
+
     deploy_app.add_typer(cfg_app, name="config")
     deploy_app.add_typer(core_app, name="core")
     deploy_app.add_typer(dev_app, name="dev")

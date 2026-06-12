@@ -41,6 +41,7 @@ NAV_TREE: dict[str, dict[str, object]] = {
             "stats": {"desc": "CPU/RAM/NET (--watch)", "children": {}},
             "health": {"desc": "Healthcheck сервисов", "children": {}},
             "clean": {"desc": "Очистить orphan Docker images/volumes", "children": {}},
+            "doctor": {"desc": "Диагностика DEV-стека (алиас hc doctor --dev)", "children": {}},
             "dotenv": {
                 "desc": "Управление .env файлом core-runtime-service",
                 "children": {
@@ -69,6 +70,7 @@ NAV_TREE: dict[str, dict[str, object]] = {
             "stack": {"desc": "Полный image stack (dev|prod)", "children": {}},
             "rollback": {"desc": "Откат core на тег (или last_tag из config)", "children": {}},
             "config": {"desc": "Параметры deploy по умолчанию", "children": {}},
+            "doctor": {"desc": "Диагностика PROD-стека (алиас hc doctor --prod)", "children": {}},
         },
     },
     "rollback": {"desc": "Откат core-runtime на тег (или последний задеплоенный)", "children": {}},
@@ -84,7 +86,7 @@ NAV_TREE: dict[str, dict[str, object]] = {
     "recovery": {"desc": "Recovery-стек (db, backup, compose)", "children": {}},
     "reset": {"desc": "Сброс конфига/кэша", "children": {}},
     "doctor": {
-        "desc": "Диагностика: --quick | --api | полная",
+        "desc": "Диагностика: --quick | --api | --dev | --prod | --all",
         "children": {},
     },
     "marketplace": {"desc": "Каталог плагинов", "children": {}},

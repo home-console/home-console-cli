@@ -2852,4 +2852,14 @@ def register(app: typer.Typer) -> None:
                 console.print(f"[dim]Подсказка:[/dim] {e.hint}")
             raise typer.Exit(code=int(e.exit_code or 1))
 
+    @env_app.command("doctor")
+    def env_doctor(
+        quick: bool = typer.Option(False, "--quick", "-q"),
+        json_out: bool = typer.Option(False, "--json"),
+    ) -> None:
+        """Алиас `hc doctor --dev` — диагностика DEV-стека."""
+        from hc.commands.doctor import run_doctor_cmd
+
+        run_doctor_cmd(quick=quick, dev=True, json_out=json_out)
+
     app.add_typer(env_app, name="env")
