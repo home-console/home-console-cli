@@ -32,6 +32,7 @@ from hc.env_bootstrap import ensure_core_env
 from hc.env_state import load_last_env, save_last_env
 from hc.errors import CoreSourcesNotFoundError, HcCliError
 from hc.hints import ENV_STACK_HELP, ENV_VS_CORE_DOTENV
+from hc.constants import QUESTIONARY_STYLE_KWARGS
 from hc.json_output import print_json
 from hc.vault_ops import (
     DbKind,
@@ -523,17 +524,8 @@ def _compose_with_profiles(
 
 
 # Дефолтные публичные порты для подсказок в `hc env ps` / status.
-# Стек DEV использует префикс «1» (18080/18000/15432/16379/15173), prod —
-# стандартные (8080/8000/5432/6379). dev-hc-* контейнеры → DEV порты.
-_KNOWN_ENDPOINTS: dict[str, str] = {
-    "core-runtime": "http://localhost:18000",
-    "caddy": "http://localhost:18080",
-    "edge": "http://localhost:8080",
-    "frontend-vite": "http://localhost:15173",
-    "postgres": "localhost:15432",
-    "platform-web": "http://localhost:3000",
-    "redis": "localhost:16379",
-}
+# Используй KNOWN_ENDPOINTS из hc.constants.
+from hc.constants import KNOWN_ENDPOINTS
 
 
 def _compose_ps_rows(project: ComposeProject) -> list[dict[str, object]]:
@@ -582,7 +574,7 @@ def _env_ps_entries(project: ComposeProject) -> list[dict[str, str]]:
                 "service": service,
                 "state": str(row.get("State") or row.get("Status") or "?"),
                 "ports": ports,
-                "url_hint": _KNOWN_ENDPOINTS.get(service, ""),
+                "url_hint": KNOWN_ENDPOINTS.get(service, ""),
             }
         )
     return entries
@@ -663,7 +655,7 @@ def _print_env_status_dashboard(console: Console, project: ComposeProject) -> No
         state = str(r.get("State") or "?").lower()
         health = str(r.get("Health") or "").lower()
         uptime = str(r.get("RunningFor") or r.get("Status") or "—")
-        url = _KNOWN_ENDPOINTS.get(service, "")
+        url = KNOWN_ENDPOINTS.get(service, "")
         ports = str(r.get("Publishers") or r.get("Ports") or "")
         if not url and ports and ports != "[]":
             url = ports
@@ -681,7 +673,7 @@ def _print_env_status_dashboard(console: Console, project: ComposeProject) -> No
 
     # Блок URL endpoints — для быстрого копирования.
     running_urls = [
-        (str(r.get("Service")), _KNOWN_ENDPOINTS.get(str(r.get("Service") or ""), ""))
+        (str(r.get("Service")), KNOWN_ENDPOINTS.get(str(r.get("Service") or ""), ""))
         for r in rows_sorted
         if str(r.get("State") or "").lower() == "running"
     ]
@@ -828,14 +820,7 @@ def _pick_services_interactive(
             hint="pip install questionary",
         )
 
-    style = QStyle([
-        ("qmark",       "fg:#00bfff bold"),
-        ("question",    "bold"),
-        ("pointer",     "fg:#00bfff bold"),
-        ("highlighted", "fg:#00bfff bold"),
-        ("selected",    "fg:#00ff00"),
-        ("instruction", "fg:#808080 italic"),
-    ])
+    style = QStyle(list(QUESTIONARY_STYLE_KWARGS.items()))
 
     choices = []
     for s in available:
@@ -879,14 +864,7 @@ def _pick_db_interactive(running: set[str], *, preferred_db: str | None = None) 
             hint="pip install questionary",
         )
 
-    style = QStyle([
-        ("qmark",       "fg:#00bfff bold"),
-        ("question",    "bold"),
-        ("pointer",     "fg:#00bfff bold"),
-        ("highlighted", "fg:#00bfff bold"),
-        ("selected",    "fg:#00ff00"),
-        ("instruction", "fg:#808080 italic"),
-    ])
+    style = QStyle(list(QUESTIONARY_STYLE_KWARGS.items()))
 
     choices = []
     for opt in _DB_OPTIONS:
@@ -1336,19 +1314,12 @@ def _offer_resolve_conflicts(
         from questionary import Style as QStyle
     except ImportError:
         raise HcCliError(
-            message="Конфликт портов.",
+            message="Пакет questionary не установлен.",
             exit_code=1,
-            hint="Останови контейнеры: docker stop <name>  или убей процесс: kill <pid>",
+            hint="pip install questionary",
         )
 
-    style = QStyle([
-        ("qmark",       "fg:#00bfff bold"),
-        ("question",    "bold"),
-        ("pointer",     "fg:#00bfff bold"),
-        ("highlighted", "fg:#00bfff bold"),
-        ("selected",    "fg:#ffaa00"),
-        ("instruction", "fg:#808080 italic"),
-    ])
+    style = QStyle(list(QUESTIONARY_STYLE_KWARGS.items()))
 
     choices = []
     for c in conflicts:

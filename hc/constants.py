@@ -34,3 +34,33 @@ DEFAULT_PORT = 8080
 
 API_PREFIX = "/api"
 
+# Dev stack ports (prefix "1" for dev, standard for prod)
+PORT_CORE_RUNTIME = 18000
+PORT_CADDY = 18080
+PORT_EDGE = 8080
+PORT_FRONTEND_VITE = 15173
+PORT_POSTGRES = 15432
+PORT_REDIS = 16379
+PORT_PLATFORM_WEB = 3000
+
+# Known service → URL mappings for `hc env ps` / status
+KNOWN_ENDPOINTS: dict[str, str] = {
+    "core-runtime": f"http://localhost:{PORT_CORE_RUNTIME}",
+    "caddy": f"http://localhost:{PORT_CADDY}",
+    "edge": f"http://localhost:{PORT_EDGE}",
+    "frontend-vite": f"http://localhost:{PORT_FRONTEND_VITE}",
+    "postgres": f"localhost:{PORT_POSTGRES}",
+    "platform-web": f"http://localhost:{PORT_PLATFORM_WEB}",
+    "redis": f"localhost:{PORT_REDIS}",
+}
+
+# Shared questionary style for interactive prompts
+QUESTIONARY_STYLE_KWARGS: dict[str, str] = {
+    "qmark": "fg:#00bfff bold",
+    "question": "bold",
+    "pointer": "fg:#00bfff bold",
+    "highlighted": "fg:#00bfff bold",
+    "selected": "fg:#00ff00",
+    "instruction": "fg:#808080 italic",
+}
+

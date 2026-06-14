@@ -19,6 +19,7 @@ def _make_plan(tmp_path: Path, services: list[str]) -> SimpleNamespace:
         compose_profiles=["frontend"] if "frontend-vite" in services else [],
         db_option=SimpleNamespace(env={"POSTGRES_HOST": "postgres"}),
         project=project,
+        mode="dev-reload",
     )
 
 
