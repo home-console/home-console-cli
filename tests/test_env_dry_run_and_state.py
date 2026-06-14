@@ -47,13 +47,13 @@ def test_env_up_dry_run(monkeypatch, env_modules) -> None:
         def cwd(self) -> Path:
             return self.compose_file.parent
 
-    monkeypatch.setattr(env_mod, "_resolve_source", lambda console: _Src())
+    monkeypatch.setattr("hc.commands.env._resolve._resolve_source", lambda console: _Src())
     monkeypatch.setattr(
         env_mod,
         "compose_project_from_source",
         lambda console, src, mode=None: _Project(),  # noqa: ANN001
     )
-    monkeypatch.setattr(env_mod, "_get_running_services", lambda *a, **k: set())
+    monkeypatch.setattr("hc.commands.env._compose._get_running_services", lambda *a, **k: set())
 
     from hc.main import app
 
@@ -95,7 +95,7 @@ def test_env_up_platform_profile_auto_uses_dev_image(monkeypatch, env_modules) -
         def cwd(self) -> Path:
             return self.compose_file.parent
 
-    monkeypatch.setattr(env_mod, "_resolve_source", lambda console: _Src())
+    monkeypatch.setattr("hc.commands.env._resolve._resolve_source", lambda console: _Src())
     monkeypatch.setattr(
         env_mod,
         "compose_project_from_source",
@@ -139,7 +139,7 @@ def test_env_down_dry_run(monkeypatch, env_modules) -> None:
         def cwd(self) -> Path:
             return self.compose_file.parent
 
-    monkeypatch.setattr(env_mod, "_resolve_source", lambda console: _Src())
+    monkeypatch.setattr("hc.commands.env._resolve._resolve_source", lambda console: _Src())
     monkeypatch.setattr(
         env_mod,
         "compose_project_from_source",
@@ -177,7 +177,7 @@ def test_last_env_written_on_up_dry_run(env_modules, monkeypatch) -> None:
         def cwd(self) -> Path:
             return self.compose_file.parent
 
-    monkeypatch.setattr(env_mod, "_resolve_source", lambda console: _Src())
+    monkeypatch.setattr("hc.commands.env._resolve._resolve_source", lambda console: _Src())
     monkeypatch.setattr(
         env_mod,
         "compose_project_from_source",
@@ -218,20 +218,20 @@ def test_env_up_creates_core_env_before_compose(env_modules, monkeypatch) -> Non
     calls: list[list[str]] = []
     ensured: list[Path] = []
 
-    monkeypatch.setattr(env_mod, "_resolve_source", lambda console: _Src())
+    monkeypatch.setattr("hc.commands.env._resolve._resolve_source", lambda console: _Src())
     monkeypatch.setattr(
         env_mod,
         "compose_project_from_source",
         lambda console, src, mode=None: _Project(),  # noqa: ANN001
     )
-    monkeypatch.setattr(env_mod, "_get_running_services", lambda *a, **k: set())
-    monkeypatch.setattr(env_mod, "_try_pull_source", lambda src, console: None)
+    monkeypatch.setattr("hc.commands.env._compose._get_running_services", lambda *a, **k: set())
+    monkeypatch.setattr("hc.commands.env._git._try_pull_source", lambda src, console: None)
     monkeypatch.setattr(env_mod, "ensure_core_env", lambda console, path: ensured.append(path))
     monkeypatch.setattr(env_mod, "_run", lambda cmd, cwd=None, extra_env=None: calls.append(cmd))
     # Disable upstream pre-flight side effects that would shell out to docker/lsof.
     monkeypatch.setattr(env_mod, "_check_disk_space", lambda console: None)
-    monkeypatch.setattr(env_mod, "_get_needed_ports", lambda plan: {})
-    monkeypatch.setattr(env_mod, "_find_port_conflicts", lambda needed, plan: [])
+    monkeypatch.setattr("hc.commands.env._diagnostics._get_needed_ports", lambda plan: {})
+    monkeypatch.setattr("hc.commands.env._diagnostics._find_port_conflicts", lambda needed, plan: [])
 
     from hc.main import app
 

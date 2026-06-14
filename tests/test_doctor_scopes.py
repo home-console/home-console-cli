@@ -121,7 +121,7 @@ def test_env_ps_json(monkeypatch, runner: CliRunner, isolated_home) -> None:
         def cwd(self) -> Path:
             return self.compose_file.parent
 
-    monkeypatch.setattr(env_mod, "_resolve_source", lambda console: _Src())
+    monkeypatch.setattr("hc.commands.env._resolve._resolve_source", lambda console: _Src())
     monkeypatch.setattr(
         env_mod,
         "compose_project_from_source",

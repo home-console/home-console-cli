@@ -42,7 +42,7 @@ def test_env_pull_clean_tree(env_mod, monkeypatch, tmp_path: Path) -> None:
     class _Src:
         path = src_path
 
-    monkeypatch.setattr(env_mod, "_resolve_source", lambda console: _Src())
+    monkeypatch.setattr("hc.commands.env._resolve._resolve_source", lambda console: _Src())
 
     calls: list[list[str]] = []
 
@@ -81,7 +81,7 @@ def test_env_ps_json_table(env_mod, monkeypatch) -> None:
         def cwd(self) -> Path:
             return self.compose_file.parent
 
-    monkeypatch.setattr(env_mod, "_resolve_source", lambda console: _Src())
+    monkeypatch.setattr("hc.commands.env._resolve._resolve_source", lambda console: _Src())
     monkeypatch.setattr(
         env_mod,
         "compose_project_from_source",
@@ -129,7 +129,7 @@ def _stub_project(env_mod, monkeypatch) -> None:
         def cwd(self) -> Path:
             return self.compose_file.parent
 
-    monkeypatch.setattr(env_mod, "_resolve_source", lambda console: _Src())
+    monkeypatch.setattr("hc.commands.env._resolve._resolve_source", lambda console: _Src())
     monkeypatch.setattr(
         env_mod,
         "compose_project_from_source",
@@ -277,7 +277,7 @@ def test_env_exec_builds_compose_cmd(env_mod, monkeypatch) -> None:
         def cwd(self) -> Path:
             return self.compose_file.parent
 
-    monkeypatch.setattr(env_mod, "_resolve_source", lambda console: _Src())
+    monkeypatch.setattr("hc.commands.env._resolve._resolve_source", lambda console: _Src())
     monkeypatch.setattr(
         env_mod,
         "compose_project_from_source",
