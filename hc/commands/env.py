@@ -2970,8 +2970,10 @@ def register(app: typer.Typer) -> None:
         if resolved_ssh:
             remote_file = env_path or f"{cfg.deploy.path}/.env"
             import shlex as _shlex
+            # Atomic write: write to temp file, then mv (prevents corruption on disconnect)
+            remote_tmp = f"{remote_file}.tmp.$$"
             p2 = subprocess.run(  # noqa: S603
-                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_file)}"],
+                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_tmp)} && mv {_shlex.quote(remote_tmp)} {_shlex.quote(remote_file)}"],
                 input=new_text, capture_output=True, text=True, check=False,
             )
             if p2.returncode != 0:
@@ -3024,8 +3026,9 @@ def register(app: typer.Typer) -> None:
         if resolved_ssh:
             import shlex as _shlex
             remote_file = env_path or f"{cfg.deploy.path}/.env"
+            remote_tmp = f"{remote_file}.tmp.$$"
             p2 = subprocess.run(  # noqa: S603
-                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_file)}"],
+                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_tmp)} && mv {_shlex.quote(remote_tmp)} {_shlex.quote(remote_file)}"],
                 input=new_text, capture_output=True, text=True, check=False,
             )
             if p2.returncode != 0:
@@ -3076,7 +3079,7 @@ def register(app: typer.Typer) -> None:
             new_text = open(tmp_path).read()  # noqa: WPS515
             os.unlink(tmp_path)
             p2 = subprocess.run(  # noqa: S603
-                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_file)}"],
+                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_tmp)} && mv {_shlex.quote(remote_tmp)} {_shlex.quote(remote_file)}"],
                 input=new_text, capture_output=True, text=True, check=False,
             )
             if p2.returncode != 0:
