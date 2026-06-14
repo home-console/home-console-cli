@@ -128,8 +128,7 @@ def test_env_ps_json(monkeypatch, runner: CliRunner, isolated_home) -> None:
         lambda console, src, mode=None: _Project(),  # noqa: ANN001
     )
     monkeypatch.setattr(
-        env_mod,
-        "_compose_ps_rows",
+        "hc.commands.env._compose._compose_ps_rows",
         lambda project: [  # noqa: ANN001
             {"Service": "core-runtime", "State": "running", "Ports": "0.0.0.0:18000->8000/tcp"}
         ],
