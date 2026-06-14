@@ -17,12 +17,12 @@ def runner() -> CliRunner:
 def _setup_common_mocks(monkeypatch, tmp_path: Path) -> None:
     """Замокать всё внешнее: docker, source resolution, compose project."""
     monkeypatch.setattr("hc.main.print_update_banner", lambda *a, **k: None)
-    monkeypatch.setattr("hc.commands.env.require_docker", lambda _console: None)
+    monkeypatch.setattr("hc.commands.env._register.require_docker", lambda _console: None)
     monkeypatch.setattr(
-        "hc.commands.env._resolve_source", lambda _console: CoreSource(path=tmp_path)
+        "hc.commands.env._register._resolve_source", lambda _console: CoreSource(path=tmp_path)
     )
     monkeypatch.setattr(
-        "hc.commands.env.compose_project_from_source",
+        "hc.commands.env._register.compose_project_from_source",
         lambda _console, _src, mode="dev-reload": type(
             "P", (), {"compose_file": tmp_path / "compose.yml", "cwd": tmp_path}
         )(),
@@ -41,13 +41,13 @@ def test_env_reset_vault_postgres_explicit(monkeypatch, runner: CliRunner, isola
             success=True,
         )
 
-    monkeypatch.setattr("hc.commands.env.reset_vault_postgres", fake_reset_pg)
+    monkeypatch.setattr("hc.commands.env._register.reset_vault_postgres", fake_reset_pg)
     monkeypatch.setattr(
-        "hc.commands.env.reset_vault_sqlite",
+        "hc.commands.env._register.reset_vault_sqlite",
         lambda **kw: pytest.fail("sqlite reset called when --db=postgres"),
     )
     # core-runtime не запущен → restart не делаем.
-    monkeypatch.setattr("hc.commands.env._get_running_services", lambda *a, **k: set())
+    monkeypatch.setattr("hc.commands.env._register._get_running_services", lambda *a, **k: set())
 
     from hc.main import app
 
@@ -61,17 +61,17 @@ def test_env_reset_vault_auto_picks_postgres_when_running(
     monkeypatch, runner: CliRunner, isolated_home, tmp_path: Path
 ) -> None:
     _setup_common_mocks(monkeypatch, tmp_path)
-    monkeypatch.setattr("hc.commands.env.detect_running_db", lambda *a, **k: "postgres")
+    monkeypatch.setattr("hc.commands.env._register.detect_running_db", lambda *a, **k: "postgres")
 
     def fake_reset_pg(**kw) -> VaultResetResult:
         return VaultResetResult(db="postgres", actions=["ok"], success=True)
 
-    monkeypatch.setattr("hc.commands.env.reset_vault_postgres", fake_reset_pg)
+    monkeypatch.setattr("hc.commands.env._register.reset_vault_postgres", fake_reset_pg)
     monkeypatch.setattr(
-        "hc.commands.env.reset_vault_sqlite",
+        "hc.commands.env._register.reset_vault_sqlite",
         lambda **kw: pytest.fail("sqlite reset called in auto/postgres"),
     )
-    monkeypatch.setattr("hc.commands.env._get_running_services", lambda *a, **k: set())
+    monkeypatch.setattr("hc.commands.env._register._get_running_services", lambda *a, **k: set())
 
     from hc.main import app
 
@@ -96,17 +96,17 @@ def test_env_reset_vault_restarts_core_when_running(
 ) -> None:
     _setup_common_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr(
-        "hc.commands.env.reset_vault_sqlite",
+        "hc.commands.env._register.reset_vault_sqlite",
         lambda **kw: VaultResetResult(db="sqlite", actions=["removed vault.db"], success=True),
     )
-    monkeypatch.setattr("hc.commands.env._get_running_services", lambda *a, **k: {"core-runtime", "redis"})
+    monkeypatch.setattr("hc.commands.env._register._get_running_services", lambda *a, **k: {"core-runtime", "redis"})
 
     restart_calls: list[list[str]] = []
 
     def fake_run(cmd, **kw):
         restart_calls.append(list(cmd))
 
-    monkeypatch.setattr("hc.commands.env._run", fake_run)
+    monkeypatch.setattr("hc.commands.env._register._run", fake_run)
 
     from hc.main import app
 
@@ -123,12 +123,12 @@ def test_env_reset_vault_propagates_failure(
 ) -> None:
     _setup_common_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr(
-        "hc.commands.env.reset_vault_postgres",
+        "hc.commands.env._register.reset_vault_postgres",
         lambda **kw: VaultResetResult(
             db="postgres", actions=[], success=False, message="psql failed"
         ),
     )
-    monkeypatch.setattr("hc.commands.env._get_running_services", lambda *a, **k: set())
+    monkeypatch.setattr("hc.commands.env._register._get_running_services", lambda *a, **k: set())
 
     from hc.main import app
 

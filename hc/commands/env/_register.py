@@ -1,0 +1,3259 @@
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from hc.config import Config
+from hc.core_ops import ComposeProject, compose_project_from_source, require_docker
+from hc.core_source import (
+    CoreSource,
+    get_core_source_from_repo,
+    get_core_source_local,
+    init_core_source,
+    init_platform_source,
+    resolve_workspace_root,
+)
+from hc.diagnostics import (
+    DetectedIssue,
+    detect_issues,
+    fetch_container_logs,
+    list_compose_containers,
+)
+from hc.env_bootstrap import ensure_core_env
+from hc.env_state import load_last_env, save_last_env
+from hc.errors import CoreSourcesNotFoundError, HcCliError
+from hc.hints import ENV_STACK_HELP, ENV_VS_CORE_DOTENV
+from hc.constants import QUESTIONARY_STYLE_KWARGS
+from hc.json_output import print_json
+from hc.vault_ops import (
+    DbKind,
+    detect_running_db,
+    reset_vault_postgres,
+    reset_vault_sqlite,
+)
+
+
+# ─── Service catalogue ────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class _Svc:
+    name: str
+    label: str
+    default: bool
+    compose_profile: str | None = None
+
+
+# Postgres is NOT listed here — it's selected via the DB radio button, not the service checkbox.
+_SERVICES: dict[str, list[_Svc]] = {
+    "dev": [
+        _Svc("core-runtime", "core-runtime  (Python бэкенд, build из src)",    default=True),
+        _Svc("caddy",        "caddy         (edge proxy / статика)",            default=True),
+        _Svc("redis",        "redis         (кэш / event bus)",                 default=False),
+    ],
+    "dev-reload": [
+        _Svc("core-runtime",  "core-runtime   (Python hot-reload + watchfiles)", default=True),
+        _Svc("caddy",         "caddy          (edge proxy / статика)",           default=True),
+        _Svc("redis",         "redis          (кэш / event bus)",                default=False),
+        _Svc("frontend-vite", "frontend-vite  (Vite HMR :15173)",               default=False,
+             compose_profile="frontend"),
+    ],
+    "dev-image": [
+        _Svc("core-runtime", "core-runtime   (образ из registry)", default=True),
+        _Svc("edge",         "edge           (caddy proxy)",        default=True),
+        _Svc("redis",        "redis          (кэш / event bus)",   default=False),
+        _Svc("platform-web", "platform-web   (фронтенд образ)",    default=False),
+    ],
+}
+
+_PROFILE_DEFAULT_MODE: dict[str, str] = {
+    "base": "dev-reload",
+    "backend": "dev-reload",
+    "platform": "dev-image",
+    "hmr": "dev-reload",
+    "full": "dev-image",
+}
+
+_PROFILES: dict[str, dict[str, list[str]]] = {
+    "base": {
+        "dev": ["core-runtime", "caddy"],
+        "dev-reload": ["core-runtime", "caddy"],
+        "dev-image": ["core-runtime", "edge"],
+    },
+    "backend": {
+        "dev": ["redis", "core-runtime", "caddy"],
+        "dev-reload": ["redis", "core-runtime", "caddy"],
+        "dev-image": ["redis", "core-runtime", "edge"],
+    },
+    "platform": {
+        "dev-image": ["core-runtime", "edge", "platform-web"],
+    },
+    "hmr": {
+        "dev-reload": ["redis", "core-runtime", "caddy", "frontend-vite"],
+    },
+    "full": {
+        "dev-image": ["redis", "core-runtime", "edge", "platform-web"],
+    },
+}
+
+
+# ─── DB options (radio) ───────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class _DbOption:
+    key: str
+    label: str
+    env: dict[str, str] = field(default_factory=dict)
+    service: str | None = None          # extra compose service name
+    compose_profile: str | None = None  # docker compose --profile flag for that service
+
+
+_DB_OPTIONS: list[_DbOption] = [
+    _DbOption(
+        key="sqlite",
+        label="SQLite      (файлы /data/*.db, встроенная, без контейнера)",
+        env={"RUNTIME_VAULT_STORAGE_TYPE": "sqlite"},
+    ),
+    _DbOption(
+        key="postgres",
+        label="PostgreSQL  (контейнер postgres, dev порт :15432)",
+        env={
+            "RUNTIME_VAULT_STORAGE_TYPE": "postgresql",
+            # sslmode=disable: skip SSL negotiation for local dev container
+            "RUNTIME_VAULT_PG_DSN": (
+                "postgresql://homeconsole:homeconsole@postgres:5432/homeconsole"
+                "?sslmode=disable"
+            ),
+        },
+        service="postgres",
+        compose_profile="postgres",
+    ),
+]
+
+_DB_KEY_MAP: dict[str, _DbOption] = {o.key: o for o in _DB_OPTIONS}
+
+
+@dataclass(frozen=True)
+class EnvUpPlan:
+    mode: str
+    service_names: list[str]
+    compose_profiles: list[str]
+    db_option: _DbOption
+    project: ComposeProject
+    running: set[str]
+
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+_MODE_DEFAULT = "dev-reload"
+_MODE_HELP = "dev-reload | dev | dev-image  (без --mode профиль может выбрать режим автоматически)"
+_PROFILE_HELP = (
+    "Пресет: base | backend | platform | hmr | full  "
+    "(без --profile: интерактивный выбор)"
+)
+_DB_HELP = "sqlite | postgres  (без --db: интерактивный выбор если core-runtime выбран)"
+
+# Container state → Rich color mapping (used in `env ps`, `env status`)
+_STATE_COLOR: dict[str, str] = {
+    "running":    "green",
+    "exited":     "red",
+    "dead":       "red",
+    "restarting": "yellow",
+    "created":    "dim",
+    "paused":     "yellow",
+}
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+# `_find_repo_root` / `_MONOREPO_SIBLINGS` переехали в hc.core_source.
+# Используй `resolve_workspace_root()` — он смотрит HC_WORKSPACE, cwd и конфиг.
+
+
+def _resolve_source(console: Console) -> CoreSource:
+    repo_root = resolve_workspace_root()
+    if repo_root:
+        src = get_core_source_from_repo(repo_root)
+        if src:
+            return src
+    src = get_core_source_local()
+    if src:
+        return src
+
+    # On a fresh machine: offer to auto-clone core-runtime-service.
+    from hc.constants import CORE_SRC_DIR, DEFAULT_CORE_REPO
+    console.print(f"[yellow]Исходники Core не найдены.[/yellow] ({CORE_SRC_DIR})")
+
+    if sys.stdin.isatty():
+        try:
+            import questionary
+            answer = questionary.confirm(
+                f"Скачать core-runtime-service в {CORE_SRC_DIR}?",
+                default=True,
+            ).ask()
+        except ImportError:
+            answer = None
+
+        if answer is None:
+            raise typer.Abort()
+        if not answer:
+            raise CoreSourcesNotFoundError(
+                message="Исходники Core не найдены.",
+                exit_code=1,
+                hint=f"Запусти: hc core init  (клонирует {DEFAULT_CORE_REPO})",
+            )
+
+        return init_core_source(console, None, None)
+
+    raise CoreSourcesNotFoundError(
+        message="Исходники Core не найдены.",
+        exit_code=1,
+        hint=f"Запусти: hc core init  (клонирует {DEFAULT_CORE_REPO})",
+    )
+
+
+def _run(cmd: list[str], *, cwd: Path | None = None, extra_env: dict[str, str] | None = None) -> None:
+    env = {**os.environ, **extra_env} if extra_env else None
+    try:
+        p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=False)  # noqa: S603
+    except subprocess.TimeoutExpired:
+        from rich.console import Console as _C
+        _C().print(f"[red]Таймаут:[/red] команда зависла: {' '.join(cmd[:3])}\nПроверь что docker daemon запущен: docker info")
+        raise typer.Exit(code=1)
+    if p.returncode != 0:
+        raise typer.Exit(code=p.returncode)
+
+
+# ─── Post-mortem after failed up ──────────────────────────────────────────────
+
+def _collect_postmortem_targets(project: ComposeProject) -> list[str]:
+    """Имена сервисов, которые имеет смысл сканировать (упавшие/unhealthy)."""
+    try:
+        candidates = list_compose_containers(
+            project.compose_file,
+            project.cwd,
+            only_states=("exited", "unhealthy", "restarting", "dead"),
+        )
+    except Exception:  # noqa: BLE001
+        return []
+
+    if not candidates:
+        try:
+            candidates = list_compose_containers(project.compose_file, project.cwd)
+        except Exception:  # noqa: BLE001
+            return []
+        candidates = [c for c in candidates if c.get("_effective_state") != "running"]
+
+    names: list[str] = []
+    for cont in candidates:
+        service = str(cont.get("Service") or cont.get("Name") or "")
+        if service and service not in names:
+            names.append(service)
+    return names
+
+
+def _run_postmortem(console: Console, project: ComposeProject) -> tuple[list[DetectedIssue], list[str]]:
+    """
+    Найти упавшие/unhealthy контейнеры, подтянуть их логи и распознать
+    известные ошибки через каталог diagnostics.
+
+    Возвращает (список найденных проблем, список просканированных сервисов).
+    """
+    services = _collect_postmortem_targets(project)
+    found: list[DetectedIssue] = []
+    for service in services:
+        try:
+            logs = fetch_container_logs(project.compose_file, project.cwd, service, tail=200)
+        except Exception:  # noqa: BLE001
+            continue
+        found.extend(detect_issues(logs, service=service))
+
+    return found, services
+
+
+def _print_postmortem(
+    console: Console,
+    issues: list[DetectedIssue],
+    *,
+    scanned_services: list[str] | None = None,
+) -> None:
+    """Красиво отрисовать найденные проблемы с готовыми командами для починки."""
+    if not issues:
+        console.print(
+            "\n[yellow]![/yellow] Стек поднялся не до конца, но известных шаблонов ошибок не нашёл."
+        )
+        # Берём реальные имена упавших сервисов вместо хардкода core-runtime.
+        targets = scanned_services or ["core-runtime"]
+        targets_str = " ".join(targets)
+        console.print(
+            f"  [dim]Посмотри полные логи:[/dim] [cyan]hc env logs --follow {targets_str}[/cyan]"
+        )
+        console.print(
+            "  [dim]Если паттерн повторяется — открой issue с этим логом, "
+            "добавим в диагностику.[/dim]"
+        )
+        return
+
+    console.print(
+        f"\n[bold red]✗ Обнаружено известных проблем: {len(issues)}[/bold red]\n"
+    )
+    for i, det in enumerate(issues, 1):
+        issue = det.issue
+        header = f"[bold]{i}. {issue.title}[/bold]"
+        if det.service:
+            header += f"  [dim](в {det.service})[/dim]"
+        console.print(header)
+        for line in issue.cause.splitlines():
+            console.print(f"   [dim]{line}[/dim]")
+        if det.matched_line:
+            console.print(f"   [dim]└ строка лога:[/dim] [yellow]{det.matched_line}[/yellow]")
+        if issue.fix_commands:
+            console.print("   [bold cyan]Что сделать:[/bold cyan]")
+            has_shell = any(fix.kind == "shell" for fix in issue.fix_commands)
+            for fix in issue.fix_commands:
+                if fix.kind == "shell":
+                    # Shell-команда: явно показываем что это для обычного терминала,
+                    # а не для hc REPL (где доступны только `hc *`).
+                    console.print(
+                        f"     [yellow]$[/yellow] [bold]{fix.command}[/bold]"
+                        f"   [dim]# {fix.description} [shell, не hc][/dim]"
+                    )
+                else:
+                    console.print(
+                        f"     [green]→[/green] [cyan]{fix.command}[/cyan]"
+                        f"   [dim]# {fix.description}[/dim]"
+                    )
+            if has_shell:
+                console.print(
+                    "     [dim italic]Легенда: [green]→[/green] — можно ввести прямо в этом REPL · "
+                    "[yellow]$[/yellow] — выполни в обычном shell[/dim italic]"
+                )
+        console.print()
+
+
+def _git(path: Path, *args: str, timeout: float = 60) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603
+        ["git", *args],
+        cwd=str(path),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+@dataclass(slots=True)
+class PullResult:
+    updated: bool
+    changed_files: list[str] = field(default_factory=list)
+    skipped: bool = False
+
+
+# Файлы, при изменении которых нужен `--build` (зависимости/образы/compose).
+_REBUILD_HINT_RE = re.compile(
+    r"(^|/)(requirements.*\.txt|package(-lock)?\.json|pnpm-lock\.yaml|yarn\.lock"
+    r"|Dockerfile[^/]*|docker-compose[^/]*\.ya?ml)$"
+)
+
+# Новые alembic-миграции — нужен restart core-runtime, чтобы они применились.
+_MIGRATION_HINT_RE = re.compile(r"(^|/)(alembic|migrations)/versions/.*\.py$")
+
+
+def pull_git_repo(
+    path: Path,
+    console: Console,
+    *,
+    label: str,
+    quiet: bool = False,
+    autostash: bool = True,
+) -> PullResult:
+    """
+    git pull репозитория в `path` с попыткой обычного merge, если `--ff-only`
+    невозможен из-за разошедшихся веток.
+
+    Если рабочее дерево не чистое: при autostash=True откладывает правки в
+    stash и возвращает их после pull; при autostash=False — пропускает pull
+    этого репозитория (PullResult.skipped=True).
+    """
+    status = _git(path, "status", "--porcelain", timeout=5)
+    if status.returncode != 0:
+        msg = f"{label}: не git-репозиторий или git недоступен."
+        if quiet:
+            return PullResult(updated=False)
+        console.print(f"[red]Ошибка:[/red] {msg}")
+        raise typer.Exit(code=1)
+
+    stashed = False
+    if status.stdout.strip():
+        if not autostash:
+            if not quiet:
+                console.print(
+                    f"[yellow]![/yellow] {label}: рабочее дерево не чистое — pull пропущен "
+                    f"(вероятно, тут твои правки). Закоммить/stash и повтори вручную."
+                )
+            return PullResult(updated=False, skipped=True)
+
+        stash = _git(path, "stash", "push", "-u", "-m", "hc env pull: autostash")
+        if stash.returncode != 0:
+            if quiet:
+                return PullResult(updated=False)
+            err = (stash.stderr or stash.stdout or "git stash failed").strip()
+            console.print(f"[red]Ошибка git stash ({label}):[/red] {err}")
+            raise typer.Exit(code=stash.returncode)
+        stashed = True
+        if not quiet:
+            console.print(f"[cyan]→[/cyan] {label}: локальные правки отложены в stash")
+
+    old_head = _git(path, "rev-parse", "HEAD", timeout=5).stdout.strip()
+
+    pull = _git(path, "pull", "--ff-only")
+    if pull.returncode != 0:
+        err = (pull.stderr or pull.stdout or "").lower()
+        if "not possible to fast-forward" in err or "would not be possible to fast-forward" in err:
+            if not quiet:
+                console.print(
+                    f"[yellow]![/yellow] {label}: ветки разошлись, пробую обычный merge..."
+                )
+            pull = _git(path, "pull")
+        if pull.returncode != 0:
+            _restore_stash(path, console, label=label, quiet=quiet)
+            if quiet:
+                return PullResult(updated=False)
+            err_out = (pull.stderr or pull.stdout or "git pull failed").strip()
+            console.print(f"[red]Ошибка git pull ({label}):[/red] {err_out}")
+            if "CONFLICT" in (pull.stdout or "") or "conflict" in err:
+                console.print(
+                    f"[dim]Резолви конфликты в {path}: правь файлы, `git add`, "
+                    f"`git commit` (или `git merge --abort` для отката).[/dim]"
+                )
+            raise typer.Exit(code=pull.returncode)
+
+    out = (pull.stdout or "").strip()
+    updated = not ("Already up to date" in out or "Уже актуально" in out)
+
+    changed_files: list[str] = []
+    if updated:
+        new_head = _git(path, "rev-parse", "HEAD", timeout=5).stdout.strip()
+        diff = _git(path, "diff", "--name-only", old_head, new_head)
+        changed_files = [f for f in (diff.stdout or "").splitlines() if f.strip()]
+
+    if stashed:
+        _restore_stash(path, console, label=label, quiet=quiet)
+
+    if not updated:
+        if not quiet:
+            console.print(f"[green]✓[/green] {label} уже актуален")
+        return PullResult(updated=False)
+
+    if not quiet:
+        console.print(f"[green]✓[/green] {label} обновлён")
+        if out:
+            for line in out.splitlines()[-3:]:
+                console.print(f"  [dim]{line}[/dim]")
+    return PullResult(updated=True, changed_files=changed_files)
+
+
+def fetch_incoming_commits(path: Path, console: Console, *, label: str) -> list[str]:
+    """git fetch + список входящих коммитов (для --dry-run), без изменения рабочего дерева."""
+    fetch = _git(path, "fetch", timeout=60)
+    if fetch.returncode != 0:
+        err = (fetch.stderr or fetch.stdout or "git fetch failed").strip()
+        console.print(f"[red]Ошибка git fetch ({label}):[/red] {err}")
+        raise typer.Exit(code=fetch.returncode)
+
+    upstream = _git(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", timeout=5)
+    if upstream.returncode != 0:
+        console.print(f"[yellow]![/yellow] {label}: нет upstream-ветки, пропускаю")
+        return []
+
+    log = _git(path, "log", "--oneline", f"HEAD..{upstream.stdout.strip()}")
+    commits = [ln for ln in (log.stdout or "").splitlines() if ln.strip()]
+    if commits:
+        console.print(f"[cyan]→[/cyan] {label}: новых коммитов — {len(commits)}")
+        for ln in commits[:10]:
+            console.print(f"  [dim]{ln}[/dim]")
+        if len(commits) > 10:
+            console.print(f"  [dim]… и ещё {len(commits) - 10}[/dim]")
+    else:
+        console.print(f"[green]✓[/green] {label} уже актуален")
+    return commits
+
+
+def _restore_stash(path: Path, console: Console, *, label: str, quiet: bool) -> None:
+    """Вернуть автостеш после pull. При конфликте оставляет stash и предупреждает."""
+    stash_list = _git(path, "stash", "list")
+    if "hc env pull: autostash" not in (stash_list.stdout or ""):
+        return
+
+    pop = _git(path, "stash", "pop")
+    if pop.returncode != 0:
+        console.print(
+            f"[yellow]![/yellow] {label}: не удалось автоматически вернуть отложенные "
+            f"правки (конфликт со свежим pull)."
+        )
+        console.print(
+            f"[dim]Правки остались в stash. Резолви вручную: "
+            f"cd {path} && git stash pop[/dim]"
+        )
+        return
+    if not quiet:
+        console.print(f"[green]✓[/green] {label}: локальные правки возвращены из stash")
+
+
+def pull_core_source(src: CoreSource, console: Console, *, quiet: bool = False) -> PullResult:
+    """git pull для core-runtime-service (см. pull_git_repo)."""
+    return pull_git_repo(src.path, console, label="core-runtime-service", quiet=quiet)
+
+
+def _try_pull_source(src: CoreSource, console: Console) -> None:
+    """Тихий pull перед env up — ошибки не критичны."""
+    try:
+        pull_core_source(src, console, quiet=True)
+    except typer.Exit:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _compose_with_profiles(
+    project: ComposeProject,
+    running: set[str],
+) -> list[str]:
+    cmd = ["docker", "compose", "-f", str(project.compose_file)]
+    for profile in sorted(_detect_active_profiles(running)):
+        cmd += ["--profile", profile]
+    return cmd
+
+
+# Дефолтные публичные порты для подсказок в `hc env ps` / status.
+# Используй KNOWN_ENDPOINTS из hc.constants.
+from hc.constants import KNOWN_ENDPOINTS
+
+
+def _compose_ps_rows(project: ComposeProject) -> list[dict[str, object]]:
+    import json
+
+    r = subprocess.run(  # noqa: S603
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(project.compose_file),
+            "ps",
+            "-a",
+            "--format",
+            "json",
+        ],
+        cwd=str(project.cwd),
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    rows: list[dict[str, object]] = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+            if isinstance(item, dict):
+                rows.append(item)
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _env_ps_entries(project: ComposeProject) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    for row in _compose_ps_rows(project):
+        service = str(row.get("Service") or row.get("Name") or "?")
+        ports = str(row.get("Publishers") or row.get("Ports") or "")
+        if ports in ("", "[]"):
+            ports = ""
+        entries.append(
+            {
+                "service": service,
+                "state": str(row.get("State") or row.get("Status") or "?"),
+                "ports": ports,
+                "url_hint": KNOWN_ENDPOINTS.get(service, ""),
+            }
+        )
+    return entries
+
+
+def _print_env_status_dashboard(console: Console, project: ComposeProject) -> None:
+    """Компактный dashboard: статус каждого сервиса + health + uptime + URL.
+
+    Отличается от `env ps` тем, что:
+    - группирует сервисы по состоянию (running/exited/restarting/created),
+    - подсвечивает state цветом,
+    - выводит health-колонку (healthy/unhealthy/starting/—),
+    - в конце даёт блок «URL endpoints» для быстрого копирования.
+    """
+    rows = _compose_ps_rows(project)
+
+    if not rows:
+        console.print(
+            "[yellow]![/yellow] Стек не запущен. Подними: "
+            "[cyan]hc env up[/cyan]"
+        )
+        console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
+        return
+
+    # Сводка по состояниям.
+    state_counts: dict[str, int] = {}
+    for r in rows:
+        state = str(r.get("State") or "unknown").lower()
+        state_counts[state] = state_counts.get(state, 0) + 1
+
+    def _state_chip(state: str, count: int) -> str:
+        color = _STATE_COLOR.get(state, "white")
+        return f"[{color}]{count} state[/{color}]"
+
+    summary = "  ".join(_state_chip(s, n) for s, n in sorted(state_counts.items()))
+    console.print(f"\n[bold]Стек:[/bold]  {summary}")
+
+    table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+    table.add_column("Сервис", min_width=22)
+    table.add_column("State")
+    table.add_column("Health")
+    table.add_column("Uptime", style="dim")
+    table.add_column("URL / порт", style="cyan")
+
+    health_icon = {
+        "healthy":   "[green]✓ healthy[/green]",
+        "unhealthy": "[red]✗ unhealthy[/red]",
+        "starting":  "[yellow]… starting[/yellow]",
+        "":          "[dim]—[/dim]",
+        "none":      "[dim]—[/dim]",
+    }
+
+    # Сортируем для стабильного порядка: running → restarting → exited → прочее.
+    state_order = {"running": 0, "restarting": 1, "exited": 2, "dead": 3}
+    rows_sorted = sorted(
+        rows, key=lambda r: (state_order.get(str(r.get("State") or "").lower(), 9),
+                              str(r.get("Service") or ""))
+    )
+
+    for r in rows_sorted:
+        service = str(r.get("Service") or r.get("Name") or "?")
+        state = str(r.get("State") or "?").lower()
+        health = str(r.get("Health") or "").lower()
+        uptime = str(r.get("RunningFor") or r.get("Status") or "—")
+        url = KNOWN_ENDPOINTS.get(service, "")
+        ports = str(r.get("Publishers") or r.get("Ports") or "")
+        if not url and ports and ports != "[]":
+            url = ports
+
+        color = _STATE_COLOR.get(state, "white")
+        table.add_row(
+            service,
+            f"[{color}]{state}[/{color}]",
+            health_icon.get(health, f"[dim]{health}[/dim]"),
+            uptime,
+            url or "—",
+        )
+
+    console.print(table)
+
+    # Блок URL endpoints — для быстрого копирования.
+    running_urls = [
+        (str(r.get("Service")), KNOWN_ENDPOINTS.get(str(r.get("Service") or ""), ""))
+        for r in rows_sorted
+        if str(r.get("State") or "").lower() == "running"
+    ]
+    running_urls = [(s, u) for s, u in running_urls if u]
+    if running_urls:
+        console.print("\n[bold]URL:[/bold]")
+        for s, u in running_urls:
+            console.print(f"  [dim]{s:22}[/dim] {u}")
+
+    # Подсказки при проблемах.
+    troubled = [r for r in rows if str(r.get("State") or "").lower() in {"exited", "dead", "restarting"}]
+    unhealthy = [r for r in rows if str(r.get("Health") or "").lower() == "unhealthy"]
+    if troubled or unhealthy:
+        console.print()
+        for r in troubled:
+            svc = r.get("Service") or "?"
+            console.print(
+                f"[yellow]![/yellow] {svc}: state={r.get('State')}  → "
+                f"[cyan]hc env logs {svc} --tail 200[/cyan]"
+            )
+        for r in unhealthy:
+            svc = r.get("Service") or "?"
+            console.print(
+                f"[yellow]![/yellow] {svc}: unhealthy  → "
+                f"[cyan]hc env logs {svc} --tail 200[/cyan]"
+            )
+        console.print("[dim]Полная диагностика:[/dim] [cyan]hc doctor[/cyan]")
+
+    console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
+
+
+def _print_env_ps(console: Console, project: ComposeProject, *, json_out: bool = False) -> None:
+    rows = _compose_ps_rows(project)
+    if json_out:
+        print_json(
+            {
+                "ok": True,
+                "compose_file": str(project.compose_file),
+                "containers": _env_ps_entries(project),
+            }
+        )
+        return
+
+    if not rows:
+        subprocess.run(  # noqa: S603
+            ["docker", "compose", "-f", str(project.compose_file), "ps", "-a"],
+            cwd=str(project.cwd),
+            check=False,
+        )
+        console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
+        console.print(ENV_VS_CORE_DOTENV)
+        return
+
+    table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+    table.add_column("Сервис")
+    table.add_column("Состояние")
+    table.add_column("Порты")
+    table.add_column("URL / хост", style="cyan")
+
+    for entry in _env_ps_entries(project):
+        table.add_row(
+            entry["service"],
+            entry["state"],
+            entry["ports"] or "—",
+            entry["url_hint"],
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
+
+
+def _get_running_services(compose_file: Path, cwd: Path) -> set[str]:
+    try:
+        r = subprocess.run(  # noqa: S603
+            ["docker", "compose", "-f", str(compose_file),
+             "ps", "--services", "--filter", "status=running"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if r.returncode == 0:
+            return {s.strip() for s in r.stdout.splitlines() if s.strip()}
+    except Exception:  # noqa: BLE001
+        pass
+    return set()
+
+
+def _warn_orphan_volumes(console: Console, cwd: Path) -> None:
+    """After down -v, check for volumes that compose didn't remove (not in top-level volumes:)."""
+    try:
+        r = subprocess.run(  # noqa: S603
+            ["docker", "volume", "ls", "--format", "{{.Name}}"],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+        project = cwd.name  # compose project name = directory name
+        orphans = [
+            v for v in r.stdout.splitlines()
+            if v.startswith(f"{project}_") or v.startswith("dev_")
+        ]
+        if orphans:
+            console.print(f"[yellow]![/yellow] Volumes не удалены (нет в top-level volumes секции compose):")
+            for v in orphans:
+                console.print(f"  [dim]docker volume rm {v}[/dim]")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _detect_active_profiles(running: set[str]) -> set[str]:
+    """Return compose profiles that have at least one running container."""
+    profiles: set[str] = set()
+    for svcs in _SERVICES.values():
+        for s in svcs:
+            if s.compose_profile and s.name in running:
+                profiles.add(s.compose_profile)
+    for opt in _DB_OPTIONS:
+        if opt.compose_profile and opt.service and opt.service in running:
+            profiles.add(opt.compose_profile)
+    return profiles
+
+
+def _detect_active_db(running: set[str]) -> str:
+    """Return the DB key ('postgres' | 'sqlite') based on running containers."""
+    for opt in _DB_OPTIONS:
+        if opt.service and opt.service in running:
+            return opt.key
+    return "sqlite"
+
+
+def _pick_services_interactive(
+    available: list[_Svc],
+    running: set[str],
+    *,
+    preferred: set[str] | None = None,
+) -> list[_Svc]:
+    try:
+        import questionary
+        from questionary import Style as QStyle
+    except ImportError:
+        raise HcCliError(
+            message="Пакет questionary не установлен.",
+            exit_code=1,
+            hint="pip install questionary",
+        )
+
+    style = QStyle(list(QUESTIONARY_STYLE_KWARGS.items()))
+
+    choices = []
+    for s in available:
+        is_running = s.name in running
+        title: object = (
+            [("", s.label), ("fg:ansigreen bold", "  ● running")]
+            if is_running
+            else s.label
+        )
+        checked = is_running
+        if not checked and preferred and s.name in preferred:
+            checked = True
+        if not checked:
+            checked = s.default
+        choices.append(questionary.Choice(title=title, value=s.name, checked=checked))
+
+    result = questionary.checkbox(
+        "Выбери сервисы (SPACE = вкл/выкл  ↑↓ = навигация  ENTER = дальше):",
+        choices=choices,
+        style=style,
+    ).ask()
+
+    if result is None:
+        raise typer.Abort()
+    if not result:
+        Console().print("[yellow]Ничего не выбрано — выход.[/yellow]")
+        raise typer.Exit(code=0)
+
+    return [s for s in available if s.name in result]
+
+
+def _pick_db_interactive(running: set[str], *, preferred_db: str | None = None) -> _DbOption:
+    """Radio-button выбор бэкенда БД."""
+    try:
+        import questionary
+        from questionary import Style as QStyle
+    except ImportError:
+        raise HcCliError(
+            message="Пакет questionary не установлен.",
+            exit_code=1,
+            hint="pip install questionary",
+        )
+
+    style = QStyle(list(QUESTIONARY_STYLE_KWARGS.items()))
+
+    choices = []
+    for opt in _DB_OPTIONS:
+        is_running = bool(opt.service and opt.service in running)
+        title: object = (
+            [("", opt.label), ("fg:ansigreen bold", "  ● running")]
+            if is_running
+            else opt.label
+        )
+        choices.append(questionary.Choice(title=title, value=opt.key))
+
+    pg_running = "postgres" in running
+    if pg_running:
+        default = "postgres"
+    elif preferred_db and preferred_db in _DB_KEY_MAP:
+        default = preferred_db
+    else:
+        default = "sqlite"
+
+    result = questionary.select(
+        "База данных (ENTER = подтвердить):",
+        choices=choices,
+        default=default,
+        style=style,
+    ).ask()
+
+    if result is None:
+        raise typer.Abort()
+
+    return _DB_KEY_MAP[result]
+
+
+def _resolve_services(
+    *,
+    mode: str,
+    profile: str | None,
+    console: Console,
+    running: set[str],
+) -> list[_Svc]:
+    available = _SERVICES.get(mode, [])
+    if not available:
+        console.print(f"[red]Ошибка:[/red] неизвестный режим {mode!r}. Допустимые: {' | '.join(_SERVICES)}")
+        raise typer.Exit(code=2)
+
+    last = load_last_env()
+    preferred = set(last.services) if last and last.mode == mode else None
+
+    if profile:
+        key = profile.strip().lower()
+        preset = _PROFILES.get(key)
+        if preset is None:
+            console.print(f"[red]Ошибка:[/red] неизвестный профиль {profile!r}. Допустимые: {' | '.join(sorted(_PROFILES))}")
+            raise typer.Exit(code=2)
+        allowed = preset.get(mode)
+        if allowed is None:
+            preferred_mode = _PROFILE_DEFAULT_MODE.get(key)
+            hint = f" Попробуй `--mode {preferred_mode}`." if preferred_mode else ""
+            console.print(
+                f"[red]Ошибка:[/red] профиль {profile!r} не поддерживается в режиме {mode!r}.{hint}"
+            )
+            raise typer.Exit(code=2)
+        selected = [s for s in available if s.name in allowed]
+        if not selected:
+            console.print(
+                f"[yellow]Профиль {profile!r} не содержит сервисов для режима {mode!r}.[/yellow]\n"
+                f"Доступные: {', '.join(s.name for s in available)}"
+            )
+            raise typer.Exit(code=2)
+        return selected
+
+    if sys.stdin.isatty():
+        return _pick_services_interactive(available, running, preferred=preferred)
+
+    if preferred:
+        picked = [s for s in available if s.name in preferred]
+        if picked:
+            return picked
+    return [s for s in available if s.default]
+
+
+def _resolve_db(
+    *,
+    mode: str,
+    db_flag: str | None,
+    needs_db: bool,
+    running: set[str],
+    console: Console,
+) -> _DbOption:
+    """Resolve DB option: flag → interactive → default sqlite."""
+    if db_flag:
+        key = db_flag.strip().lower()
+        opt = _DB_KEY_MAP.get(key)
+        if opt is None:
+            console.print(f"[red]Ошибка:[/red] --db {db_flag!r} неизвестен. Допустимые: {' | '.join(_DB_KEY_MAP)}")
+            raise typer.Exit(code=2)
+        return opt
+
+    if needs_db and sys.stdin.isatty():
+        last = load_last_env()
+        preferred_db = last.db if last and last.mode == mode else None
+        return _pick_db_interactive(running, preferred_db=preferred_db)
+
+    last = load_last_env()
+    if needs_db and last and last.mode == mode and last.db in _DB_KEY_MAP:
+        return _DB_KEY_MAP[last.db]
+    return _DB_KEY_MAP["sqlite"]
+
+
+def _resolve_mode(mode: str | None, profile: str | None) -> str:
+    if mode:
+        return mode.strip().lower()
+    if profile:
+        return _PROFILE_DEFAULT_MODE.get(profile.strip().lower(), _MODE_DEFAULT)
+    return _MODE_DEFAULT
+
+
+def _resolve_env_up_plan(
+    *,
+    console: Console,
+    mode: str,
+    profile: str | None,
+    db: str | None,
+    src: CoreSource,
+) -> EnvUpPlan:
+    project = compose_project_from_source(console, src, mode=mode)
+    running = _get_running_services(project.compose_file, project.cwd)
+
+    selected = _resolve_services(mode=mode, profile=profile, console=console, running=running)
+    service_names = [s.name for s in selected]
+    compose_profiles = list({s.compose_profile for s in selected if s.compose_profile})
+
+    needs_db = "core-runtime" in service_names
+    db_flag = db.strip().lower().replace("pg", "postgres") if db else None
+    db_option = _resolve_db(
+        mode=mode,
+        db_flag=db_flag,
+        needs_db=needs_db,
+        running=running,
+        console=console,
+    )
+
+    if needs_db and db_option.service:
+        if db_option.compose_profile and db_option.compose_profile not in compose_profiles:
+            compose_profiles.append(db_option.compose_profile)
+        if db_option.service not in service_names:
+            service_names.append(db_option.service)
+
+    return EnvUpPlan(
+        mode=mode,
+        service_names=service_names,
+        compose_profiles=compose_profiles,
+        db_option=db_option,
+        project=project,
+        running=running,
+    )
+
+
+def _get_needed_ports(plan: EnvUpPlan) -> dict[int, str]:
+    """Return {host_port: service_name} for all services in the plan."""
+    import json
+
+    r = subprocess.run(  # noqa: S603
+        [
+            "docker", "compose", "-f", str(plan.project.compose_file),
+            *[arg for cp in sorted(plan.compose_profiles) for arg in ("--profile", cp)],
+            "config", "--format", "json",
+        ],
+        cwd=str(plan.project.cwd),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if r.returncode != 0:
+        return {}
+
+    try:
+        cfg = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+    result: dict[int, str] = {}
+    for svc_name in plan.service_names:
+        svc = cfg.get("services", {}).get(svc_name, {})
+        for p in svc.get("ports", []):
+            published = p.get("published") if isinstance(p, dict) else None
+            if published:
+                try:
+                    result[int(published)] = svc_name
+                except (ValueError, TypeError):
+                    pass
+    return result
+
+
+def _parse_docker_labels(labels_val: object) -> dict[str, str]:
+    if isinstance(labels_val, dict):
+        return {str(k): str(v) for k, v in labels_val.items()}
+    out: dict[str, str] = {}
+    for part in str(labels_val or "").split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _parse_published_ports(ports_str: str) -> set[int]:
+    held: set[int] = set()
+    for m in re.finditer(r":(\d+)->", ports_str):
+        held.add(int(m.group(1)))
+    return held
+
+
+def _compose_project_name(plan: EnvUpPlan) -> str:
+    import json
+
+    base = _compose_base_cmd(plan)
+    r = subprocess.run(  # noqa: S603
+        [*base, "config", "--format", "json"],
+        cwd=str(plan.project.cwd),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if r.returncode == 0:
+        try:
+            name = json.loads(r.stdout).get("name")
+            if name:
+                return str(name)
+        except json.JSONDecodeError:
+            pass
+    return plan.project.cwd.name
+
+
+def _process_command_line(pid: int) -> str:
+    r = subprocess.run(  # noqa: S603
+        ["ps", "-p", str(pid), "-o", "args="],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    cmd = (r.stdout or "").strip()
+    return cmd or f"pid {pid}"
+
+
+def _find_host_listeners(port: int) -> list[dict[str, object]]:
+    """Процессы на хосте, слушающие TCP-порт (lsof / ss)."""
+    holders: list[dict[str, object]] = []
+    seen_pids: set[int] = set()
+
+    if shutil.which("lsof"):
+        r = subprocess.run(  # noqa: S603
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-F", "pcn"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            pid: int | None = None
+            comm = ""
+            name = ""
+            for line in r.stdout.splitlines():
+                if not line:
+                    continue
+                tag, val = line[0], line[1:]
+                if tag == "p":
+                    if pid is not None and pid not in seen_pids:
+                        holders.append({"pid": pid, "command": name or comm})
+                        seen_pids.add(pid)
+                    pid = int(val)
+                    comm = ""
+                    name = ""
+                elif tag == "c":
+                    comm = val
+                elif tag == "n":
+                    name = val
+            if pid is not None and pid not in seen_pids:
+                holders.append({"pid": pid, "command": name or comm})
+                seen_pids.add(pid)
+
+        if not holders:
+            r2 = subprocess.run(  # noqa: S603
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            for line in (r2.stdout or "").splitlines():
+                if line.strip().isdigit():
+                    pid = int(line.strip())
+                    if pid not in seen_pids:
+                        holders.append({"pid": pid, "command": _process_command_line(pid)})
+                        seen_pids.add(pid)
+
+    if not holders and shutil.which("ss"):
+        r3 = subprocess.run(  # noqa: S603
+            ["ss", "-tlnp", f"sport = :{port}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        for m in re.finditer(r"pid=(\d+)", r3.stdout or ""):
+            pid = int(m.group(1))
+            if pid not in seen_pids:
+                holders.append({"pid": pid, "command": _process_command_line(pid)})
+                seen_pids.add(pid)
+
+    return holders
+
+
+def _find_port_conflicts(
+    needed: dict[int, str],
+    plan: EnvUpPlan,
+) -> list[dict[str, object]]:
+    """
+  Найти кто занимает нужные порты: чужие контейнеры и процессы на хосте.
+
+  Порты, которые уже держит running-контейнер нашего compose-проекта
+  для сервиса из плана, не считаются конфликтом.
+    """
+    import json
+
+    if not needed:
+        return []
+
+    project_name = _compose_project_name(plan)
+    conflicts: list[dict[str, object]] = []
+    legit_ports: set[int] = set()
+    docker_covered_ports: set[int] = set()
+
+    r = subprocess.run(  # noqa: S603
+        ["docker", "ps", "--format", "{{json .}}"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    containers: list[dict] = []
+    if r.returncode == 0:
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                containers.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    for c in containers:
+        labels = _parse_docker_labels(c.get("Labels", ""))
+        svc = labels.get("com.docker.compose.service", "")
+        proj = labels.get("com.docker.compose.project", "")
+        held = _parse_published_ports(str(c.get("Ports", "")))
+        if proj == project_name and svc in plan.service_names:
+            for p in held:
+                if p in needed and needed[p] == svc:
+                    legit_ports.add(p)
+
+    for c in containers:
+        labels = _parse_docker_labels(c.get("Labels", ""))
+        held = _parse_published_ports(str(c.get("Ports", "")))
+        blocking = {
+            p: needed[p]
+            for p in held
+            if p in needed and p not in legit_ports
+        }
+        if not blocking:
+            continue
+        docker_covered_ports.update(blocking)
+        conflicts.append({
+            "kind": "docker",
+            "id": (c.get("ID") or "")[:12],
+            "name": c.get("Names", "?"),
+            "image": c.get("Image", "?"),
+            "ports": blocking,
+        })
+
+    for port, svc in needed.items():
+        if port in legit_ports or port in docker_covered_ports:
+            continue
+        for holder in _find_host_listeners(port):
+            cmd = str(holder.get("command", ""))
+            if "docker-proxy" in cmd:
+                continue
+            conflicts.append({
+                "kind": "process",
+                "pid": holder["pid"],
+                "command": cmd,
+                "ports": {port: svc},
+            })
+
+    return conflicts
+
+
+def _kill_process(pid: int, *, signal_name: str) -> bool:
+    import signal
+
+    sig = signal.SIGKILL if signal_name == "kill" else signal.SIGTERM
+    try:
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+
+
+def _offer_resolve_conflicts(
+    conflicts: list[dict[str, object]],
+    console: Console,
+) -> None:
+    """Интерактивно остановить контейнеры или убить процессы, занимающие порты."""
+    console.print("\n[yellow]⚠ Конфликт портов[/yellow] — порты заняты:\n")
+
+    for c in conflicts:
+        ports_info = ", ".join(
+            f"[bold]:{p}[/bold] (нужен для {svc})"
+            for p, svc in sorted(c["ports"].items())  # type: ignore[union-attr]
+        )
+        if c.get("kind") == "process":
+            console.print(
+                f"  [yellow]процесс[/yellow]  PID [bold]{c['pid']}[/bold]  "
+                f"[dim]{c['command']}[/dim]  {ports_info}"
+            )
+        else:
+            console.print(
+                f"  [cyan]контейнер[/cyan]  {c['name']}  {c['image']}  {ports_info}"
+            )
+
+    if not sys.stdin.isatty():
+        hints = []
+        for c in conflicts:
+            if c.get("kind") == "process":
+                hints.append(f"kill {c['pid']}")
+            else:
+                hints.append(f"docker stop {c['name']}")
+        raise HcCliError(
+            message="Конфликт портов: порты заняты другими процессами/контейнерами.",
+            exit_code=1,
+            hint="Освободи порты: " + "; ".join(hints),
+        )
+
+    try:
+        import questionary
+        from questionary import Style as QStyle
+    except ImportError:
+        raise HcCliError(
+            message="Пакет questionary не установлен.",
+            exit_code=1,
+            hint="pip install questionary",
+        )
+
+    style = QStyle(list(QUESTIONARY_STYLE_KWARGS.items()))
+
+    choices = []
+    for c in conflicts:
+        if c.get("kind") == "process":
+            title = (
+                f"PID {c['pid']}  {c['command'][:60]}  "
+                + ", ".join(f":{p}" for p in sorted(c["ports"]))  # type: ignore[union-attr]
+            )
+        else:
+            title = (
+                f"{c['name']}  [{c['image']}]  "
+                + ", ".join(f":{p}" for p in sorted(c["ports"]))  # type: ignore[union-attr]
+            )
+        choices.append(questionary.Choice(title=title, value=c, checked=True))
+
+    selected = questionary.checkbox(
+        "Выбери что освободить (SPACE = вкл/выкл  ENTER = применить):",
+        choices=choices,
+        style=style,
+    ).ask()
+
+    if selected is None:
+        raise typer.Abort()
+
+    if not selected:
+        raise HcCliError(
+            message="Конфликт портов не разрешён.",
+            exit_code=1,
+            hint="Останови конфликтующие процессы/контейнеры вручную и повтори.",
+        )
+
+    has_docker = any(c.get("kind") != "process" for c in selected)
+    has_process = any(c.get("kind") == "process" for c in selected)
+
+    docker_action = None
+    process_action = None
+
+    if has_docker:
+        docker_action = questionary.select(
+            "Действие для контейнеров:",
+            choices=[
+                questionary.Choice("Остановить  (docker stop)", value="stop"),
+                questionary.Choice("Удалить     (docker rm -f)", value="rm"),
+            ],
+            style=style,
+        ).ask()
+        if docker_action is None:
+            raise typer.Abort()
+
+    if has_process:
+        process_action = questionary.select(
+            "Действие для процессов:",
+            choices=[
+                questionary.Choice("Завершить  (SIGTERM)", value="term"),
+                questionary.Choice("Убить      (SIGKILL)", value="kill"),
+            ],
+            style=style,
+        ).ask()
+        if process_action is None:
+            raise typer.Abort()
+
+    for c in selected:
+        if c.get("kind") == "process":
+            pid = int(c["pid"])
+            if _kill_process(pid, signal_name=str(process_action)):
+                console.print(f"[green]✓[/green] процесс [bold]{pid}[/bold] завершён")
+            else:
+                console.print(f"[red]✗[/red] не удалось завершить процесс [bold]{pid}[/bold]")
+            continue
+
+        cid = c["id"] or c["name"]
+        if docker_action == "stop":
+            r = subprocess.run(["docker", "stop", cid], capture_output=True, check=False)  # noqa: S603
+            if r.returncode == 0:
+                console.print(f"[green]✓[/green] остановлен [bold]{c['name']}[/bold]")
+            else:
+                console.print(f"[red]✗[/red] не удалось остановить [bold]{c['name']}[/bold]")
+        else:
+            r = subprocess.run(["docker", "rm", "-f", cid], capture_output=True, check=False)  # noqa: S603
+            if r.returncode == 0:
+                console.print(f"[green]✓[/green] удалён [bold]{c['name']}[/bold]")
+            else:
+                console.print(f"[red]✗[/red] не удалось удалить [bold]{c['name']}[/bold]")
+
+    console.print()
+
+
+def _frontend_workspace_path(plan: "EnvUpPlan") -> Path:
+    """Путь к platform-home-console (sibling core-runtime-service для volume mount)."""
+    core_root = plan.project.cwd.parent.parent  # deploy/dev → core-runtime-service
+    return core_root.parent / "platform-home-console"
+
+
+def _strip_frontend_from_plan(console: Console, plan: "EnvUpPlan") -> None:
+    plan.service_names[:] = [s for s in plan.service_names if s != "frontend-vite"]
+    plan.compose_profiles[:] = [p for p in plan.compose_profiles if p != "frontend"]
+    console.print("[yellow]![/yellow] frontend-vite убран из плана запуска")
+
+
+def _ensure_frontend_workspace(
+    console: Console,
+    plan: "EnvUpPlan",
+) -> tuple[bool, set[str]]:
+    """
+    Если в plan есть frontend-vite — гарантировать исходники platform-home-console.
+
+    При отсутствии/пустой папке клонирует автоматически (как core init), без диалога.
+    Возвращает (ok, services_to_recreate) — второй элемент для --force-recreate
+    после свежего клона.
+    """
+    if "frontend-vite" not in plan.service_names:
+        return True, set()
+
+    workspace = _frontend_workspace_path(plan)
+    pkg_json = workspace / "package.json"
+
+    if pkg_json.is_file():
+        return True, set()
+
+    can_clone = (not workspace.exists()) or (
+        workspace.exists() and not any(workspace.iterdir())
+    )
+
+    if can_clone:
+        console.print(
+            f"[cyan]→[/cyan] Скачиваю platform-home-console в [bold]{workspace}[/bold] ..."
+        )
+        try:
+            init_platform_source(console, target=workspace)
+        except typer.Exit:
+            console.print("[red]Не удалось скачать platform-home-console.[/red]")
+            _strip_frontend_from_plan(console, plan)
+            return True, set()
+        if not pkg_json.is_file():
+            console.print(
+                "[red]Клон завершился, но package.json не найден — пропускаю frontend-vite.[/red]"
+            )
+            _strip_frontend_from_plan(console, plan)
+            return True, set()
+        # Свежий клон — контейнер надо пересоздать (старый мог смонтировать пустую папку).
+        return True, {"frontend-vite"}
+
+    console.print(
+        f"\n[yellow]⚠[/yellow] В [bold]{workspace}[/bold] нет [bold]package.json[/bold] "
+        f"— frontend-vite не запустится."
+    )
+    console.print(
+        "  [dim]Папка не пустая, автоклон не делаю (может быть чужое содержимое).[/dim]"
+    )
+
+    if sys.stdin.isatty():
+        try:
+            import questionary
+
+            skip = questionary.confirm(
+                "Продолжить без frontend-vite?",
+                default=True,
+            ).ask()
+        except ImportError:
+            skip = True
+        if skip is None:
+            return False, set()
+        if skip:
+            _strip_frontend_from_plan(console, plan)
+            return True, set()
+        return False, set()
+
+    _strip_frontend_from_plan(console, plan)
+    return True, set()
+
+
+def _prune_non_running_compose_services(
+    console: Console,
+    plan: "EnvUpPlan",
+    *,
+    extra_force: set[str] | None = None,
+) -> None:
+    """
+    Удалить контейнеры сервисов из плана, которые не в состоянии running.
+
+    Лечит «network … not found» и старые bind-mount'ы (контейнер создан когда
+    /workspace был пуст, а исходники появились позже).
+    """
+    extra_force = extra_force or set()
+    try:
+        containers = list_compose_containers(plan.project.compose_file, plan.project.cwd)
+    except Exception:  # noqa: BLE001
+        return
+
+    by_service = {str(c.get("Service") or ""): c for c in containers if c.get("Service")}
+    to_rm: list[str] = []
+
+    for svc in plan.service_names:
+        cont = by_service.get(svc)
+        if not cont:
+            continue
+        state = str(cont.get("State") or cont.get("Status") or "").lower()
+        if svc in extra_force or not state.startswith("running"):
+            to_rm.append(svc)
+
+    to_rm = list(dict.fromkeys(to_rm))
+    if not to_rm:
+        return
+
+    base = _compose_base_cmd(plan)
+    console.print(f"[dim]→ пересоздаю контейнеры: {', '.join(to_rm)}[/dim]")
+    subprocess.run(  # noqa: S603
+        [*base, "rm", "-sf", *to_rm],
+        cwd=str(plan.project.cwd),
+        check=False,
+        capture_output=True,
+    )
+
+
+def _compose_up_with_stale_retry(
+    console: Console,
+    plan: "EnvUpPlan",
+    up_cmd: list[str],
+    *,
+    extra_env: dict[str, str] | None,
+    force_recreate: set[str] | None = None,
+) -> None:
+    """docker compose up; при сбое — снести не-running контейнеры и повторить один раз."""
+    _prune_non_running_compose_services(console, plan, extra_force=force_recreate or set())
+
+    try:
+        _run(up_cmd, cwd=plan.project.cwd, extra_env=extra_env)
+    except typer.Exit as first_err:
+        if (first_err.exit_code or 0) == 0:
+            raise
+
+        needed_ports = _get_needed_ports(plan)
+        conflicts = _find_port_conflicts(needed_ports, plan)
+        if conflicts:
+            console.print("[yellow]→[/yellow] похоже, порты заняты — предлагаю освободить ...")
+            _offer_resolve_conflicts(conflicts, console)
+            _run(up_cmd, cwd=plan.project.cwd, extra_env=extra_env)
+            return
+
+        console.print(
+            "[yellow]→[/yellow] compose up не удался — очищаю зависшие контейнеры и повторяю ..."
+        )
+        _prune_non_running_compose_services(console, plan, extra_force=set(plan.service_names))
+        try:
+            _run(up_cmd, cwd=plan.project.cwd, extra_env=extra_env)
+        except typer.Exit:
+            raise first_err from None
+
+
+def _check_disk_space(console: Console) -> None:
+    """Проверить свободное место; предупредить и предложить расширение если мало."""
+    import shutil as _shutil
+
+    stat = _shutil.disk_usage("/")
+    free_gb = stat.free / 1024 ** 3
+    total_gb = stat.total / 1024 ** 3
+    used_pct = stat.used / stat.total * 100
+
+    if free_gb >= 2.0:
+        return
+
+    color = "red" if free_gb < 0.5 else "yellow"
+    console.print(
+        f"\n[{color}]⚠ Мало места на диске[/{color}]  "
+        f"свободно [bold]{free_gb:.2f} GB[/bold] из {total_gb:.1f} GB "
+        f"([bold]{used_pct:.0f}%[/bold] занято)"
+    )
+    console.print(
+        "  [dim]Быстрая очистка:[/dim] "
+        "[bold]docker system prune -af --volumes[/bold]"
+    )
+
+    lvm = _detect_lvm_opportunity()
+    if lvm:
+        _offer_lvm_extend(console, lvm)
+    elif free_gb < 0.5:
+        if not sys.stdin.isatty():
+            from hc.errors import HcCliError
+            raise HcCliError(
+                message=f"Критически мало места: {free_gb:.2f} GB.",
+                exit_code=1,
+                hint="docker system prune -af --volumes",
+            )
+        try:
+            import questionary
+            if not questionary.confirm(
+                "Критически мало места. Продолжить всё равно?", default=False
+            ).ask():
+                raise typer.Exit(code=1)
+        except ImportError:
+            pass
+
+    console.print()
+
+
+def _detect_lvm_opportunity() -> dict | None:
+    """Вернуть info-словарь если / на LVM и в VG есть свободное место (>1 GB)."""
+    try:
+        df = subprocess.run(  # noqa: S603
+            ["df", "/", "--output=source"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        lines = [l for l in df.stdout.strip().splitlines() if l.strip() and not l.startswith("Source")]
+        if not lines or not lines[-1].startswith("/dev/mapper/"):
+            return None
+        dev = lines[-1].strip()
+
+        # Try vgs without sudo first, then with sudo -n (no-password)
+        for cmd_prefix in ([], ["sudo", "-n"]):
+            vgs = subprocess.run(  # noqa: S603
+                [*cmd_prefix, "vgs", "--units", "g", "--noheadings", "--nosuffix",
+                 "-o", "vg_name,vg_free"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if vgs.returncode == 0:
+                break
+        else:
+            # Can't read VGs — still LVM, report without sizes
+            return {"dev": dev, "lv_path": None, "vg_name": None, "vg_free_gb": None}
+
+        for line in vgs.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) < 2:
+                continue
+            try:
+                vg_free_gb = float(parts[1])
+            except ValueError:
+                continue
+            if vg_free_gb < 1.0:
+                continue
+            vg_name = parts[0]
+
+            lv_path = None
+            for lv_prefix in ([], ["sudo", "-n"]):
+                lvs = subprocess.run(  # noqa: S603
+                    [*lv_prefix, "lvs", "--noheadings", "-o", "lv_path,vg_name"],
+                    capture_output=True, text=True, timeout=5, check=False,
+                )
+                if lvs.returncode == 0:
+                    for lv_line in lvs.stdout.splitlines():
+                        lp = lv_line.strip().split()
+                        if len(lp) >= 2 and lp[1] == vg_name:
+                            lv_path = lp[0]
+                            break
+                    break
+
+            return {"dev": dev, "lv_path": lv_path, "vg_name": vg_name, "vg_free_gb": vg_free_gb}
+
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _offer_lvm_extend(console: Console, lvm: dict) -> None:
+    """Показать или выполнить расширение LVM раздела."""
+    vg_free: float | None = lvm.get("vg_free_gb")
+    lv_path: str | None = lvm.get("lv_path")
+    dev: str = lvm.get("dev", "")
+
+    if vg_free and vg_free > 1.0:
+        console.print(
+            f"\n[green]LVM:[/green] обнаружено [bold]{vg_free:.1f} GB[/bold] "
+            "свободного места в VG — можно расширить раздел."
+        )
+        lv = lv_path or "<lv_path>"
+        console.print(f"  [dim]1.[/dim] [bold]sudo lvextend -l +100%FREE {lv}[/bold]")
+        console.print(f"  [dim]2.[/dim] [bold]sudo resize2fs {dev}[/bold]")
+
+        if sys.stdin.isatty() and lv_path:
+            try:
+                import questionary
+                if questionary.confirm(
+                    f"Расширить LVM автоматически (+{vg_free:.1f} GB)?",
+                    default=True,
+                ).ask():
+                    r1 = subprocess.run(  # noqa: S603
+                        ["sudo", "lvextend", "-l", "+100%FREE", lv_path], check=False
+                    )
+                    if r1.returncode != 0:
+                        console.print("[red]✗[/red] lvextend завершился с ошибкой.")
+                        return
+                    r2 = subprocess.run(  # noqa: S603
+                        ["sudo", "resize2fs", dev], check=False
+                    )
+                    if r2.returncode == 0:
+                        import shutil as _shutil
+                        free_after = _shutil.disk_usage("/").free / 1024 ** 3
+                        console.print(
+                            f"[green]✓[/green] Диск расширен! "
+                            f"Свободно: [bold]{free_after:.1f} GB[/bold]"
+                        )
+                    else:
+                        console.print("[red]✗[/red] resize2fs завершился с ошибкой.")
+            except ImportError:
+                pass
+    else:
+        console.print("\n[dim]LVM обнаружен, но свободного места в VG нет.[/dim]")
+
+
+def _show_failure_logs(console: Console, plan: EnvUpPlan) -> None:
+    """После неудачного up показать логи упавших контейнеров."""
+    import json as _json
+
+    rows = _compose_ps_rows(plan.project)
+    failed: list[str] = []
+    for row in rows:
+        svc = str(row.get("Service") or row.get("Name") or "")
+        if svc not in plan.service_names:
+            continue
+        state = str(row.get("State") or row.get("Status") or "").lower()
+        health = str(row.get("Health") or "").lower()
+        if state in ("exited", "dead", "restarting") or health == "unhealthy":
+            failed.append(svc)
+
+    targets = failed if failed else plan.service_names
+
+    console.print(f"\n[red]── Логи упавших сервисов: {', '.join(targets)} ──[/red]\n")
+    subprocess.run(  # noqa: S603
+        [
+            "docker", "compose", "-f", str(plan.project.compose_file),
+            "logs", "--tail", "60", "--no-log-prefix",
+            *targets,
+        ],
+        cwd=str(plan.project.cwd),
+        check=False,
+    )
+    console.print(f"\n[dim]Полные логи: hc env logs --follow {' '.join(targets)}[/dim]")
+
+
+_FRONTEND_VITE_OVERRIDE = "frontend-vite.hc.yml"
+
+# Исправляет проблемы compose из core-runtime-service для frontend-vite:
+#
+# 1. pnpm dev запускал ВСЕ apps (web + mobile + desktop) → меняем на
+#    pnpm --filter=web dev.
+#
+# 2. api:gen вызывает `openapi-typescript ../core-runtime-service/openapi.json …`
+#    Внутри контейнера cwd=/workspace, поэтому путь резолвится в
+#    /core-runtime-service/openapi.json. В upstream-compose примонтирован
+#    только /workspace — отсюда ENOENT. Монтируем core-runtime-service
+#    как /core-runtime-service:ro (read-only — vite туда писать не должен).
+#
+# 3. VITE_CORE_PROXY_TARGET — прокси /api на core-runtime через docker DNS,
+#    а не на localhost:18000 хоста.
+
+
+def _render_frontend_override_body(core_root: Path) -> str:
+    # ВАЖНО: запускаем vite через `pnpm --filter=web exec vite`, а не через
+    # `pnpm --filter=web dev -- --host …`. Скрипт dev в apps/web сводится к
+    # `vite`, и `pnpm run … -- --host` добавляет лишний `--`, из-за чего vite
+    # получает `vite -- --host …` и игнорирует флаги — поднимается на
+    # localhost:5173 и Caddy не может достучаться (502).
+    #
+    # Перед exec собираем `@platform/*` пакеты (это делает скрипт dev,
+    # повторяем явно).
+    cmd = (
+        "corepack enable && "
+        "pnpm install --frozen-lockfile && "
+        "pnpm api:gen && "
+        "pnpm --filter='@platform/*' build && "
+        "pnpm --filter=web exec vite --host 0.0.0.0 --port 5173"
+    )
+    return f"""\
+services:
+  frontend-vite:
+    environment:
+      VITE_CORE_PROXY_TARGET: http://core-runtime:8000
+    volumes:
+      - {core_root}:/core-runtime-service:ro
+    command: ["sh", "-c", "{cmd}"]
+"""
+
+
+def _write_frontend_compose_override(plan: EnvUpPlan) -> Path | None:
+    """Сгенерировать compose-override для корректной сборки web-приложения."""
+    if "frontend-vite" not in plan.service_names:
+        return None
+    from hc.constants import DATA_DIR
+
+    # core_root — это абсолютный путь к core-runtime-service на хосте.
+    # _frontend_workspace_path делает parent.parent от compose cwd (deploy/dev),
+    # это core-runtime-service; нам нужен сам core-runtime-service.
+    core_root = plan.project.cwd.parent.parent
+    body = _render_frontend_override_body(core_root)
+
+    path = DATA_DIR / "compose-overrides" / _FRONTEND_VITE_OVERRIDE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() or path.read_text(encoding="utf-8") != body:
+        path.write_text(body, encoding="utf-8")
+    return path
+
+
+def _build_compose_env(plan: EnvUpPlan) -> dict[str, str]:
+    """Переменные окружения для docker compose (DB + frontend/caddy + debug)."""
+    env = dict(plan.db_option.env or {})
+    if "frontend-vite" in plan.service_names:
+        # Caddy должен проксировать UI на Vite, а не на пустую ./frontend
+        env.setdefault("CADDYFILE_PATH", "./Caddyfile.hmr")
+    # Dev modes: enable DEBUG for core-runtime (rate limiting, verbose logs)
+    if plan.mode in ("dev", "dev-reload"):
+        env.setdefault("DEBUG", "1")
+        env.setdefault("DEBUG_MODE", "1")
+    return env
+
+
+def _compose_base_cmd(plan: EnvUpPlan) -> list[str]:
+    cmd = ["docker", "compose", "-f", str(plan.project.compose_file)]
+    override = _write_frontend_compose_override(plan)
+    if override:
+        cmd += ["-f", str(override)]
+    for cp in sorted(plan.compose_profiles):
+        cmd += ["--profile", cp]
+    return cmd
+
+
+def _ensure_frontend_static_build(console: Console, plan: EnvUpPlan) -> None:
+    """
+    Если caddy в плане без frontend-vite — нужна статика в deploy/dev/frontend.
+    Собираем pnpm build:web в одноразовом node-контейнере, если index.html нет.
+    """
+    if "frontend-vite" in plan.service_names or "caddy" not in plan.service_names:
+        return
+
+    frontend_dir = plan.project.cwd / "frontend"
+    if (frontend_dir / "index.html").is_file():
+        return
+
+    workspace = _frontend_workspace_path(plan)
+    if not (workspace / "package.json").is_file():
+        console.print(
+            "\n[yellow]![/yellow] [bold]deploy/dev/frontend[/bold] пуст — UI через caddy (:18080) "
+            "не будет работать.\n"
+            "  Добавь [cyan]frontend-vite[/cyan] в env up или склонируй platform-home-console."
+        )
+        return
+
+    hc_root = workspace.parent
+    console.print(
+        f"\n[cyan]→[/cyan] Собираю статику платформы → [bold]{frontend_dir}[/bold] …"
+    )
+    frontend_dir.mkdir(parents=True, exist_ok=True)
+    script = (
+        "set -e; corepack enable; pnpm install --frozen-lockfile; "
+        "pnpm build:web; cp -r apps/web/dist/. /out/"
+    )
+    r = subprocess.run(  # noqa: S603
+        [
+            "docker", "run", "--rm",
+            "-v", f"{hc_root}:/hc",
+            "-v", f"{frontend_dir}:/out",
+            "-w", "/hc/platform-home-console",
+            "node:22-alpine",
+            "sh", "-c", script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    if r.returncode != 0 or not (frontend_dir / "index.html").is_file():
+        err = (r.stderr or r.stdout or "build failed").strip()
+        console.print(f"[red]Не удалось собрать frontend:[/red] {err[:500]}")
+        console.print(
+            "[dim]Подсказка: выбери frontend-vite в env up для HMR вместо статики.[/dim]"
+        )
+        return
+    console.print("[green]✓[/green] Статика платформы собрана")
+
+
+def _print_env_up_dry_run(
+    console: Console,
+    plan: EnvUpPlan,
+    *,
+    pull: bool,
+    build: bool,
+    detach: bool,
+) -> None:
+    console.print("[bold cyan]dry run[/bold cyan] — [dim]env up (ничего не запущено)[/dim]\n")
+    console.print(f"  mode      [bold]{plan.mode}[/bold]")
+    console.print(f"  db        [bold]{plan.db_option.key}[/bold]")
+    console.print(f"  services  [bold]{', '.join(plan.service_names)}[/bold]")
+    if plan.compose_profiles:
+        console.print(f"  profiles  [bold]{', '.join(sorted(plan.compose_profiles))}[/bold]")
+    console.print(f"  compose   [dim]{plan.project.compose_file}[/dim]\n")
+
+    base = _compose_base_cmd(plan)
+    extra = plan.db_option.env or {}
+    if extra:
+        console.print("  [dim]env:[/dim]")
+        for k, v in sorted(extra.items()):
+            console.print(f"    {k}={v}")
+        console.print()
+
+    if pull:
+        console.print(f"  [dim]$ {' '.join([*base, 'pull', *plan.service_names])}[/dim]")
+    up_cmd = [*base, "up"]
+    if detach:
+        up_cmd.append("-d")
+    if build:
+        up_cmd.append("--build")
+    up_cmd += plan.service_names
+    console.print(f"  [dim]$ {' '.join(up_cmd)}[/dim]")
+    last = load_last_env()
+    if last and last.mode == plan.mode:
+        console.print("\n  [dim]последний выбор:[/dim] " + ", ".join(last.services) + f"  db={last.db}")
+
+
+def _print_env_down_dry_run(
+    console: Console,
+    *,
+    mode: str,
+    project: ComposeProject,
+    running: set[str],
+    active_profiles: set[str],
+    active_db: str,
+    volumes: bool,
+) -> None:
+    console.print("[bold cyan]dry run[/bold cyan] — [dim]env down (ничего не остановлено)[/dim]\n")
+    console.print(f"  mode      [bold]{mode}[/bold]")
+    console.print(f"  db        [bold]{active_db}[/bold]")
+    if active_profiles:
+        console.print(f"  profiles  [bold]{', '.join(sorted(active_profiles))}[/bold]")
+    if running:
+        console.print(f"  running   [bold]{', '.join(sorted(running))}[/bold]")
+    else:
+        console.print("  running   [dim](нет запущенных сервисов)[/dim]")
+
+    cmd = ["docker", "compose", "-f", str(project.compose_file)]
+    for profile in sorted(active_profiles):
+        cmd += ["--profile", profile]
+    cmd.append("down")
+    if volumes:
+        cmd.append("-v")
+        if active_db == "sqlite":
+            console.print(
+                "\n  [yellow]![/yellow] [dim]-v удалит volume core-data (SQLite)[/dim]"
+            )
+    console.print(f"\n  [dim]$ {' '.join(cmd)}[/dim]")
+
+
+def _print_summary(
+    *,
+    mode: str,
+    compose_file: Path,
+    services: list[str],
+    was_running: set[str],
+    db_option: _DbOption,
+    console: Console,
+) -> None:
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column(style="dim", min_width=16)
+    table.add_column()
+
+    for name in services:
+        status = "[dim]● already running[/dim]" if name in was_running else "[green]● started[/green]"
+        table.add_row(name, status)
+
+    console.print()
+    console.print(table)
+
+    # DB line
+    db_label = "PostgreSQL" if db_option.key == "postgres" else "SQLite"
+    console.print(f"\n  [dim]db:[/dim]      {db_label}")
+
+    # URLs
+    urls: list[tuple[str, str]] = []
+    if mode in ("dev", "dev-reload"):
+        if "caddy" in services:
+            urls.append(("UI ", "http://localhost:18080"))
+        if "core-runtime" in services:
+            urls.append(("API", "http://localhost:18000"))
+        if "frontend-vite" in services and "caddy" not in services:
+            urls.append(("HMR", "http://localhost:15173"))
+        if "postgres" in services:
+            urls.append(("PG ", "localhost:15432"))
+        if "redis" in services:
+            urls.append(("RDS", "localhost:16379"))
+    elif mode == "dev-image":
+        if "edge" in services:
+            urls.append(("UI ", "http://localhost:18080"))
+        if "core-runtime" in services:
+            urls.append(("API", "http://localhost:18000"))
+        if "redis" in services:
+            urls.append(("RDS", "localhost:16379"))
+        if "platform-web" in services:
+            urls.append(("App", "http://localhost:3000"))
+
+    for label, url in urls:
+        console.print(f"  [dim]{label}:[/dim]      [cyan]{url}[/cyan]")
+
+    if mode in ("dev", "dev-reload") and "frontend-vite" in services and "caddy" in services:
+        console.print(
+            "  [dim]vite:[/dim]    [dim]HMR через caddy → :18080 "
+            "(прямой :15173 — только отладка)[/dim]"
+        )
+
+    console.print(f"\n  [dim]compose:[/dim] {compose_file}\n")
+
+
+# ─── Command registration ─────────────────────────────────────────────────────
+
+def register(app: typer.Typer) -> None:
+    env_app = typer.Typer(
+        help=ENV_STACK_HELP,
+        context_settings={"help_option_names": ["-h", "--help"]},
+        no_args_is_help=True,
+    )
+
+    @env_app.command("up")
+    def env_up(
+        mode: str | None = typer.Option(None, "--mode", "-m", help=_MODE_HELP),
+        profile: str | None = typer.Option(None, "--profile", "-p", help=_PROFILE_HELP),
+        db: str | None = typer.Option(None, "--db", help=_DB_HELP),
+        pull: bool = typer.Option(False, "--pull/--no-pull", help="docker compose pull перед up"),
+        build: bool = typer.Option(False, "--build/--no-build", help="Пересобрать образы перед up"),
+        detach: bool = typer.Option(True, "--detach/--no-detach", "-d", help="Запустить в фоне"),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Показать план без запуска compose"),
+    ) -> None:
+        """
+        Поднять dev-окружение.
+
+        Шаг 1: чекбоксы — выбор сервисов (уже запущенные помечены ● running).
+        Шаг 2: radio — выбор БД (SQLite / PostgreSQL).
+
+        Примеры:
+          hc env up                           # интерактив
+          hc env up --profile hmr             # core + caddy + Vite HMR, спросит DB
+          hc env up --profile base --db pg    # core + caddy, PostgreSQL, без вопросов
+          hc env up --build                   # пересобрать образ и поднять
+        """
+        console = Console()
+        try:
+            if not dry_run:
+                require_docker(console)
+                _check_disk_space(console)
+            mode = _resolve_mode(mode, profile)
+            if mode not in _SERVICES:
+                console.print(f"[red]Ошибка:[/red] неизвестный режим {mode!r}. Допустимые: {' | '.join(_SERVICES)}")
+                raise typer.Exit(code=2)
+
+            src = _resolve_source(console)
+            if not dry_run:
+                ensure_core_env(console, src.path)
+            if not dry_run:
+                _try_pull_source(src, console)
+
+            plan = _resolve_env_up_plan(
+                console=console,
+                mode=mode,
+                profile=profile,
+                db=db,
+                src=src,
+            )
+            save_last_env(
+                mode=plan.mode,
+                services=plan.service_names,
+                db=plan.db_option.key,
+            )
+
+            if dry_run:
+                _print_env_up_dry_run(console, plan, pull=pull, build=build, detach=detach)
+                return
+
+            # Источник исходников: workspace (dev-монорепо) vs managed-клон.
+            # Если используется workspace — печатаем явно, чтобы человек понимал,
+            # что контейнер смонтирует именно его рабочую копию.
+            workspace = resolve_workspace_root()
+            src_path = Path(plan.project.cwd).parent.parent.resolve()
+            using_workspace = (
+                workspace is not None
+                and src_path == (workspace / "core-runtime-service").resolve()
+            )
+            if using_workspace:
+                src_label = f"[green]workspace[/green] {workspace}"
+            else:
+                src_label = f"managed-клон {src_path}"
+
+            console.print(
+                f"\n[cyan]→[/cyan] env up  "
+                f"mode=[bold]{plan.mode}[/bold]  "
+                f"db=[bold]{plan.db_option.key}[/bold]  "
+                f"services=[bold]{', '.join(plan.service_names)}[/bold]"
+            )
+            console.print(f"   [dim]src:[/dim] {src_label}")
+
+            # Подсказка: cwd внутри монорепо, но мы используем managed-клон.
+            # Часто это значит «юзер думает что редактирует свой репо, а
+            # контейнер смотрит в чужой клон». Один совет ради сэкономленного
+            # часа отладки.
+            if not using_workspace:
+                from hc.core_source import _scan_upwards_for_monorepo
+
+                cwd_repo = _scan_upwards_for_monorepo(Path.cwd())
+                if cwd_repo and Config.load().workspace.path.strip() == "":
+                    console.print(
+                        f"   [dim]hint:[/dim] [yellow]cwd внутри монорепо ({cwd_repo}),[/yellow]"
+                        f" [yellow]но workspace не привязан — правки не дойдут до контейнера.[/yellow]"
+                    )
+                    console.print(
+                        f"   [dim]      →[/dim] [cyan]hc workspace set {cwd_repo}[/cyan]"
+                    )
+
+            # frontend-vite в плане → автоклон platform-home-console (без диалога).
+            ok, recreate = _ensure_frontend_workspace(console, plan)
+            if not ok:
+                raise typer.Exit(code=1)
+
+            # caddy без vite → собрать статику в deploy/dev/frontend если пусто.
+            _ensure_frontend_static_build(console, plan)
+
+            # plan.service_names / compose override могли измениться — пересобираем:
+            base_cmd = _compose_base_cmd(plan)
+            extra_env = _build_compose_env(plan)
+
+            if pull:
+                _run(
+                    [*base_cmd, "pull", *plan.service_names],
+                    cwd=plan.project.cwd,
+                    extra_env=extra_env,
+                )
+
+            needed_ports = _get_needed_ports(plan)
+            conflicts = _find_port_conflicts(needed_ports, plan)
+            if conflicts:
+                _offer_resolve_conflicts(conflicts, console)
+
+            up_cmd = [*base_cmd, "up"]
+            if detach:
+                up_cmd.append("-d")
+            if build:
+                up_cmd.append("--build")
+            up_cmd += plan.service_names
+
+            try:
+                _compose_up_with_stale_retry(
+                    console,
+                    plan,
+                    up_cmd,
+                    extra_env=extra_env,
+                    force_recreate=recreate,
+                )
+            except typer.Exit as exit_exc:
+                # docker compose ушёл с ошибкой:
+                #   1) Сначала покажем сырые логи упавших сервисов (контекст для человека).
+                #   2) Потом прогоним через детектор известных проблем и подскажем действия.
+                if (exit_exc.exit_code or 0) != 0:
+                    _show_failure_logs(console, plan)
+                    issues, scanned = _run_postmortem(console, plan.project)
+                    _print_postmortem(console, issues, scanned_services=scanned)
+                raise
+
+            if detach:
+                console.print("[green]✓[/green] env up ok")
+                _print_summary(
+                    mode=plan.mode,
+                    compose_file=plan.project.compose_file,
+                    services=plan.service_names,
+                    was_running=plan.running,
+                    db_option=plan.db_option,
+                    console=console,
+                )
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("down")
+    def env_down(
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        volumes: bool = typer.Option(False, "--volumes", "-v", help="Удалить volumes (БД, кэш)"),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Показать план без остановки compose"),
+    ) -> None:
+        """Остановить dev-окружение (автоматически определяет активные профили)."""
+        console = Console()
+        try:
+            if not dry_run:
+                require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+
+            running = _get_running_services(project.compose_file, project.cwd)
+            active_profiles = _detect_active_profiles(running)
+            active_db = _detect_active_db(running)
+
+            if dry_run:
+                _print_env_down_dry_run(
+                    console,
+                    mode=mode,
+                    project=project,
+                    running=running,
+                    active_profiles=active_profiles,
+                    active_db=active_db,
+                    volumes=volumes,
+                )
+                return
+
+            profile_hint = f"  profiles=[bold]{', '.join(sorted(active_profiles))}[/bold]" if active_profiles else ""
+            console.print(f"[cyan]→[/cyan] env down  mode=[bold]{mode}[/bold]  db=[bold]{active_db}[/bold]{profile_hint}")
+
+            cmd = ["docker", "compose", "-f", str(project.compose_file)]
+            for profile in sorted(active_profiles):
+                cmd += ["--profile", profile]
+            cmd.append("down")
+
+            if volumes:
+                if active_db == "sqlite" and sys.stdin.isatty():
+                    console.print(
+                        "[yellow]![/yellow] SQLite хранит данные в volume [bold]core-data[/bold] — "
+                        "они будут удалены вместе с остальными volumes."
+                    )
+                    try:
+                        import questionary
+                        confirmed = questionary.confirm(
+                            "Удалить volumes (данные SQLite будут потеряны)?",
+                            default=False,
+                        ).ask()
+                    except ImportError:
+                        confirmed = True
+                    if not confirmed:
+                        console.print("[dim]Volumes оставлены.[/dim]")
+                        raise typer.Exit(code=0)
+                cmd.append("-v")
+
+            _run(cmd, cwd=project.cwd)
+            console.print("[green]✓[/green] env down ok")
+
+            if volumes:
+                _warn_orphan_volumes(console, project.cwd)
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("logs")
+    def env_logs(
+        service: str | None = typer.Argument(None, help="Сервис (пусто = все)"),
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        follow: bool = typer.Option(False, "-f", "--follow", help="Следить за логами"),
+        tail: int = typer.Option(100, "--tail", help="Кол-во последних строк"),
+        grep: str | None = typer.Option(
+            None,
+            "--grep",
+            "-g",
+            help="Фильтр regex (case-insensitive) по строкам лога. Работает и с -f.",
+        ),
+        invert: bool = typer.Option(
+            False,
+            "--invert",
+            "-v",
+            help="Инверсия фильтра --grep (показывать строки, НЕ соответствующие).",
+        ),
+    ) -> None:
+        """Логи сервисов dev-окружения.
+
+        Примеры:
+          hc env logs -f                          — стрим всех сервисов
+          hc env logs core-runtime --tail 500     — последние 500 строк ядра
+          hc env logs caddy -f --grep "/api/v1"   — стрим только запросов к API
+          hc env logs core-runtime -g ERROR -g WARN  — несколько паттернов: OR (пока один)
+          hc env logs core-runtime -g 200 -v      — всё кроме «200» в строке
+        """
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+
+            cmd = [
+                "docker", "compose", "-f", str(project.compose_file),
+                "logs", "--tail", str(tail),
+            ]
+            if follow:
+                cmd.append("-f")
+            if service:
+                cmd.append(service)
+
+            # Простой случай — без фильтра: пробросим вывод docker напрямую, чтобы
+            # сохранить цвета и читаемость. Фильтр включается только когда нужно.
+            if not grep:
+                _run(cmd, cwd=project.cwd)
+                return
+
+            # Фильтрация: подписываемся на stdout/stderr docker compose построчно
+            # и пропускаем через regex. `-f` отлично работает потому что мы
+            # не ждём завершения процесса, а итерируемся по строкам.
+            import re as _re
+
+            try:
+                pattern = _re.compile(grep, _re.IGNORECASE)
+            except _re.error as exc:
+                console.print(f"[red]Ошибка:[/red] невалидный regex '{grep}': {exc}")
+                raise typer.Exit(code=2)
+
+            proc = subprocess.Popen(  # noqa: S603
+                cmd,
+                cwd=str(project.cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            try:
+                assert proc.stdout is not None  # noqa: S101 (для типов)
+                for line in proc.stdout:
+                    match = bool(pattern.search(line))
+                    if match ^ invert:
+                        # Сохраняем перевод строки от docker.
+                        console.file.write(line)
+                        console.file.flush()
+            except KeyboardInterrupt:
+                proc.terminate()
+            finally:
+                rc = proc.wait()
+                if rc not in (0, -15):  # 0 = OK, -15 = SIGTERM (наш Ctrl-C)
+                    raise typer.Exit(code=rc)
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("restart")
+    def env_restart(
+        service: str | None = typer.Argument(None, help="Сервис (пусто = все запущенные)"),
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        build: bool = typer.Option(
+            False,
+            "--build",
+            help="Пересобрать образ перед рестартом (только для сервисов build из src)",
+        ),
+        recreate: bool = typer.Option(
+            False,
+            "--recreate",
+            help=(
+                "Пересоздать контейнер (применяет новые volume mounts / env / "
+                "конфиг-файлы вроде Caddyfile, которые `restart` не подхватит)."
+            ),
+        ),
+    ) -> None:
+        """Перезапустить сервис(ы).
+
+        Различия:
+          (по умолчанию)  — `docker compose restart`: быстрый рестарт процесса
+                            в том же контейнере. НЕ подхватит изменения в
+                            Caddyfile, mount, env или env_file.
+          --recreate      — `docker compose up -d --force-recreate`: пересоздаёт
+                            контейнер. Нужно когда поменял Caddyfile, volumes,
+                            env, или хочешь сбросить состояние FS контейнера.
+          --build         — пересобрать образ и поднять заново (для build-из-src).
+        """
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+            base = ["docker", "compose", "-f", str(project.compose_file)]
+            targets = [service] if service else []
+            label = f"[bold]{service}[/bold]" if service else "all"
+
+            if build:
+                console.print(f"[cyan]→[/cyan] build {label}")
+                _run([*base, "build", *targets], cwd=project.cwd)
+                _run([*base, "up", "-d", *targets], cwd=project.cwd)
+                console.print("[green]✓[/green] rebuild + up ok")
+                return
+
+            if recreate:
+                console.print(f"[cyan]→[/cyan] recreate {label}")
+                _run([*base, "up", "-d", "--force-recreate", *targets], cwd=project.cwd)
+                console.print("[green]✓[/green] recreate ok")
+                return
+
+            console.print(f"[cyan]→[/cyan] restart {label}")
+            _run([*base, "restart", *targets], cwd=project.cwd)
+            console.print("[green]✓[/green] restart ok")
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("reload")
+    def env_reload(
+        service: str | None = typer.Argument(None, help="Сервис (пусто = все запущенные)"),
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+    ) -> None:
+        """Алиас для `restart --recreate` — пересоздать контейнер с новым конфигом.
+
+        Удобно сразу после правки Caddyfile / mount / env. Эквивалент:
+          hc env restart [SERVICE] --recreate
+        """
+        env_restart(service=service, mode=mode, build=False, recreate=True)
+
+    @env_app.command("rebuild")
+    def env_rebuild(
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        profile: str | None = typer.Option(None, "--profile", "-p", help=_PROFILE_HELP),
+        no_cache: bool = typer.Option(False, "--no-cache", help="Сборка без кэша Docker"),
+    ) -> None:
+        """
+        Пересобрать образы и перезапустить сервисы (интерактивный выбор).
+
+        Примеры:
+          hc env rebuild                          # интерактив
+          hc env rebuild --profile base           # core + caddy без вопросов
+          hc env rebuild --no-cache               # интерактив, без кэша
+        """
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            if mode not in _SERVICES:
+                console.print(f"[red]Ошибка:[/red] неизвестный режим {mode!r}. Допустимые: {' | '.join(_SERVICES)}")
+                raise typer.Exit(code=2)
+
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+            running = _get_running_services(project.compose_file, project.cwd)
+
+            selected = _resolve_services(mode=mode, profile=profile, console=console, running=running)
+            service_names = [s.name for s in selected]
+
+            console.print(
+                f"\n[cyan]→[/cyan] env rebuild  "
+                f"mode=[bold]{mode}[/bold]  "
+                f"services=[bold]{', '.join(service_names)}[/bold]"
+                + ("  [dim]--no-cache[/dim]" if no_cache else "")
+            )
+
+            base_cmd = ["docker", "compose", "-f", str(project.compose_file)]
+
+            build_cmd = [*base_cmd, "build"]
+            if no_cache:
+                build_cmd.append("--no-cache")
+            build_cmd += service_names
+            _run(build_cmd, cwd=project.cwd)
+
+            _run([*base_cmd, "up", "-d", *service_names], cwd=project.cwd)
+            console.print(f"[green]✓[/green] rebuild ok")
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("pull")
+    def env_pull(
+        build: bool = typer.Option(
+            False, "--build", help="Если изменились зависимости/Dockerfile/compose — пересобрать запущенный стек"
+        ),
+        dry_run: bool = typer.Option(
+            False, "--dry-run", help="Только показать входящие коммиты, без pull"
+        ),
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+    ) -> None:
+        """
+        Обновить исходники core-runtime-service и platform-home-console (git pull).
+
+        Примеры:
+          hc env pull              # обновить core + platform (если склонирован)
+          hc env pull --dry-run     # показать, что подъедет, без pull
+          hc env pull --build       # после pull пересобрать запущенный стек, если нужно
+        """
+        console = Console()
+        try:
+            src = _resolve_source(console)
+            platform_path = src.path.parent / "platform-home-console"
+            has_platform = (platform_path / ".git").exists()
+
+            if dry_run:
+                fetch_incoming_commits(src.path, console, label="core-runtime-service")
+                if has_platform:
+                    fetch_incoming_commits(platform_path, console, label="platform-home-console")
+                return
+
+            core_result = pull_core_source(src, console, quiet=False)
+
+            platform_result = PullResult(updated=False)
+            if has_platform:
+                platform_result = pull_git_repo(
+                    platform_path, console, label="platform-home-console", quiet=False, autostash=True
+                )
+
+            changed = [*core_result.changed_files, *platform_result.changed_files]
+            rebuild_needed = any(_REBUILD_HINT_RE.search(f) for f in changed)
+            migrations_changed = any(_MIGRATION_HINT_RE.search(f) for f in changed)
+
+            if migrations_changed:
+                console.print(
+                    "\n[yellow]![/yellow] Обнаружены новые миграции БД — "
+                    "перезапусти core-runtime, чтобы применить:"
+                )
+                console.print("  [cyan]hc env restart core-runtime[/cyan]")
+
+            if rebuild_needed:
+                hint_files = [f for f in changed if _REBUILD_HINT_RE.search(f)]
+                if build:
+                    require_docker(console)
+                    console.print("\n[cyan]→[/cyan] Изменились зависимости/Dockerfile/compose — пересобираю...")
+                    project = compose_project_from_source(console, src, mode=mode.strip().lower())
+                    running = _get_running_services(project.compose_file, project.cwd)
+                    if running:
+                        base = _compose_with_profiles(project, running)
+                        services = sorted(running)
+                        _run([*base, "build", *services], cwd=project.cwd)
+                        _run([*base, "up", "-d", *services], cwd=project.cwd)
+                        console.print("[green]✓[/green] rebuild ok")
+                    else:
+                        console.print("[dim]Стек не запущен — пропускаю rebuild.[/dim]")
+                else:
+                    console.print(
+                        "\n[yellow]![/yellow] Изменились зависимости/Dockerfile/compose:"
+                    )
+                    for f in hint_files:
+                        console.print(f"  [dim]{f}[/dim]")
+                    console.print("  → [cyan]hc env up --build[/cyan] (или повтори с `--build`)")
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("ps")
+    def env_ps(
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        json_out: bool = typer.Option(False, "--json", help="Машинный вывод в JSON"),
+    ) -> None:
+        """Контейнеры dev-стека: состояние, порты и подсказки URL."""
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+            _print_env_ps(console, project, json_out=json_out)
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("exec")
+    def env_exec(
+        service: str = typer.Argument(..., help="Имя сервиса в compose"),
+        command: list[str] = typer.Argument(
+            None,
+            help="Команда внутри контейнера (по умолчанию sh)",
+        ),
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+    ) -> None:
+        """Выполнить команду в контейнере (по умолчанию интерактивный sh)."""
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+            running = _get_running_services(project.compose_file, project.cwd)
+            base = _compose_with_profiles(project, running)
+            exec_cmd = [*base, "exec", "-it", service]
+            exec_cmd.extend(command if command else ["sh"])
+            console.print(f"[dim]$ {' '.join(exec_cmd)}[/dim]")
+            p = subprocess.run(exec_cmd, cwd=str(project.cwd), check=False)  # noqa: S603
+            raise typer.Exit(code=p.returncode)
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("status")
+    def env_status(
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        raw: bool = typer.Option(
+            False, "--raw", help="Сырой `docker compose ps` без обработки."
+        ),
+    ) -> None:
+        """Компактный dashboard dev-стека: контейнеры, health, URL, uptime.
+
+        По умолчанию печатает богатую таблицу + блок URL endpoints. С --raw
+        печатает оригинальный `docker compose ps`.
+        """
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+
+            if raw:
+                subprocess.run(  # noqa: S603
+                    ["docker", "compose", "-f", str(project.compose_file), "ps"],
+                    cwd=str(project.cwd),
+                    check=False,
+                )
+                console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
+                console.print(ENV_VS_CORE_DOTENV)
+                return
+
+            _print_env_status_dashboard(console, project)
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("stats")
+    def env_stats(
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        watch: bool = typer.Option(False, "--watch", "-w", help="Обновлять каждые N секунд"),
+        interval: float = typer.Option(3.0, "--interval", "-n", help="Интервал обновления (сек)"),
+    ) -> None:
+        """CPU%, RAM, NET I/O контейнеров dev-окружения."""
+        import json
+        import time
+        from rich.live import Live
+        from rich.table import Table
+
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+
+            def _stats_table() -> Table:
+                r = subprocess.run(  # noqa: S603
+                    ["docker", "compose", "-f", str(project.compose_file),
+                     "stats", "--no-stream", "--format", "{{json .}}"],
+                    cwd=str(project.cwd),
+                    capture_output=True, text=True, check=False,
+                )
+                table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+                table.add_column("Сервис")
+                table.add_column("CPU%",     justify="right")
+                table.add_column("RAM",      justify="right")
+                table.add_column("RAM%",     justify="right")
+                table.add_column("NET I/O",  justify="right")
+                table.add_column("BLOCK I/O",justify="right")
+                table.add_column("PIDs",     justify="right")
+
+                for line in r.stdout.strip().splitlines():
+                    try:
+                        d = json.loads(line)
+                        cpu_s = d.get("CPUPerc", "0%")
+                        try:
+                            cpu_f = float(cpu_s.rstrip("%"))
+                            cpu_color = "red" if cpu_f > 80 else "yellow" if cpu_f > 40 else "green"
+                        except ValueError:
+                            cpu_color = "white"
+                        table.add_row(
+                            d.get("Name", "?"),
+                            f"[{cpu_color}]{cpu_s}[/{cpu_color}]",
+                            d.get("MemUsage", "?"),
+                            d.get("MemPerc", "?"),
+                            d.get("NetIO", "?"),
+                            d.get("BlockIO", "?"),
+                            d.get("PIDs", "?"),
+                        )
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                return table
+
+            if watch:
+                with Live(refresh_per_second=1, screen=False) as live:
+                    while True:
+                        live.update(_stats_table())
+                        time.sleep(interval)
+            else:
+                console.print(_stats_table())
+
+        except (KeyboardInterrupt, typer.Abort):
+            pass
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("health")
+    def env_health(
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+    ) -> None:
+        """Healthcheck статус каждого сервиса окружения."""
+        import json
+        from rich.table import Table
+
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+
+            r = subprocess.run(  # noqa: S603
+                ["docker", "compose", "-f", str(project.compose_file),
+                 "ps", "--format", "json"],
+                cwd=str(project.cwd),
+                capture_output=True, text=True, check=False,
+            )
+
+            table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+            table.add_column("Сервис")
+            table.add_column("Статус")
+            table.add_column("Health")
+            table.add_column("Порты")
+
+            _HEALTH_COLOR = {"healthy": "green", "unhealthy": "red",
+                             "starting": "yellow", "none": "dim"}
+
+            rows: list[dict] = []
+            raw = r.stdout.strip()
+            if raw:
+                try:
+                    parsed = json.loads(raw)
+                    rows = parsed if isinstance(parsed, list) else [parsed]
+                except json.JSONDecodeError:
+                    for line in raw.splitlines():
+                        try:
+                            rows.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+
+            if not rows:
+                console.print("[yellow]Нет запущенных контейнеров.[/yellow]")
+                console.print(f"[dim]compose:[/dim] {project.compose_file}")
+                return
+
+            for row in rows:
+                name = row.get("Service") or row.get("Name") or "?"
+                state = str(row.get("State") or row.get("Status") or "?").lower()
+                health = str(row.get("Health") or "none").lower()
+                ports = row.get("Publishers") or row.get("Ports") or ""
+                if isinstance(ports, list):
+                    ports = ", ".join(
+                        f"{p.get('PublishedPort', '')}→{p.get('TargetPort', '')}"
+                        for p in ports if p.get("PublishedPort")
+                    )
+
+                sc = _STATE_COLOR.get(state, "white")
+                hc_color = _HEALTH_COLOR.get(health, "white")
+                health_icon = {"healthy": "✓", "unhealthy": "✗",
+                               "starting": "…", "none": "—"}.get(health, health)
+
+                table.add_row(
+                    f"[bold]{name}[/bold]",
+                    f"[{sc}]{state}[/{sc}]",
+                    f"[{hc_color}]{health_icon} {health}[/{hc_color}]",
+                    str(ports),
+                )
+
+            console.print(table)
+            console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("clean")
+    def env_clean(
+        volumes: bool = typer.Option(False, "--volumes", help="Удалить также orphan volumes"),
+        all_images: bool = typer.Option(False, "--all-images", help="Удалить все неиспользуемые образы (не только dangling)"),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Показать что будет удалено без выполнения"),
+    ) -> None:
+        """Очистить orphan Docker ресурсы (dangling images, неиспользуемые volumes)."""
+        console = Console()
+        require_docker(console)
+
+        image_cmd = ["docker", "image", "prune", "-f"]
+        if all_images:
+            image_cmd.append("--all")
+
+        if dry_run:
+            console.print("[yellow]Dry run:[/yellow] будет выполнено:")
+            console.print(f"  {' '.join(image_cmd)}")
+            if volumes:
+                console.print("  docker volume prune -f")
+            return
+
+        console.print("[cyan]→[/cyan] Очистка Docker ресурсов...")
+        p = subprocess.run(image_cmd, capture_output=True, text=True, check=False)  # noqa: S603
+        out = (p.stdout or "").strip()
+        if p.returncode == 0:
+            console.print(f"[green]✓[/green] Images: {out or 'nothing to remove'}")
+        else:
+            console.print(f"[yellow]Images:[/yellow] {(p.stderr or '').strip()}")
+
+        if volumes:
+            p = subprocess.run(  # noqa: S603
+                ["docker", "volume", "prune", "-f"], capture_output=True, text=True, check=False
+            )
+            out = (p.stdout or "").strip()
+            if p.returncode == 0:
+                console.print(f"[green]✓[/green] Volumes: {out or 'nothing to remove'}")
+            else:
+                console.print(f"[yellow]Volumes:[/yellow] {(p.stderr or '').strip()}")
+
+    # --- hc env dotenv: управление .env файлом core-runtime-service ---
+
+    _SECRET_RE = re.compile(r"(KEY|SECRET|PASSWORD|TOKEN|PASS|PRIVATE|MASTER)", re.IGNORECASE)
+
+    def _dotenv_local_path() -> tuple[bool, "Path | None"]:
+        """Найти .env локально через _resolve_source. Возвращает (found, path)."""
+        from rich.console import Console as _C
+        try:
+            src = _resolve_source(_C(stderr=True))
+            env_path = src.path / ".env"
+            return True, env_path
+        except SystemExit:
+            return False, None
+
+    def _parse_dotenv(text: str) -> list[tuple[str, str, str]]:
+        """Parse .env → list of (raw_line, key, value). Preserves comments/blanks as ('line', '', '')."""
+        result = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                result.append((line, "", ""))
+            elif "=" in stripped:
+                key, _, val = stripped.partition("=")
+                result.append((line, key.strip(), val))
+            else:
+                result.append((line, "", ""))
+        return result
+
+    def _serialize_dotenv(entries: list[tuple[str, str, str]]) -> str:
+        return "\n".join(e[0] for e in entries) + "\n"
+
+    def _mask(key: str, val: str) -> str:
+        return "***" if _SECRET_RE.search(key) and val else val
+
+    dotenv_app = typer.Typer(
+        help="Управление .env файлом core-runtime-service",
+        context_settings={"help_option_names": ["-h", "--help"]},
+        no_args_is_help=True,
+    )
+
+    @dotenv_app.command("show")
+    def dotenv_show(
+        no_mask: bool = typer.Option(False, "--no-mask", help="Показать секреты без маскировки"),
+        ssh: str | None = typer.Option(None, "--ssh", help="user@host (по умолчанию из deploy config)"),
+        env_path: str | None = typer.Option(None, "--env-path", help="Путь к .env на удалённом сервере"),
+    ) -> None:
+        """Показать содержимое .env (секреты маскируются по умолчанию)."""
+        console = Console()
+        cfg = Config.load()
+        resolved_ssh = ssh or cfg.deploy.ssh or None
+
+        if resolved_ssh:
+            remote_file = env_path or (f"{cfg.deploy.path}/.env" if cfg.deploy.path else "")
+            if not remote_file:
+                console.print("[red]Ошибка:[/red] укажи --env-path или задай deploy.path в config.")
+                raise typer.Exit(code=1)
+            p = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat {remote_file}"],
+                capture_output=True, text=True, check=False,
+            )
+            if p.returncode != 0:
+                console.print(f"[red]SSH ошибка:[/red] {(p.stderr or '').strip()}")
+                raise typer.Exit(code=p.returncode)
+            text = p.stdout
+            console.print(f"[dim]{resolved_ssh}:{remote_file}[/dim]")
+        else:
+            found, path = _dotenv_local_path()
+            if not found or path is None:
+                raise typer.Exit(code=2)
+            if not path.exists():
+                console.print(f"[yellow].env не найден:[/yellow] {path}")
+                raise typer.Exit(code=0)
+            text = path.read_text(encoding="utf-8", errors="replace")
+            console.print(f"[dim]{path}[/dim]")
+
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                console.print(f"[dim]{line}[/dim]")
+            elif "=" in stripped:
+                key, _, val = stripped.partition("=")
+                display_val = val if no_mask else _mask(key.strip(), val)
+                console.print(f"[bold cyan]{key}[/bold cyan]={display_val}")
+            else:
+                console.print(line)
+
+    @dotenv_app.command("set")
+    def dotenv_set(
+        assignment: str = typer.Argument(..., help="KEY=VALUE"),
+        ssh: str | None = typer.Option(None, "--ssh", help="user@host (по умолчанию из deploy config)"),
+        env_path: str | None = typer.Option(None, "--env-path", help="Путь к .env на удалённом сервере"),
+    ) -> None:
+        """Добавить или обновить переменную в .env. Формат: KEY=VALUE."""
+        console = Console()
+        if "=" not in assignment:
+            console.print("[red]Ошибка:[/red] формат KEY=VALUE")
+            raise typer.Exit(code=1)
+        key, _, val = assignment.partition("=")
+        key = key.strip()
+        if not key:
+            console.print("[red]Ошибка:[/red] ключ не может быть пустым")
+            raise typer.Exit(code=1)
+
+        cfg = Config.load()
+        resolved_ssh = ssh or cfg.deploy.ssh or None
+
+        if resolved_ssh:
+            remote_file = env_path or (f"{cfg.deploy.path}/.env" if cfg.deploy.path else "")
+            if not remote_file:
+                console.print("[red]Ошибка:[/red] укажи --env-path или задай deploy.path в config.")
+                raise typer.Exit(code=1)
+            # Download, modify, upload
+            p = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat {remote_file} 2>/dev/null || true"],
+                capture_output=True, text=True, check=False,
+            )
+            text = p.stdout or ""
+        else:
+            found, path = _dotenv_local_path()
+            if not found or path is None:
+                raise typer.Exit(code=2)
+            text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+
+        entries = _parse_dotenv(text)
+        updated = False
+        new_line = f"{key}={val}"
+        for i, (raw, k, v) in enumerate(entries):
+            if k == key:
+                entries[i] = (new_line, key, val)
+                updated = True
+                break
+        if not updated:
+            entries.append((new_line, key, val))
+
+        new_text = _serialize_dotenv(entries)
+
+        if resolved_ssh:
+            remote_file = env_path or f"{cfg.deploy.path}/.env"
+            import shlex as _shlex
+            # Atomic write: write to temp file, then mv (prevents corruption on disconnect)
+            remote_tmp = f"{remote_file}.tmp.$$"
+            p2 = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_tmp)} && mv {_shlex.quote(remote_tmp)} {_shlex.quote(remote_file)}"],
+                input=new_text, capture_output=True, text=True, check=False,
+            )
+            if p2.returncode != 0:
+                console.print(f"[red]SSH ошибка:[/red] {(p2.stderr or '').strip()}")
+                raise typer.Exit(code=p2.returncode)
+            console.print(f"[green]✓[/green] {key} {'обновлён' if updated else 'добавлен'} в {resolved_ssh}:{remote_file}")
+        else:
+            path.write_text(new_text, encoding="utf-8")  # type: ignore[union-attr]
+            console.print(f"[green]✓[/green] {key} {'обновлён' if updated else 'добавлен'} в {path}")
+
+    @dotenv_app.command("unset")
+    def dotenv_unset(
+        key: str = typer.Argument(..., help="Имя переменной для удаления"),
+        ssh: str | None = typer.Option(None, "--ssh", help="user@host"),
+        env_path: str | None = typer.Option(None, "--env-path", help="Путь к .env на сервере"),
+    ) -> None:
+        """Удалить переменную из .env."""
+        console = Console()
+        cfg = Config.load()
+        resolved_ssh = ssh or cfg.deploy.ssh or None
+
+        if resolved_ssh:
+            remote_file = env_path or (f"{cfg.deploy.path}/.env" if cfg.deploy.path else "")
+            if not remote_file:
+                console.print("[red]Ошибка:[/red] укажи --env-path или задай deploy.path в config.")
+                raise typer.Exit(code=1)
+            p = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat {remote_file} 2>/dev/null || true"],
+                capture_output=True, text=True, check=False,
+            )
+            text = p.stdout or ""
+        else:
+            found, path = _dotenv_local_path()
+            if not found or path is None:
+                raise typer.Exit(code=2)
+            if not path.exists():
+                console.print(f"[yellow].env не найден:[/yellow] {path}")
+                raise typer.Exit(code=0)
+            text = path.read_text(encoding="utf-8", errors="replace")
+
+        entries = _parse_dotenv(text)
+        before = len(entries)
+        entries = [(raw, k, v) for raw, k, v in entries if k != key]
+        if len(entries) == before:
+            console.print(f"[yellow]{key} не найден в .env[/yellow]")
+            raise typer.Exit(code=0)
+
+        new_text = _serialize_dotenv(entries)
+
+        if resolved_ssh:
+            import shlex as _shlex
+            remote_file = env_path or f"{cfg.deploy.path}/.env"
+            remote_tmp = f"{remote_file}.tmp.$$"
+            p2 = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_tmp)} && mv {_shlex.quote(remote_tmp)} {_shlex.quote(remote_file)}"],
+                input=new_text, capture_output=True, text=True, check=False,
+            )
+            if p2.returncode != 0:
+                console.print(f"[red]SSH ошибка:[/red] {(p2.stderr or '').strip()}")
+                raise typer.Exit(code=p2.returncode)
+            console.print(f"[green]✓[/green] {key} удалён из {resolved_ssh}:{remote_file}")
+        else:
+            path.write_text(new_text, encoding="utf-8")  # type: ignore[union-attr]
+            console.print(f"[green]✓[/green] {key} удалён из {path}")
+
+    @dotenv_app.command("edit")
+    def dotenv_edit(
+        ssh: str | None = typer.Option(None, "--ssh", help="user@host"),
+        env_path: str | None = typer.Option(None, "--env-path", help="Путь к .env на сервере"),
+    ) -> None:
+        """Открыть .env в $EDITOR (для SSH — скачивает, редактирует, загружает)."""
+        import shlex as _shlex
+        import shutil as _shutil
+        import tempfile as _tempfile
+        console = Console()
+        cfg = Config.load()
+        resolved_ssh = ssh or cfg.deploy.ssh or None
+
+        editor = (os.environ.get("VISUAL") or os.environ.get("EDITOR") or "").strip()
+        if not editor:
+            for cand in ("nvim", "vim", "nano", "micro"):
+                if _shutil.which(cand):
+                    editor = cand
+                    break
+        if not editor:
+            console.print("[red]Ошибка:[/red] не задан редактор. Укажи переменную EDITOR или VISUAL.")
+            raise typer.Exit(code=2)
+
+        if resolved_ssh:
+            remote_file = env_path or (f"{cfg.deploy.path}/.env" if cfg.deploy.path else "")
+            if not remote_file:
+                console.print("[red]Ошибка:[/red] укажи --env-path или задай deploy.path в config.")
+                raise typer.Exit(code=1)
+            with _tempfile.NamedTemporaryFile(suffix=".env", delete=False) as tmp:
+                tmp_path = tmp.name
+            p = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat {remote_file} 2>/dev/null || true"],
+                capture_output=True, text=True, check=False,
+            )
+            open(tmp_path, "w").write(p.stdout or "")  # noqa: WPS515
+            cmd = [*_shlex.split(editor), tmp_path]
+            subprocess.run(cmd, check=False)  # noqa: S603
+            new_text = open(tmp_path).read()  # noqa: WPS515
+            os.unlink(tmp_path)
+            p2 = subprocess.run(  # noqa: S603
+                ["ssh", resolved_ssh, f"cat > {_shlex.quote(remote_tmp)} && mv {_shlex.quote(remote_tmp)} {_shlex.quote(remote_file)}"],
+                input=new_text, capture_output=True, text=True, check=False,
+            )
+            if p2.returncode != 0:
+                console.print(f"[red]SSH ошибка:[/red] {(p2.stderr or '').strip()}")
+                raise typer.Exit(code=p2.returncode)
+            console.print(f"[green]✓[/green] .env сохранён на {resolved_ssh}:{remote_file}")
+        else:
+            found, path = _dotenv_local_path()
+            if not found or path is None:
+                raise typer.Exit(code=2)
+            if not path.exists():
+                path.touch()
+            cmd = [*_shlex.split(editor), str(path)]
+            p = subprocess.run(cmd, check=False)  # noqa: S603
+            if p.returncode != 0:
+                console.print(f"[yellow]Редактор завершился с кодом {p.returncode}[/yellow]")
+            else:
+                console.print("[green]✓[/green] .env сохранён")
+
+    env_app.add_typer(dotenv_app, name="dotenv")
+
+    # ─── hc env reset-vault ────────────────────────────────────────────────
+
+    @env_app.command("reset-vault")
+    def env_reset_vault(
+        db: str = typer.Option(
+            "auto",
+            "--db",
+            help="Какой vault сбрасывать: auto | sqlite | postgres (auto = по запущенному стеку)",
+        ),
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение"),
+        restart: bool = typer.Option(
+            True,
+            "--restart/--no-restart",
+            help="Перезапустить core-runtime после сброса",
+        ),
+    ) -> None:
+        """
+        Сбросить vault (шифрованное хранилище секретов) — нужно когда RUNTIME_MASTER_KEY
+        не совпадает с тем, которым зашифрованы существующие записи.
+
+        Что удаляется:
+          • sqlite:   /data/vault.db и /data/vault_secret.db (+ WAL/SHM)
+          • postgres: записи в storage с namespace в (secrets.store, _system.meta,
+                      _system.root_hash, _system.audit_log) + TRUNCATE storage_metadata
+
+        Что НЕ удаляется: данные core (runtime.db / основная схема Postgres) — их
+        миграции и пользовательские записи остаются нетронутыми.
+
+        После сброса core при следующем старте сгенерирует CSRF_SECRET и
+        OAUTH_ENCRYPTION_KEY заново и положит в новый vault с текущим RUNTIME_MASTER_KEY.
+
+        Примеры:
+          hc env reset-vault              # auto-detect + подтверждение
+          hc env reset-vault --db postgres --yes
+          hc env reset-vault --no-restart # сбросить, но не перезапускать
+        """
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+
+            db_key = db.strip().lower().replace("pg", "postgres")
+            resolved: DbKind
+            if db_key == "auto":
+                detected = detect_running_db(project.compose_file, project.cwd)
+                if detected is None:
+                    # Фоллбэк на last_env, если стек не запущен.
+                    last = load_last_env()
+                    if last and last.db in {"sqlite", "postgres"}:
+                        resolved = last.db  # type: ignore[assignment]
+                        console.print(
+                            f"[dim]Стек не запущен, использую db={resolved} из последнего env up[/dim]"
+                        )
+                    else:
+                        console.print(
+                            "[red]Ошибка:[/red] не удалось определить активную БД. "
+                            "Укажи явно: --db sqlite или --db postgres"
+                        )
+                        raise typer.Exit(code=2)
+                else:
+                    resolved = detected
+            elif db_key in {"sqlite", "postgres"}:
+                resolved = db_key  # type: ignore[assignment]
+            else:
+                console.print(
+                    f"[red]Ошибка:[/red] --db {db!r} неизвестен. Допустимые: auto | sqlite | postgres"
+                )
+                raise typer.Exit(code=2)
+
+            # Предупреждение пользователю.
+            console.print(
+                f"\n[yellow]![/yellow] Сейчас будет сброшен vault для [bold]{resolved}[/bold]."
+            )
+            if resolved == "postgres":
+                console.print(
+                    "  [dim]Удалятся записи storage из vault-namespaces + "
+                    "TRUNCATE storage_metadata.[/dim]"
+                )
+                console.print(
+                    "  [dim]Core-данные (схемы Alembic, прочие записи) остаются.[/dim]"
+                )
+            else:
+                console.print(
+                    "  [dim]Удалятся файлы /data/vault.db и /data/vault_secret.db "
+                    "(+ WAL/SHM) из volume core-data.[/dim]"
+                )
+                console.print("  [dim]Файл /data/runtime.db (core) остаётся.[/dim]")
+
+            if not yes and sys.stdin.isatty():
+                try:
+                    import questionary
+                    confirmed = questionary.confirm(
+                        "Продолжить сброс vault?",
+                        default=False,
+                    ).ask()
+                except ImportError:
+                    confirmed = False
+                if not confirmed:
+                    console.print("[dim]Отменено.[/dim]")
+                    raise typer.Exit(code=0)
+
+            # Сам сброс.
+            console.print(f"\n[cyan]→[/cyan] reset-vault [bold]{resolved}[/bold]")
+            if resolved == "postgres":
+                result = reset_vault_postgres(
+                    compose_file=project.compose_file,
+                    cwd=project.cwd,
+                )
+            else:
+                result = reset_vault_sqlite(
+                    compose_file=project.compose_file,
+                    cwd=project.cwd,
+                )
+
+            for action in result.actions:
+                console.print(f"  [dim]·[/dim] {action}")
+
+            if not result.success:
+                console.print(f"[red]✗[/red] reset-vault failed: {result.message}")
+                raise typer.Exit(code=1)
+
+            console.print(f"[green]✓[/green] vault сброшен ({result.db})")
+
+            # Перезапуск core-runtime — он пересоздаст vault и runtime-секреты.
+            if restart:
+                running = _get_running_services(project.compose_file, project.cwd)
+                if "core-runtime" in running:
+                    console.print("[cyan]→[/cyan] restart core-runtime")
+                    _run(
+                        ["docker", "compose", "-f", str(project.compose_file),
+                         "restart", "core-runtime"],
+                        cwd=project.cwd,
+                    )
+                    console.print("[green]✓[/green] core-runtime перезапущен")
+                    console.print(
+                        "  [dim]Проверь:[/dim] [cyan]hc env health[/cyan] "
+                        "или [cyan]hc env logs core-runtime --tail 50[/cyan]"
+                    )
+                else:
+                    console.print(
+                        "  [dim]core-runtime не запущен — подними его: [/dim][cyan]hc env up[/cyan]"
+                    )
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    @env_app.command("doctor")
+    def env_doctor(
+        quick: bool = typer.Option(False, "--quick", "-q"),
+        json_out: bool = typer.Option(False, "--json"),
+    ) -> None:
+        """Алиас `hc doctor --dev` — диагностика DEV-стека."""
+        from hc.commands.doctor import run_doctor_cmd
+
+        run_doctor_cmd(quick=quick, dev=True, json_out=json_out)
+
+    app.add_typer(env_app, name="env")

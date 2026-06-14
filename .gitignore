@@ -19,6 +19,7 @@ __pycache__/
 .venv/
 venv/
 env/
+!hc/commands/env/
 
 # backups
 backups/

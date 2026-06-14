@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 def env_modules(isolated_home, tmp_path, monkeypatch):
     import hc.constants as constants
     import hc.env_state as env_state
-    import hc.commands.env as env_mod
+    import hc.commands.env._register as env_mod
 
     importlib.reload(constants)
     monkeypatch.setattr(env_state, "LAST_ENV_PATH", tmp_path / "last_env.json")

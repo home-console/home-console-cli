@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-import hc.commands.env as env_mod
+import hc.commands.env._register as env_mod
 
 
 def _make_plan(tmp_path: Path, services: list[str]) -> SimpleNamespace:

@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 def env_mod(isolated_home, monkeypatch):
     import importlib
 
-    import hc.commands.env as m
+    import hc.commands.env._register as m
 
     importlib.reload(m)
     return m

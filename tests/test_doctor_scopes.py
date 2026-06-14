@@ -99,7 +99,7 @@ def test_plugin_list_json(monkeypatch, runner: CliRunner, isolated_home) -> None
 
 
 def test_env_ps_json(monkeypatch, runner: CliRunner, isolated_home) -> None:
-    import hc.commands.env as env_mod
+    import hc.commands.env._register as env_mod
 
     monkeypatch.setattr("hc.main.print_update_banner", lambda *a, **k: None)
     monkeypatch.setattr(env_mod, "require_docker", lambda console: None)

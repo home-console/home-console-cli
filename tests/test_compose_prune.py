@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import hc.commands.env as env_mod
+import hc.commands.env._register as env_mod
 
 
 def _make_plan(tmp_path: Path) -> SimpleNamespace:
