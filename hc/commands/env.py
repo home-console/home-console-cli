@@ -1842,11 +1842,15 @@ def _write_frontend_compose_override(plan: EnvUpPlan) -> Path | None:
 
 
 def _build_compose_env(plan: EnvUpPlan) -> dict[str, str]:
-    """Переменные окружения для docker compose (DB + frontend/caddy)."""
+    """Переменные окружения для docker compose (DB + frontend/caddy + debug)."""
     env = dict(plan.db_option.env or {})
     if "frontend-vite" in plan.service_names:
         # Caddy должен проксировать UI на Vite, а не на пустую ./frontend
         env.setdefault("CADDYFILE_PATH", "./Caddyfile.hmr")
+    # Dev modes: enable DEBUG for core-runtime (rate limiting, verbose logs)
+    if plan.mode in ("dev", "dev-reload"):
+        env.setdefault("DEBUG", "1")
+        env.setdefault("DEBUG_MODE", "1")
     return env
 
 
