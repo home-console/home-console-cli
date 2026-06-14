@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from hc.constants import KNOWN_ENDPOINTS
+from hc.constants import KNOWN_ENDPOINTS, QUESTIONARY_STYLE_KWARGS
 
 
 # ─── Service catalogue ────────────────────────────────────────────────────────
@@ -144,6 +144,9 @@ _REBUILD_HINT_RE = re.compile(
 
 # Новые alembic-миграции — нужен restart core-runtime, чтобы они применились.
 _MIGRATION_HINT_RE = re.compile(r"(^|/)(alembic|migrations)/versions/.*\.py$")
+
+# Frontend Vite compose override filename
+_FRONTEND_VITE_OVERRIDE = "frontend-vite.hc.yml"
 
 
 # Re-export from constants for backward compat
