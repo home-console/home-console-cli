@@ -635,30 +635,6 @@ class HCClient:
         )
         return data if isinstance(data, dict) else None
 
-    async def admin_marketplace_install_from_registry(
-        self,
-        plugin_name: str,
-        *,
-        version: str | None = None,
-        channel: str = "stable",
-        registry_url: str | None = None,
-        force_update: bool = False,
-    ) -> dict[str, Any] | None:
-        body: dict[str, Any] = {"plugin_name": plugin_name, "channel": channel}
-        if version:
-            body["version"] = version
-        if registry_url:
-            body["registry_url"] = registry_url
-        if force_update:
-            body["force_update"] = True
-        data = await self._request_json_absolute(
-            "POST",
-            endpoints.ADMIN_MARKETPLACE_INSTALL_FROM_REGISTRY,
-            json=body,
-            return_error_json=True,
-        )
-        return data if isinstance(data, dict) else None
-
     async def admin_marketplace_update_from_registry(
         self,
         plugin_name: str,

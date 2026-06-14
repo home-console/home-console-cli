@@ -20,4 +20,8 @@ def test_is_compose_running_requires_header_plus_row() -> None:
 
 
 def test_ssh_cmd_is_argv_list_no_shell() -> None:
-    assert _ssh_cmd("u@h", "cd /srv && ls") == ["ssh", "u@h", "cd /srv && ls"]
+    result = _ssh_cmd("u@h", "cd /srv && ls")
+    assert result[0] == "ssh"
+    assert result[-1] == "cd /srv && ls"
+    assert "u@h" in result
+    assert any("ConnectTimeout" in arg for arg in result)

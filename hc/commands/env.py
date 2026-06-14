@@ -161,6 +161,16 @@ _PROFILE_HELP = (
 )
 _DB_HELP = "sqlite | postgres  (без --db: интерактивный выбор если core-runtime выбран)"
 
+# Container state → Rich color mapping (used in `env ps`, `env status`)
+_STATE_COLOR: dict[str, str] = {
+    "running":    "green",
+    "exited":     "red",
+    "dead":       "red",
+    "restarting": "yellow",
+    "created":    "dim",
+    "paused":     "yellow",
+}
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -606,16 +616,8 @@ def _print_env_status_dashboard(console: Console, project: ComposeProject) -> No
         state_counts[state] = state_counts.get(state, 0) + 1
 
     def _state_chip(state: str, count: int) -> str:
-        colors = {
-            "running":    "green",
-            "exited":     "red",
-            "dead":       "red",
-            "restarting": "yellow",
-            "created":    "dim",
-            "paused":     "yellow",
-        }
-        color = colors.get(state, "white")
-        return f"[{color}]{count} {state}[/{color}]"
+        color = _STATE_COLOR.get(state, "white")
+        return f"[{color}]{count} state[/{color}]"
 
     summary = "  ".join(_state_chip(s, n) for s, n in sorted(state_counts.items()))
     console.print(f"\n[bold]Стек:[/bold]  {summary}")
@@ -627,14 +629,6 @@ def _print_env_status_dashboard(console: Console, project: ComposeProject) -> No
     table.add_column("Uptime", style="dim")
     table.add_column("URL / порт", style="cyan")
 
-    state_color = {
-        "running":    "green",
-        "exited":     "red",
-        "dead":       "red",
-        "restarting": "yellow",
-        "created":    "dim",
-        "paused":     "yellow",
-    }
     health_icon = {
         "healthy":   "[green]✓ healthy[/green]",
         "unhealthy": "[red]✗ unhealthy[/red]",
@@ -660,7 +654,7 @@ def _print_env_status_dashboard(console: Console, project: ComposeProject) -> No
         if not url and ports and ports != "[]":
             url = ports
 
-        color = state_color.get(state, "white")
+        color = _STATE_COLOR.get(state, "white")
         table.add_row(
             service,
             f"[{color}]{state}[/{color}]",
@@ -2738,7 +2732,6 @@ def register(app: typer.Typer) -> None:
             table.add_column("Health")
             table.add_column("Порты")
 
-            _STATUS_COLOR = {"running": "green", "exited": "red", "paused": "yellow"}
             _HEALTH_COLOR = {"healthy": "green", "unhealthy": "red",
                              "starting": "yellow", "none": "dim"}
 
@@ -2771,7 +2764,7 @@ def register(app: typer.Typer) -> None:
                         for p in ports if p.get("PublishedPort")
                     )
 
-                sc = _STATUS_COLOR.get(state, "white")
+                sc = _STATE_COLOR.get(state, "white")
                 hc_color = _HEALTH_COLOR.get(health, "white")
                 health_icon = {"healthy": "✓", "unhealthy": "✗",
                                "starting": "…", "none": "—"}.get(health, health)

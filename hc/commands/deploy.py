@@ -149,9 +149,9 @@ def _copy_dir_contents(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst)
 
 
-def _ssh_cmd(ssh: str, remote_cmd: str) -> list[str]:
+def _ssh_cmd(ssh: str, remote_cmd: str, connect_timeout: int = 10) -> list[str]:
     # deliberately no shell=True
-    return ["ssh", ssh, remote_cmd]
+    return ["ssh", "-o", f"ConnectTimeout={connect_timeout}", "-o", "ServerAliveInterval=30", ssh, remote_cmd]
 
 
 def _is_compose_running(ps_stdout: str) -> bool:
