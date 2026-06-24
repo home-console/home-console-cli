@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.0.30] — 2026-06-24
+
+### Added
+- `hc env up`: автопривязка `workspace.path` при обнаружении монорепо (cwd / HC_WORKSPACE)
+- `hc env up`: проверка исходников Core на незакрытые git merge conflict до запуска compose
+- `hc env up`: автофикс расщеплённого compose-стека (workspace vs managed-клон) — остановка всех контейнеров проекта, `workspace.path` в конфиг, продолжение `env up` с единым источником
+
+### Changed
+- ранний автофикс расщеплённого стека — до сборки compose-плана, а не только после предупреждения
+
 ## [0.0.9] — 2026-05-17
 
 ### Added

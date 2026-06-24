@@ -99,6 +99,45 @@ def resolve_workspace_root() -> Path | None:
     return None
 
 
+def ensure_workspace_pinned(
+    console: Console | None = None,
+    *,
+    quiet: bool = False,
+) -> Path | None:
+    """Сохранить обнаруженный workspace в config.toml для стабильного источника.
+
+    Без привязки `hc env up` из произвольного cwd может взять managed-клон
+    (~/.local/share/hc), а уже запущенные контейнеры — другой путь → расщепление
+    стека и «правки не доходят до контейнера».
+    """
+    detected = detect_workspace_root()
+    if detected is None:
+        return None
+
+    resolved = str(detected.resolve())
+    from hc.config import Config
+
+    cfg = Config.load()
+    prev = (cfg.workspace.path or "").strip()
+    if prev == resolved:
+        return detected
+
+    cfg.workspace.path = resolved
+    cfg.save()
+    if not quiet and console is not None:
+        if prev:
+            console.print(
+                f"[dim]→ workspace.path обновлён:[/dim] {detected} "
+                f"[dim](был {prev})[/dim]"
+            )
+        else:
+            console.print(
+                f"[dim]→ workspace.path сохранён:[/dim] {detected} "
+                "[dim](env up всегда будет использовать этот монорепо)[/dim]"
+            )
+    return detected
+
+
 # ─── Канонический маппинг режимов → compose-файл ──────────────────────────────
 #
 # Режим         Compose-файл (rel to core-runtime-service)      Когда использовать

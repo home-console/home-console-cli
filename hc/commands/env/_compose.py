@@ -145,13 +145,25 @@ def _compose_with_profiles(
     return cmd
 
 
-def _compose_project_name(plan: EnvUpPlan) -> str:
-    import json as _json
+from hc.commands.env._catalog import (
+    _SERVICES, _DB_OPTIONS, EnvUpPlan, KNOWN_ENDPOINTS,
+)
+from hc.core_ops import ComposeProject
 
-    base = _compose_base_cmd(plan)
+
+def compose_project_name(project: ComposeProject) -> str:
+    """Имя compose-проекта (метка com.docker.compose.project)."""
     r = subprocess.run(  # noqa: S603
-        [*base, "config", "--format", "json"],
-        cwd=str(plan.project.cwd),
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(project.compose_file),
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=str(project.cwd),
         capture_output=True,
         text=True,
         timeout=10,
@@ -159,12 +171,16 @@ def _compose_project_name(plan: EnvUpPlan) -> str:
     )
     if r.returncode == 0:
         try:
-            name = _json.loads(r.stdout).get("name")
+            name = json.loads(r.stdout).get("name")
             if name:
                 return str(name)
-        except _json.JSONDecodeError:
+        except json.JSONDecodeError:
             pass
-    return plan.project.cwd.name
+    return project.cwd.name
+
+
+def _compose_project_name(plan: EnvUpPlan) -> str:
+    return compose_project_name(plan.project)
 
 
 def planned_config_files_from_cmd(base_cmd: list[str]) -> str:

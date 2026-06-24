@@ -8,6 +8,14 @@ from unittest.mock import MagicMock
 
 import hc.commands.env._diagnostics as diag_mod
 from hc.commands.env._compose import planned_config_files_from_cmd
+from hc.constants import CORE_SRC_DIR
+
+
+def _make_monorepo(tmp_path: Path, name: str = "HomeConsole") -> Path:
+    root = tmp_path / name
+    (root / "core-runtime-service" / "deploy" / "dev").mkdir(parents=True)
+    (root / "home-console-cli").mkdir(parents=True)
+    return root
 
 
 def _make_plan(tmp_path: Path, *, services: list[str] | None = None) -> SimpleNamespace:
@@ -158,3 +166,157 @@ def test_detect_for_project_status_only(tmp_path: Path, monkeypatch) -> None:
     assert issue is not None
     assert issue.already_split is True
     assert issue.would_split is False
+
+
+def test_suggest_workspace_prefers_cwd_monorepo(tmp_path: Path, monkeypatch) -> None:
+    repo = _make_monorepo(tmp_path)
+    monkeypatch.chdir(repo / "core-runtime-service")
+    monkeypatch.setattr("hc.core_source.detect_workspace_root", lambda: repo.resolve())
+
+    ws_cfg = str(repo / "core-runtime-service/deploy/dev/docker-compose.reload.yml")
+    managed_cfg = str(CORE_SRC_DIR / "deploy/dev/docker-compose.reload.yml")
+    issue = diag_mod.ComposeStackSplitIssue(
+        project_name="dev",
+        groups=(
+            diag_mod.ComposeStackSplitGroup(ws_cfg, ("postgres",), "workspace"),
+            diag_mod.ComposeStackSplitGroup(managed_cfg, ("frontend-vite",), "managed"),
+        ),
+        mixed_sources=True,
+        already_split=True,
+    )
+    assert diag_mod.suggest_workspace_for_split_fix(issue) == repo.resolve()
+
+
+def test_suggest_workspace_from_running_workspace_group(tmp_path: Path, monkeypatch) -> None:
+    repo = _make_monorepo(tmp_path, "Work")
+    monkeypatch.setattr("hc.core_source.detect_workspace_root", lambda: None)
+
+    ws_cfg = str(repo / "core-runtime-service/deploy/dev/docker-compose.reload.yml")
+    managed_cfg = str(CORE_SRC_DIR / "deploy/dev/docker-compose.reload.yml")
+    issue = diag_mod.ComposeStackSplitIssue(
+        project_name="dev",
+        groups=(
+            diag_mod.ComposeStackSplitGroup(ws_cfg, ("postgres",), "workspace"),
+            diag_mod.ComposeStackSplitGroup(managed_cfg, ("frontend-vite",), "managed"),
+        ),
+        mixed_sources=True,
+        already_split=True,
+    )
+    assert diag_mod.suggest_workspace_for_split_fix(issue) == repo.resolve()
+
+
+def test_apply_fix_persists_workspace_and_stops_project(tmp_path: Path, monkeypatch) -> None:
+    import sys
+
+    repo = _make_monorepo(tmp_path)
+    issue = diag_mod.ComposeStackSplitIssue(
+        project_name="dev",
+        groups=(diag_mod.ComposeStackSplitGroup("a", ("postgres",), None),),
+        already_split=True,
+    )
+    monkeypatch.setattr(diag_mod, "suggest_workspace_for_split_fix", lambda _i: repo.resolve())
+
+    saved: dict[str, str] = {}
+
+    class _Cfg:
+        class workspace:
+            path = ""
+
+        def save(self) -> None:
+            saved["path"] = self.workspace.path
+
+    monkeypatch.setattr("hc.config.Config.load", lambda: _Cfg())
+
+    docker_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        docker_calls.append(list(cmd))
+        if cmd[:3] == ["docker", "ps", "-aq"]:
+            return MagicMock(returncode=0, stdout="cid1\ncid2\n")
+        if cmd[:3] == ["docker", "rm", "-f"]:
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return MagicMock(returncode=1, stdout="")
+
+    monkeypatch.setattr(diag_mod.subprocess, "run", fake_run)
+
+    console = MagicMock()
+    assert diag_mod.apply_compose_stack_split_fix(console, issue) is True
+    assert saved["path"] == str(repo.resolve())
+    assert ["docker", "rm", "-f", "cid1", "cid2"] in docker_calls
+
+
+def test_apply_fix_works_without_tty(monkeypatch, tmp_path: Path) -> None:
+    repo = _make_monorepo(tmp_path)
+    issue = diag_mod.ComposeStackSplitIssue(
+        project_name="dev",
+        groups=(),
+        already_split=True,
+    )
+    monkeypatch.setattr(diag_mod, "suggest_workspace_for_split_fix", lambda _i: repo.resolve())
+    monkeypatch.setattr("sys.stdin", MagicMock(isatty=lambda: False))
+
+    class _Cfg:
+        class workspace:
+            path = ""
+
+        def save(self) -> None:
+            pass
+
+    monkeypatch.setattr("hc.config.Config.load", lambda: _Cfg())
+    monkeypatch.setattr(
+        diag_mod.subprocess,
+        "run",
+        lambda *a, **k: MagicMock(returncode=0, stdout=""),
+    )
+
+    console = MagicMock()
+    assert diag_mod.apply_compose_stack_split_fix(console, issue) is True
+
+
+def test_validate_core_source_tree_rejects_merge_conflicts(tmp_path: Path) -> None:
+    core = tmp_path / "core-runtime-service"
+    bad_file = core / "core" / "kernel" / "broken.py"
+    bad_file.parent.mkdir(parents=True)
+    bad_file.write_text(
+        'def f():\n    """doc"""\n<<<<<<< Updated upstream\n    pass\n',
+        encoding="utf-8",
+    )
+    try:
+        diag_mod.validate_core_source_tree(core)
+        assert False, "expected HcCliError"
+    except diag_mod.HcCliError as exc:
+        assert "merge conflict" in exc.message
+
+
+def test_ensure_workspace_pinned_saves_detected_monorepo(tmp_path: Path, monkeypatch) -> None:
+    from hc.core_source import ensure_workspace_pinned
+
+    repo = _make_monorepo(tmp_path)
+    monkeypatch.setattr("hc.core_source.detect_workspace_root", lambda: repo.resolve())
+
+    saved: dict[str, str] = {}
+
+    class _Cfg:
+        class workspace:
+            path = ""
+
+        def save(self) -> None:
+            saved["path"] = self.workspace.path
+
+    monkeypatch.setattr("hc.config.Config.load", lambda: _Cfg())
+
+    assert ensure_workspace_pinned(quiet=True) == repo.resolve()
+    assert saved["path"] == str(repo.resolve())
+
+
+def test_offer_fix_skipped_when_not_tty(monkeypatch, tmp_path: Path) -> None:
+    """offer_fix — алиас apply; без монорепо фикс не применяется."""
+    issue = diag_mod.ComposeStackSplitIssue(
+        project_name="dev",
+        groups=(),
+        already_split=True,
+    )
+    monkeypatch.setattr(diag_mod, "suggest_workspace_for_split_fix", lambda _i: None)
+    monkeypatch.setattr("sys.stdin", MagicMock(isatty=lambda: False))
+    console = MagicMock()
+    assert diag_mod.offer_fix_compose_stack_split(console, issue) is False

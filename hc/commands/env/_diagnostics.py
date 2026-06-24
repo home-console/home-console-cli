@@ -234,12 +234,199 @@ def _warn_compose_stack_split(console: Console, issue: ComposeStackSplitIssue) -
             "(~/.local/share/hc/core-runtime-service) — правки кода могут не попасть в контейнер."
         )
 
-    console.print(
-        "  [dim]собрать в один стак:[/dim] "
-        "[cyan]hc env down[/cyan]  затем  "
-        "[cyan]hc workspace set <путь-к-монорепо>[/cyan]  и  "
-        "[cyan]hc env up[/cyan]"
+    if sys.stdin.isatty():
+        console.print(
+            "  [dim]автофикс:[/dim] стек будет собран в один источник автоматически "
+            "(или вручную: [cyan]hc env down[/cyan] → "
+            "[cyan]hc workspace set <путь-к-монорепо>[/cyan] → [cyan]hc env up[/cyan])"
+        )
+    else:
+        console.print(
+            "  [dim]собрать в один стак:[/dim] "
+            "[cyan]hc env down[/cyan]  затем  "
+            "[cyan]hc workspace set <путь-к-монорепо>[/cyan]  и  "
+            "[cyan]hc env up[/cyan]"
+        )
+
+
+def _is_managed_core_root(root: Path) -> bool:
+    try:
+        return root.resolve() == CORE_SRC_DIR.resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def _monorepo_from_core_root(core_root: Path) -> Path | None:
+    from hc.core_source import _looks_like_monorepo
+
+    monorepo = core_root.parent
+    if _looks_like_monorepo(monorepo):
+        return monorepo.resolve()
+    return None
+
+
+def suggest_workspace_for_split_fix(issue: ComposeStackSplitIssue) -> Path | None:
+    """Подобрать монорепо для автофикса расщеплённого стека."""
+    from hc.core_source import detect_workspace_root
+
+    detected = detect_workspace_root()
+    if detected is not None:
+        return detected
+
+    for group in issue.groups:
+        core_root = _core_root_from_config_files(group.config_files)
+        if core_root is None or _is_managed_core_root(core_root):
+            continue
+        monorepo = _monorepo_from_core_root(core_root)
+        if monorepo is not None:
+            return monorepo
+
+    if issue.planned_config_files:
+        core_root = _core_root_from_config_files(issue.planned_config_files)
+        if core_root is not None and not _is_managed_core_root(core_root):
+            monorepo = _monorepo_from_core_root(core_root)
+            if monorepo is not None:
+                return monorepo
+
+    return None
+
+
+def _persist_workspace_path(workspace: Path) -> None:
+    from hc.config import Config
+
+    cfg = Config.load()
+    cfg.workspace.path = str(workspace)
+    cfg.save()
+
+
+def _stop_compose_project_containers(project_name: str, console: Console) -> None:
+    """Остановить все контейнеры compose-проекта (все группы config_files)."""
+    r = subprocess.run(  # noqa: S603
+        [
+            "docker",
+            "ps",
+            "-aq",
+            "--filter",
+            f"label=com.docker.compose.project={project_name}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
     )
+    if r.returncode != 0:
+        console.print(
+            "[yellow]![/yellow] не удалось получить список контейнеров "
+            f"проекта «{project_name}»"
+        )
+        return
+
+    ids = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+    if not ids:
+        console.print(f"[dim]→[/dim] контейнеры проекта «{project_name}» уже остановлены")
+        return
+
+    console.print(
+        f"[dim]→[/dim] останавливаю {len(ids)} контейнер(ов) проекта "
+        f"«{project_name}»…"
+    )
+    rm = subprocess.run(  # noqa: S603
+        ["docker", "rm", "-f", *ids],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if rm.returncode != 0:
+        err = (rm.stderr or rm.stdout or "docker rm failed").strip()
+        console.print(f"[red]✗[/red] не удалось остановить контейнеры: {err[:300]}")
+        return
+    console.print("[green]✓[/green] стек остановлен")
+
+
+_MERGE_CONFLICT_MARKERS = ("<<<<<<<", "=======", ">>>>>>>")
+
+
+def validate_core_source_tree(core_root: Path) -> None:
+    """Не пускать env up, если в исходниках Core остались git merge conflict markers."""
+    bad: list[str] = []
+    skip_dirs = {".venv", "__pycache__", ".git", "node_modules", "dist", "build"}
+    try:
+        root = core_root.resolve()
+    except (OSError, RuntimeError):
+        root = core_root
+
+    for py in root.rglob("*.py"):
+        if skip_dirs.intersection(py.parts):
+            continue
+        try:
+            text = py.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            stripped = line.lstrip()
+            if any(stripped.startswith(marker) for marker in _MERGE_CONFLICT_MARKERS):
+                try:
+                    rel = py.relative_to(root)
+                except ValueError:
+                    rel = py
+                bad.append(f"{rel}:{lineno}")
+                break
+
+    if not bad:
+        return
+
+    sample = ", ".join(bad[:3])
+    more = f" (+{len(bad) - 3})" if len(bad) > 3 else ""
+    managed = False
+    try:
+        managed = root == CORE_SRC_DIR.resolve()
+    except (OSError, RuntimeError):
+        pass
+
+    hint = (
+        "Исправь конфликты в managed-клоне или привяжи монорепо: "
+        "hc workspace set <путь> → hc env down → hc env up"
+        if managed
+        else "Исправь конфликты в исходниках и повтори hc env up"
+    )
+    raise HcCliError(
+        message=(
+            f"Исходники Core повреждены: незакрытые git merge conflict "
+            f"({len(bad)} файл(ов), напр. {sample}{more})"
+        ),
+        hint=hint,
+    )
+
+
+def apply_compose_stack_split_fix(
+    console: Console,
+    issue: ComposeStackSplitIssue,
+) -> bool:
+    """Автофикс расщеплённого стека: down всех групп → workspace set → продолжить env up."""
+    workspace = suggest_workspace_for_split_fix(issue)
+    if workspace is None:
+        console.print(
+            "[yellow]![/yellow] автофикс недоступен: не найден путь к монорепо.\n"
+            "  [dim]→[/dim] [cyan]hc workspace set <путь-к-монорепо>[/cyan], "
+            "затем [cyan]hc env down[/cyan] и [cyan]hc env up[/cyan]"
+        )
+        return False
+
+    console.print(
+        f"[cyan]→[/cyan] собираю стек «{issue.project_name}» в один источник: "
+        f"{workspace}"
+    )
+    _stop_compose_project_containers(issue.project_name, console)
+    _persist_workspace_path(workspace)
+    console.print(f"[green]✓[/green] workspace.path → {workspace}")
+    console.print("[dim]Пересобираю план env up с единым источником…[/dim]")
+    return True
+
+
+def offer_fix_compose_stack_split(console: Console, issue: ComposeStackSplitIssue) -> bool:
+    """Совместимость: делегирует в apply_compose_stack_split_fix (без интерактива)."""
+    return apply_compose_stack_split_fix(console, issue)
 
 
 def _collect_postmortem_targets(project: "ComposeProject") -> list[str]:

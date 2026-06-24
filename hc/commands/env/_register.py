@@ -28,7 +28,9 @@ from hc.commands.env._diagnostics import (
     _get_needed_ports, _parse_docker_labels, _parse_published_ports,
     _process_command_line, _find_host_listeners, _find_port_conflicts,
     _kill_process, _offer_resolve_conflicts, _show_failure_logs,
-    detect_compose_stack_split, _warn_compose_stack_split,
+    detect_compose_stack_split, detect_compose_stack_split_for_project,
+    _warn_compose_stack_split, apply_compose_stack_split_fix,
+    validate_core_source_tree,
 )
 from hc.commands.env._resolve import (
     _resolve_source, _pick_services_interactive, _pick_db_interactive,
@@ -38,11 +40,12 @@ from hc.commands.env._status import (
     _print_env_status_dashboard, _print_env_ps,
     _print_env_up_dry_run, _print_env_down_dry_run, _print_summary,
 )
-from hc.commands.env._compose import planned_config_files_from_cmd
+from hc.commands.env._compose import planned_config_files_from_cmd, compose_project_name
 from hc.config import Config
 from hc.core_ops import ComposeProject, compose_project_from_source, require_docker
 from hc.core_source import (
     CoreSource,
+    ensure_workspace_pinned,
     get_core_source_from_repo,
     get_core_source_local,
     init_core_source,
@@ -242,6 +245,25 @@ def _frontend_workspace_path(plan: "EnvUpPlan") -> Path:
     """Путь к platform-home-console (sibling core-runtime-service для volume mount)."""
     core_root = plan.project.cwd.parent.parent  # deploy/dev → core-runtime-service
     return core_root.parent / "platform-home-console"
+
+
+def _prepare_env_source(console: Console, src: CoreSource, mode: str) -> CoreSource:
+    """Привязать workspace, проверить исходники и собрать расщеплённый стек до env up."""
+    ensure_workspace_pinned(console, quiet=True)
+    validate_core_source_tree(src.path)
+
+    project = compose_project_from_source(console, src, mode=mode)
+    split = detect_compose_stack_split_for_project(compose_project_name(project))
+    if split and (split.already_split or split.mixed_sources):
+        _warn_compose_stack_split(console, split)
+        if apply_compose_stack_split_fix(console, split):
+            workspace = resolve_workspace_root()
+            if workspace is not None:
+                new_src = get_core_source_from_repo(workspace)
+                if new_src is not None:
+                    src = new_src
+                    validate_core_source_tree(src.path)
+    return src
 
 
 def _strip_frontend_from_plan(console: Console, plan: "EnvUpPlan") -> None:
@@ -715,6 +737,8 @@ def register(app: typer.Typer) -> None:
                 raise typer.Exit(code=2)
 
             src = _resolve_source(console)
+            if not dry_run:
+                src = _prepare_env_source(console, src, mode)
             created = False
             if not dry_run:
                 created = ensure_core_env(console, src.path)
@@ -799,6 +823,43 @@ def register(app: typer.Typer) -> None:
             )
             if split_issue:
                 _warn_compose_stack_split(console, split_issue)
+                if apply_compose_stack_split_fix(console, split_issue):
+                    src = _resolve_source(console)
+                    plan = _resolve_env_up_plan(
+                        console=console,
+                        mode=mode,
+                        profile=profile,
+                        db=db,
+                        src=src,
+                        first_run=False,
+                    )
+                    workspace = resolve_workspace_root()
+                    src_path = Path(plan.project.cwd).parent.parent.resolve()
+                    using_workspace = (
+                        workspace is not None
+                        and src_path == (workspace / "core-runtime-service").resolve()
+                    )
+                    if using_workspace:
+                        console.print(
+                            f"   [dim]src:[/dim] [green]workspace[/green] {workspace}"
+                        )
+                    else:
+                        console.print(f"   [dim]src:[/dim] managed-клон {src_path}")
+                    ok, recreate = _ensure_frontend_workspace(console, plan)
+                    if not ok:
+                        raise typer.Exit(code=1)
+                    _ensure_frontend_static_build(console, plan)
+                    base_cmd = _compose_base_cmd(plan)
+                    extra_env = _build_compose_env(plan)
+                    split_issue = detect_compose_stack_split(
+                        plan,
+                        planned_config_files=planned_config_files_from_cmd(base_cmd),
+                    )
+                    if split_issue:
+                        console.print(
+                            "[yellow]![/yellow] стек всё ещё выглядит расщеплённым — "
+                            "продолжаю env up."
+                        )
 
             if pull:
                 _run(
