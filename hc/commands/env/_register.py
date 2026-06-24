@@ -14,7 +14,7 @@ from rich.table import Table
 
 from hc.commands.env._catalog import (
     _Svc, _SERVICES, _PROFILE_DEFAULT_MODE, _PROFILES,
-    _DbOption, _DB_OPTIONS, _DB_KEY_MAP, EnvUpPlan,
+    _DbOption, _DB_OPTIONS, _DB_KEY_MAP, EnvUpPlan, VAULT_PG_DSN_DEFAULT,
     _MODE_DEFAULT, _MODE_HELP, _PROFILE_HELP, _DB_HELP,
     _STATE_COLOR, _REBUILD_HINT_RE, _MIGRATION_HINT_RE,
     KNOWN_ENDPOINTS, QUESTIONARY_STYLE_KWARGS, _FRONTEND_VITE_OVERRIDE,
@@ -28,6 +28,7 @@ from hc.commands.env._diagnostics import (
     _get_needed_ports, _parse_docker_labels, _parse_published_ports,
     _process_command_line, _find_host_listeners, _find_port_conflicts,
     _kill_process, _offer_resolve_conflicts, _show_failure_logs,
+    detect_compose_stack_split, _warn_compose_stack_split,
 )
 from hc.commands.env._resolve import (
     _resolve_source, _pick_services_interactive, _pick_db_interactive,
@@ -37,6 +38,7 @@ from hc.commands.env._status import (
     _print_env_status_dashboard, _print_env_ps,
     _print_env_up_dry_run, _print_env_down_dry_run, _print_summary,
 )
+from hc.commands.env._compose import planned_config_files_from_cmd
 from hc.config import Config
 from hc.core_ops import ComposeProject, compose_project_from_source, require_docker
 from hc.core_source import (
@@ -713,8 +715,9 @@ def register(app: typer.Typer) -> None:
                 raise typer.Exit(code=2)
 
             src = _resolve_source(console)
+            created = False
             if not dry_run:
-                ensure_core_env(console, src.path)
+                created = ensure_core_env(console, src.path)
             if not dry_run:
                 _try_pull_source(src, console)
 
@@ -724,12 +727,16 @@ def register(app: typer.Typer) -> None:
                 profile=profile,
                 db=db,
                 src=src,
+                first_run=created,
             )
             save_last_env(
                 mode=plan.mode,
                 services=plan.service_names,
                 db=plan.db_option.key,
             )
+
+            if not dry_run and created and "core-runtime" in plan.service_names:
+                _apply_first_run_storage_choice(src.path / ".env", plan.db_option.key, console)
 
             if dry_run:
                 _print_env_up_dry_run(console, plan, pull=pull, build=build, detach=detach)
@@ -785,6 +792,13 @@ def register(app: typer.Typer) -> None:
             # plan.service_names / compose override могли измениться — пересобираем:
             base_cmd = _compose_base_cmd(plan)
             extra_env = _build_compose_env(plan)
+
+            split_issue = detect_compose_stack_split(
+                plan,
+                planned_config_files=planned_config_files_from_cmd(base_cmd),
+            )
+            if split_issue:
+                _warn_compose_stack_split(console, split_issue)
 
             if pull:
                 _run(
@@ -1513,6 +1527,38 @@ def register(app: typer.Typer) -> None:
     def _serialize_dotenv(entries: list[tuple[str, str, str]]) -> str:
         return "\n".join(e[0] for e in entries) + "\n"
 
+    def _apply_first_run_storage_choice(env_path: Path, db_key: str, console: Console) -> None:
+        """
+        При первом создании .env (см. ensure_core_env) — преднастроить весь
+        storage stack (core + vault) согласно выбору контейнера БД, чтобы не
+        требовалась последующая миграция (vault ещё пуст на первом запуске).
+        """
+        if db_key != "postgres" or not env_path.exists():
+            return
+        entries = _parse_dotenv(env_path.read_text(encoding="utf-8", errors="replace"))
+        overrides = {
+            "RUNTIME_STORAGE_TYPE": "postgresql",
+            "RUNTIME_PG_HOST": "postgres",
+            "RUNTIME_PG_PORT": "5432",
+            "RUNTIME_PG_DATABASE": "homeconsole",
+            "RUNTIME_PG_USER": "homeconsole",
+            "RUNTIME_PG_PASSWORD": "homeconsole",
+            "RUNTIME_VAULT_STORAGE_TYPE": "postgresql",
+            "RUNTIME_VAULT_PG_DSN": VAULT_PG_DSN_DEFAULT,
+        }
+        existing = {k for _, k, _ in entries if k}
+        for i, (raw, k, v) in enumerate(entries):
+            if k in overrides:
+                entries[i] = (f"{k}={overrides[k]}", k, overrides[k])
+        for k, v in overrides.items():
+            if k not in existing:
+                entries.append((f"{k}={v}", k, v))
+        env_path.write_text(_serialize_dotenv(entries), encoding="utf-8")
+        console.print(
+            "[green]✓[/green] Первый запуск: .env настроен на PostgreSQL "
+            "(core: schema public, vault: schema vault) — без миграции."
+        )
+
     def _mask(key: str, val: str) -> str:
         return "***" if _SECRET_RE.search(key) and val else val
 
@@ -1897,6 +1943,149 @@ def register(app: typer.Typer) -> None:
                     console.print(
                         "  [dim]core-runtime не запущен — подними его: [/dim][cyan]hc env up[/cyan]"
                     )
+
+        except HcCliError as e:
+            console.print(f"[red]Ошибка:[/red] {e.message}")
+            if e.hint:
+                console.print(f"[dim]Подсказка:[/dim] {e.hint}")
+            raise typer.Exit(code=int(e.exit_code or 1))
+
+    # ─── hc env vault-migrate ──────────────────────────────────────────────
+
+    @env_app.command("vault-migrate")
+    def env_vault_migrate(
+        to: str = typer.Option(..., "--to", help="Целевой backend vault: sqlite | postgres"),
+        mode: str = typer.Option(_MODE_DEFAULT, "--mode", "-m", help=_MODE_HELP),
+        delete_source: bool = typer.Option(
+            False, "--delete-source",
+            help="Удалить данные из текущего backend после проверенной копии",
+        ),
+        dry_run: bool = typer.Option(
+            False, "--dry-run", help="Только показать что будет скопировано, без изменений"
+        ),
+        restart: bool = typer.Option(
+            True, "--restart/--no-restart", help="Перезапустить core-runtime после миграции"
+        ),
+    ) -> None:
+        """
+        Перенести vault-хранилище (secrets.store, _system.*) между backend'ами
+        sqlite <-> postgres.
+
+        Сама миграция выполняется внутри core-runtime через
+        `python -m modules.storage.vault_migrate` — этот же модуль можно
+        запустить и на проде, `hc env` тут лишь обёртка для dev-стека.
+
+        Примеры:
+          hc env vault-migrate --to postgres --dry-run   # показать что переедет
+          hc env vault-migrate --to postgres             # скопировать sqlite → postgres
+          hc env vault-migrate --to sqlite --delete-source
+        """
+        console = Console()
+        try:
+            require_docker(console)
+            mode = mode.strip().lower()
+
+            to_key = to.strip().lower().replace("pg", "postgres")
+            if to_key not in ("sqlite", "postgres"):
+                console.print(f"[red]Ошибка:[/red] --to {to!r} неизвестен. Допустимые: sqlite | postgres")
+                raise typer.Exit(code=2)
+
+            src = _resolve_source(console)
+            project = compose_project_from_source(console, src, mode=mode)
+
+            running = _get_running_services(project.compose_file, project.cwd)
+            if "core-runtime" not in running:
+                console.print(
+                    "[red]Ошибка:[/red] core-runtime не запущен — нужен для выполнения миграции.\n"
+                    "  [dim]hc env up[/dim]"
+                )
+                raise typer.Exit(code=1)
+
+            found, env_path = _dotenv_local_path()
+            if not found or env_path is None or not env_path.exists():
+                console.print("[red]Ошибка:[/red] .env не найден.")
+                raise typer.Exit(code=2)
+
+            entries = _parse_dotenv(env_path.read_text(encoding="utf-8", errors="replace"))
+            current_env = {k: v for _, k, v in entries if k}
+
+            current_type = current_env.get("RUNTIME_VAULT_STORAGE_TYPE", "sqlite").strip().lower()
+            current_key = "postgres" if current_type == "postgresql" else "sqlite"
+
+            if current_key == to_key:
+                console.print(f"[yellow]Vault уже на backend {to_key!r} — нечего переносить.[/yellow]")
+                raise typer.Exit(code=0)
+
+            default_pg_dsn = VAULT_PG_DSN_DEFAULT
+            sqlite_path = current_env.get("RUNTIME_VAULT_DB_PATH", "data/vault.db").strip() or "data/vault.db"
+            pg_dsn = current_env.get("RUNTIME_VAULT_PG_DSN", "").strip() or default_pg_dsn
+
+            def _backend_args(key: str, role: str) -> list[str]:
+                if key == "sqlite":
+                    return [f"--{role}", "sqlite", f"--{role}-path", sqlite_path]
+                return [f"--{role}", "postgres", f"--{role}-dsn", pg_dsn]
+
+            migrate_cmd = [
+                "docker", "compose", "-f", str(project.compose_file),
+                "exec", "-T", "core-runtime",
+                "python", "-m", "modules.storage.vault_migrate",
+                *_backend_args(current_key, "from"),
+                *_backend_args(to_key, "to"),
+            ]
+            if delete_source:
+                migrate_cmd.append("--delete-source")
+            if dry_run:
+                migrate_cmd.append("--dry-run")
+
+            console.print(
+                f"\n[cyan]→[/cyan] vault-migrate  {current_key} → {to_key}"
+                + ("  [dim](dry-run)[/dim]" if dry_run else "")
+            )
+            p = subprocess.run(migrate_cmd, cwd=str(project.cwd), check=False)  # noqa: S603
+            if p.returncode != 0:
+                console.print("[red]✗[/red] миграция завершилась с ошибкой")
+                raise typer.Exit(code=p.returncode)
+
+            if dry_run:
+                console.print("[dim]Dry-run — .env не изменён.[/dim]")
+                return
+
+            console.print(f"[green]✓[/green] данные скопированы в {to_key}")
+
+            # Обновить .env: переключить тип vault-хранилища на новый backend.
+            new_type = "postgresql" if to_key == "postgres" else "sqlite"
+            updated = False
+            for i, (raw, k, v) in enumerate(entries):
+                if k == "RUNTIME_VAULT_STORAGE_TYPE":
+                    entries[i] = (f"RUNTIME_VAULT_STORAGE_TYPE={new_type}", k, new_type)
+                    updated = True
+                    break
+            if not updated:
+                entries.append((f"RUNTIME_VAULT_STORAGE_TYPE={new_type}", "RUNTIME_VAULT_STORAGE_TYPE", new_type))
+
+            if to_key == "postgres" and "RUNTIME_VAULT_PG_DSN" not in current_env:
+                entries.append((f"RUNTIME_VAULT_PG_DSN={pg_dsn}", "RUNTIME_VAULT_PG_DSN", pg_dsn))
+            if to_key == "sqlite" and "RUNTIME_VAULT_DB_PATH" not in current_env:
+                entries.append((f"RUNTIME_VAULT_DB_PATH={sqlite_path}", "RUNTIME_VAULT_DB_PATH", sqlite_path))
+
+            env_path.write_text(_serialize_dotenv(entries), encoding="utf-8")
+            console.print(f"[green]✓[/green] RUNTIME_VAULT_STORAGE_TYPE={new_type} записан в {env_path}")
+
+            if restart:
+                console.print("[cyan]→[/cyan] restart core-runtime")
+                _run(
+                    ["docker", "compose", "-f", str(project.compose_file),
+                     "restart", "core-runtime"],
+                    cwd=project.cwd,
+                )
+                console.print("[green]✓[/green] core-runtime перезапущен")
+            else:
+                console.print("  [dim]Перезапусти core-runtime чтобы изменения применились:[/dim] hc env restart core-runtime")
+
+            if not delete_source:
+                console.print(
+                    f"\n[dim]Старые данные в {current_key} не удалены (без --delete-source).[/dim]"
+                )
 
         except HcCliError as e:
             console.print(f"[red]Ошибка:[/red] {e.message}")

@@ -167,6 +167,41 @@ def _compose_project_name(plan: EnvUpPlan) -> str:
     return plan.project.cwd.name
 
 
+def planned_config_files_from_cmd(base_cmd: list[str]) -> str:
+    """Собрать значение метки com.docker.compose.project.config_files из compose-команды."""
+    files: list[str] = []
+    i = 0
+    while i < len(base_cmd):
+        if base_cmd[i] == "-f" and i + 1 < len(base_cmd):
+            files.append(str(Path(base_cmd[i + 1]).resolve()))
+            i += 2
+            continue
+        i += 1
+    return ",".join(files)
+
+
+def compose_project_name_from_compose(project: "ComposeProject") -> str:
+    """Имя compose-проекта без полного EnvUpPlan (для status/ps)."""
+    import json as _json
+
+    r = subprocess.run(  # noqa: S603
+        ["docker", "compose", "-f", str(project.compose_file), "config", "--format", "json"],
+        cwd=str(project.cwd),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if r.returncode == 0:
+        try:
+            name = _json.loads(r.stdout).get("name")
+            if name:
+                return str(name)
+        except _json.JSONDecodeError:
+            pass
+    return project.cwd.name
+
+
 def _compose_base_cmd(plan: EnvUpPlan) -> list[str]:
     cmd = ["docker", "compose", "-f", str(plan.project.compose_file)]
     for cp in sorted(plan.compose_profiles):

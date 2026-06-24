@@ -77,3 +77,10 @@ def register(app: typer.Typer) -> None:
         anyio.run(_run_install)
         console.print(f"[green]✓[/green] {name} {info.get('version', '')} установлен и запущен")
 
+        # Обновить кеш CLI-команд плагинов
+        try:
+            from hc.plugin_cli_loader import refresh_cache
+            refresh_cache(client)
+        except Exception:
+            pass
+

@@ -16,9 +16,10 @@ STATE_DIR = Path.home() / ".local" / "state" / "hc"
 CORE_SRC_DIR = DATA_DIR / "core-runtime-service"
 PLATFORM_SRC_DIR = DATA_DIR / "platform-home-console"
 
-# Нативный `hc core up --mode native`: PID и лог процесса `python main.py`.
-NATIVE_CORE_PID_PATH = STATE_DIR / "native-core.pid"
-NATIVE_CORE_LOG_PATH = STATE_DIR / "native-core.log"
+# Нативный `hc core up --mode native`: PID, лог и stdin-FIFO процесса `python main.py`.
+NATIVE_CORE_PID_PATH  = STATE_DIR / "native-core.pid"
+NATIVE_CORE_LOG_PATH  = STATE_DIR / "native-core.log"
+NATIVE_CORE_STDIN_FIFO = STATE_DIR / "native-core.stdin"
 
 DEFAULT_CORE_REPO = "https://github.com/home-console/core-runtime-service"
 DEFAULT_CORE_REF = "master"

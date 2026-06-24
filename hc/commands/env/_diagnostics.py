@@ -1,24 +1,250 @@
 """Diagnostics: port conflicts, post-mortem, failure logs."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import signal
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
 
 from hc.commands.env._catalog import EnvUpPlan, QUESTIONARY_STYLE_KWARGS
 from hc.commands.env._compose import _compose_ps_rows, _compose_project_name
+from hc.constants import CORE_SRC_DIR
 from hc.errors import HcCliError
 
+if TYPE_CHECKING:
+    from hc.core_ops import ComposeProject
+    from hc.diagnostics import DetectedIssue
 
-def _collect_postmortem_targets(project: ComposeProject) -> list[str]:
+
+@dataclass(frozen=True)
+class ComposeStackSplitGroup:
+    config_files: str
+    services: tuple[str, ...]
+    source_label: str | None
+
+
+@dataclass(frozen=True)
+class ComposeStackSplitIssue:
+    project_name: str
+    groups: tuple[ComposeStackSplitGroup, ...]
+    planned_config_files: str | None = None
+    already_split: bool = False
+    would_split: bool = False
+    mixed_sources: bool = False
+
+
+def _core_root_from_config_files(config_files: str) -> Path | None:
+    """Корень core-runtime-service из метки config_files (первый compose-файл)."""
+    first = (config_files.split(",")[0] or "").strip()
+    if not first:
+        return None
+    compose_file = Path(first)
+    if compose_file.parent.name == "dev" and compose_file.parent.parent.name == "deploy":
+        return compose_file.parent.parent.parent
+    return None
+
+
+def _source_label_from_config_files(config_files: str) -> str | None:
+    root = _core_root_from_config_files(config_files)
+    if root is None:
+        return None
+    try:
+        resolved = root.resolve()
+    except (OSError, RuntimeError):
+        return str(root)
+    try:
+        if resolved == CORE_SRC_DIR.resolve():
+            return f"managed-клон ({resolved})"
+    except (OSError, RuntimeError):
+        pass
+    try:
+        rel = resolved.relative_to(Path.home())
+        return f"workspace (~/{rel})"
+    except ValueError:
+        return str(resolved)
+
+
+def _list_compose_project_containers(project_name: str) -> list[dict[str, str]]:
+    """Все контейнеры compose-проекта (running и stopped)."""
+    r = subprocess.run(  # noqa: S603
+        ["docker", "ps", "-a", "--format", "{{json .}}"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if r.returncode != 0:
+        return []
+
+    containers: list[dict[str, str]] = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        labels = _parse_docker_labels(item.get("Labels", ""))
+        if labels.get("com.docker.compose.project") != project_name:
+            continue
+
+        service = labels.get("com.docker.compose.service", "")
+        if not service:
+            continue
+
+        containers.append(
+            {
+                "service": service,
+                "name": str(item.get("Names") or ""),
+                "config_files": labels.get("com.docker.compose.project.config_files", ""),
+                "state": str(item.get("State") or item.get("Status") or ""),
+            }
+        )
+    return containers
+
+
+def _analyze_compose_stack_split(
+    project_name: str,
+    *,
+    planned_config_files: str | None,
+) -> ComposeStackSplitIssue | None:
+    containers = _list_compose_project_containers(project_name)
+    if not containers:
+        return None
+
+    by_config: dict[str, list[str]] = {}
+    for cont in containers:
+        cfg = cont["config_files"]
+        if not cfg:
+            continue
+        by_config.setdefault(cfg, []).append(cont["service"])
+
+    if not by_config:
+        return None
+
+    groups = tuple(
+        ComposeStackSplitGroup(
+            config_files=cfg,
+            services=tuple(sorted(set(svcs))),
+            source_label=_source_label_from_config_files(cfg),
+        )
+        for cfg, svcs in sorted(by_config.items())
+    )
+
+    already_split = len(groups) > 1
+    would_split = False
+    if planned_config_files and planned_config_files not in by_config:
+        would_split = True
+
+    source_labels = {g.source_label for g in groups if g.source_label}
+    if planned_config_files:
+        planned_label = _source_label_from_config_files(planned_config_files)
+        if planned_label:
+            source_labels.add(planned_label)
+    mixed_sources = len(source_labels) > 1
+
+    if not (already_split or would_split):
+        return None
+
+    return ComposeStackSplitIssue(
+        project_name=project_name,
+        groups=groups,
+        planned_config_files=planned_config_files,
+        already_split=already_split,
+        would_split=would_split,
+        mixed_sources=mixed_sources,
+    )
+
+
+def detect_compose_stack_split(
+    plan: EnvUpPlan,
+    *,
+    planned_config_files: str,
+) -> ComposeStackSplitIssue | None:
+    """Проверить расщепление стека до/после env up."""
+    project_name = _compose_project_name(plan)
+    return _analyze_compose_stack_split(
+        project_name,
+        planned_config_files=planned_config_files,
+    )
+
+
+def detect_compose_stack_split_for_project(project_name: str) -> ComposeStackSplitIssue | None:
+    """Проверить уже расщеплённый стек (для env status)."""
+    return _analyze_compose_stack_split(project_name, planned_config_files=None)
+
+
+def _warn_compose_stack_split(console: Console, issue: ComposeStackSplitIssue) -> None:
+    """Предупредить о расщеплении стека в Docker Desktop."""
+    console.print()
+    if issue.already_split:
+        console.print(
+            f"[yellow]![/yellow] [bold]Стек «{issue.project_name}» расщеплён[/bold] "
+            "— Docker Desktop показывает несколько групп с одним именем."
+        )
+    else:
+        console.print(
+            f"[yellow]![/yellow] [bold]env up расщепит стек «{issue.project_name}»[/bold] "
+            "— compose-файлы не совпадут с уже запущенными контейнерами."
+        )
+
+    console.print(
+        "[dim]Контейнеры в одной docker-сети, но метки compose разные "
+        "(разные -f, override frontend-vite, workspace vs managed-клон).[/dim]"
+    )
+
+    for i, group in enumerate(issue.groups, 1):
+        svc = ", ".join(group.services)
+        console.print(f"  [dim]группа {i}:[/dim] {svc}")
+        if group.source_label:
+            console.print(f"           [dim]src:[/dim] {group.source_label}")
+        first_file = group.config_files.split(",")[0]
+        if first_file:
+            console.print(f"           [dim]compose:[/dim] {first_file}")
+        if "," in group.config_files:
+            console.print(
+                "           [dim]override:[/dim] "
+                f"{group.config_files.split(',', 1)[1].strip()}"
+            )
+
+    if issue.planned_config_files and issue.would_split:
+        planned_label = _source_label_from_config_files(issue.planned_config_files)
+        console.print("  [dim]план env up:[/dim]", end="")
+        if planned_label:
+            console.print(f" {planned_label}")
+        else:
+            console.print(f" {issue.planned_config_files.split(',')[0]}")
+
+    if issue.mixed_sources:
+        console.print(
+            "  [yellow]→[/yellow] смешаны workspace и managed-клон "
+            "(~/.local/share/hc/core-runtime-service) — правки кода могут не попасть в контейнер."
+        )
+
+    console.print(
+        "  [dim]собрать в один стак:[/dim] "
+        "[cyan]hc env down[/cyan]  затем  "
+        "[cyan]hc workspace set <путь-к-монорепо>[/cyan]  и  "
+        "[cyan]hc env up[/cyan]"
+    )
+
+
+def _collect_postmortem_targets(project: "ComposeProject") -> list[str]:
     """Имена сервисов, которые имеет смысл сканировать (упавшие/unhealthy)."""
+    from hc.diagnostics import list_compose_containers
     try:
         candidates = list_compose_containers(
             project.compose_file,
@@ -44,13 +270,14 @@ def _collect_postmortem_targets(project: ComposeProject) -> list[str]:
 
 
 
-def _run_postmortem(console: Console, project: ComposeProject) -> tuple[list[DetectedIssue], list[str]]:
+def _run_postmortem(console: Console, project: "ComposeProject") -> tuple[list["DetectedIssue"], list[str]]:
     """
     Найти упавшие/unhealthy контейнеры, подтянуть их логи и распознать
     известные ошибки через каталог diagnostics.
 
     Возвращает (список найденных проблем, список просканированных сервисов).
     """
+    from hc.diagnostics import DetectedIssue, detect_issues, fetch_container_logs, list_compose_containers
     services = _collect_postmortem_targets(project)
     found: list[DetectedIssue] = []
     for service in services:
@@ -66,7 +293,7 @@ def _run_postmortem(console: Console, project: ComposeProject) -> tuple[list[Det
 
 def _print_postmortem(
     console: Console,
-    issues: list[DetectedIssue],
+    issues: list["DetectedIssue"],
     *,
     scanned_services: list[str] | None = None,
 ) -> None:

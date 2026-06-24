@@ -16,7 +16,7 @@ from hc.commands.install import register as register_install
 from hc.commands.logs import register as register_logs
 from hc.commands.module import register as register_module
 from hc.commands.plugin import register as register_plugin
-from hc.commands import skill
+from hc.commands import action
 from hc.commands.remove import register as register_remove
 from hc.commands.search import register as register_search
 from hc.commands.setup import register as register_setup
@@ -33,14 +33,19 @@ from hc.commands.emergency import register as register_emergency
 from hc.commands.service import register as register_service
 from hc.commands.event import register as register_event
 from hc.commands.shell_config import register as register_shell_config
+from hc.commands.completion import register as register_completion
+from hc.commands.agent import register as register_agent
+from hc.commands.cloud import register as register_cloud
+from hc.commands.wg import register as register_wg
 from hc.commands.rollback import register as register_rollback
 from hc.commands.workspace import register as register_workspace
 from hc import __version__
 from hc.update_check import print_update_banner
 from hc.cli_registry import NAV_TREE
 from hc.shell import run_shell
+from hc.plugin_cli_loader import register_plugin_commands
 
-_SKIP_UPDATE_NOTIFY = frozenset({"version", "upgrade", "shell", "repl", "nav"})
+_SKIP_UPDATE_NOTIFY = frozenset({"version", "upgrade", "shell", "repl", "nav", "completion"})
 
 app = typer.Typer(
     add_completion=True,
@@ -158,7 +163,7 @@ def _register_all() -> None:
     register_install(app)
     register_remove(app)
     register_plugin(app)
-    skill.register(app)
+    action.register(app)
     register_module(app)
     register_logs(app)
     register_search(app)
@@ -175,8 +180,14 @@ def _register_all() -> None:
     register_service(app)
     register_event(app)
     register_shell_config(app)
+    register_completion(app)
+    register_agent(app)
+    register_cloud(app)
+    register_wg(app)
     register_rollback(app)
     register_workspace(app)
+    # Динамические команды плагинов из кеша (~/.config/hc/plugin_cli_cache.json)
+    register_plugin_commands(app)
 
 
 _register_all()

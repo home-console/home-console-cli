@@ -528,6 +528,16 @@ def register(app: typer.Typer) -> None:
     from hc.commands.plugin_new import register_new
     register_new(plugin_app)
 
+    from hc.commands.plugin_validate import register_validate
+    register_validate(plugin_app)
+
+    from hc.commands.plugin_publish import register_publish
+    register_publish(plugin_app)
+
+    from hc.commands.plugin_contract import register_contract, register_graph
+    register_contract(plugin_app)
+    register_graph(plugin_app)
+
     # capabilities subgroup
     cap_app = typer.Typer(
         help="Инспекция capability registry",
@@ -586,6 +596,51 @@ def register(app: typer.Typer) -> None:
             ptype = p.get("type", "local")
             color = "green" if ptype == "local" else "yellow"
             console.print(f"  [{color}]{ptype}[/{color}]  {p.get('name', '?')}")
+
+    @cap_app.command("check")
+    def cap_check(
+        plugin_name: str = typer.Argument(..., help="Имя плагина (напр. yandex_smart_home)"),
+        json_out: bool = typer.Option(False, "--json", help="JSON вывод"),
+    ) -> None:
+        """Показать все capability, которые предоставляет плагин.
+
+        Примеры:
+          hc plugin capabilities check yandex_smart_home
+          hc plugin capabilities check network_scanner --json
+        """
+        console = Console()
+        client = require_client(console)
+        caps = anyio.run(client.list_capabilities)
+        if caps is None:
+            console.print("[red]Ошибка: не удалось получить список capabilities.[/red]")
+            raise typer.Exit(code=1)
+
+        provided = [
+            c for c in caps
+            if any(p.get("name") == plugin_name for p in c.get("providers", []))
+        ]
+
+        if json_out:
+            from hc.json_output import print_json
+            print_json({"ok": True, "plugin": plugin_name, "capabilities": provided, "total": len(provided)})
+            return
+
+        if not provided:
+            console.print(f"[yellow]Плагин [bold]{plugin_name}[/bold] не предоставляет ни одного capability.[/yellow]")
+            console.print("[dim]Подсказка: проверь имя плагина через `hc plugin capabilities list`[/dim]")
+            raise typer.Exit(code=0)
+
+        table = Table(title=f"Capabilities плагина {plugin_name!r} ({len(provided)})")
+        table.add_column("ID", style="bold cyan")
+        table.add_column("Тип")
+        table.add_column("Всего провайдеров")
+        for c in sorted(provided, key=lambda x: x.get("id", "")):
+            my_providers = [p for p in c.get("providers", []) if p.get("name") == plugin_name]
+            ptype = my_providers[0].get("type", "local") if my_providers else "?"
+            color = "green" if ptype == "local" else "yellow"
+            total = len(c.get("providers", []))
+            table.add_row(c.get("id", ""), f"[{color}]{ptype}[/{color}]", str(total))
+        console.print(table)
 
     plugin_app.add_typer(cap_app, name="capabilities")
 

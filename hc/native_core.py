@@ -18,10 +18,10 @@ from hc.core_source import CoreSource
 from hc.env_bootstrap import core_env_path, ensure_core_env
 
 
-def _native_paths() -> tuple[Path, Path]:
-    from hc.constants import NATIVE_CORE_LOG_PATH, NATIVE_CORE_PID_PATH
+def _native_paths() -> tuple[Path, Path, Path]:
+    from hc.constants import NATIVE_CORE_LOG_PATH, NATIVE_CORE_PID_PATH, NATIVE_CORE_STDIN_FIFO
 
-    return NATIVE_CORE_PID_PATH, NATIVE_CORE_LOG_PATH
+    return NATIVE_CORE_PID_PATH, NATIVE_CORE_LOG_PATH, NATIVE_CORE_STDIN_FIFO
 
 _ENV_LINE_RE = re.compile(
     r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$",
@@ -81,7 +81,7 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _read_pid_file() -> int | None:
-    pid_path, _ = _native_paths()
+    pid_path, _, _ = _native_paths()
     if not pid_path.is_file():
         return None
     try:
@@ -92,15 +92,39 @@ def _read_pid_file() -> int | None:
 
 
 def _write_pid_file(pid: int) -> None:
-    pid_path, _ = _native_paths()
+    pid_path, _, _ = _native_paths()
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(pid), encoding="utf-8")
 
 
 def _remove_pid_file() -> None:
-    pid_path, _ = _native_paths()
+    pid_path, _, _ = _native_paths()
     try:
         pid_path.unlink()
+    except OSError:
+        pass
+
+
+def _setup_stdin_fifo() -> int | None:
+    """Создать stdin-FIFO и вернуть открытый fd (O_RDWR), или None при ошибке."""
+    if sys.platform == "win32":
+        return None
+    _, _, fifo_path = _native_paths()
+    try:
+        if fifo_path.exists():
+            fifo_path.unlink()
+        fifo_path.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(fifo_path, 0o600)  # noqa: S103
+        # O_RDWR: read-end для stdin процесса + write-end остаётся открытым (нет EOF пока fifo_fd жив)
+        return os.open(str(fifo_path), os.O_RDWR)
+    except OSError:
+        return None
+
+
+def _remove_stdin_fifo() -> None:
+    _, _, fifo_path = _native_paths()
+    try:
+        fifo_path.unlink()
     except OSError:
         pass
 
@@ -191,12 +215,16 @@ def native_up(
         _remove_pid_file()
 
     py_exe = resolve_core_python(console, src.path, use_hc_python=use_hc_python)
-    _, log_path = _native_paths()
+    _, log_path, _ = _native_paths()
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     if foreground:
         _native_up_foreground(console, src, py_exe=py_exe, main_py=main_py, env_path=env_path)
         return
+
+    # stdin: FIFO для поддержки `hc core attach` (только Unix)
+    stdin_fd = _setup_stdin_fifo()
+    stdin_arg: int = stdin_fd if stdin_fd is not None else subprocess.DEVNULL  # type: ignore[assignment]
 
     log_f: IO[bytes] = open(log_path, "ab", buffering=0)  # noqa: SIM115
     try:
@@ -213,13 +241,16 @@ def native_up(
             proc = subprocess.Popen(  # noqa: S603
                 [py_exe, str(main_py)],
                 cwd=str(src.path),
-                stdin=subprocess.DEVNULL,
+                stdin=stdin_arg,
                 stdout=log_f,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
     except OSError as e:
         log_f.close()
+        if stdin_fd is not None:
+            os.close(stdin_fd)
+            _remove_stdin_fifo()
         console.print(f"[red]Ошибка: не удалось запустить процесс: {e}[/red]")
         raise typer.Exit(code=1) from e
     finally:
@@ -227,6 +258,13 @@ def native_up(
             log_f.close()
         except OSError:
             pass
+        # Закрываем свою копию fd — в ребёнке fd уже унаследован.
+        # Write-end остаётся доступным через FIFO-файл для `attach`.
+        if stdin_fd is not None:
+            try:
+                os.close(stdin_fd)
+            except OSError:
+                pass
 
     _write_pid_file(proc.pid)
     port, display_host = api_listen_display(env_path)
@@ -346,6 +384,7 @@ def native_down(console: Console, *, volumes: bool) -> None:
         console.print("[red]Ошибка: не удалось остановить процесс.[/red]")
         raise typer.Exit(code=1)
     _remove_pid_file()
+    _remove_stdin_fifo()
     console.print("[green]✓[/green] Нативный Core остановлен.")
 
 
@@ -414,7 +453,7 @@ def native_ps(console: Console, src: CoreSource) -> None:
 
 
 def native_logs(console: Console, *, follow: bool, tail: int) -> None:
-    _, log_path = _native_paths()
+    _, log_path, _ = _native_paths()
     if not log_path.is_file():
         console.print(
             f"[red]Ошибка: лог не найден ({log_path}).[/red] "
@@ -469,6 +508,77 @@ _SIGNAL_ALIASES: dict[str, int] = {
     "term":    signal.SIGTERM.value,
     "int":     signal.SIGINT.value,
 }
+
+
+def native_attach(console: Console, *, tail: int) -> None:
+    """Подключиться к stdout/stderr уже запущенного native Core.
+
+    Показывает последние `tail` строк лога и следит за новыми в реальном времени.
+    Если stdin-FIFO существует (Core запущен через `hc core up --mode native`),
+    переключает терминал в raw-режим и пробрасывает нажатия клавиш в процесс.
+    Ctrl+C / Ctrl+D — отключиться (Core продолжает работать).
+    """
+    import threading
+
+    pid = _read_pid_file()
+    if pid is None:
+        console.print("[red]Ошибка: нативный Core не запущен (нет PID-файла).[/red]")
+        raise typer.Exit(code=1)
+    if not _pid_alive(pid):
+        console.print(f"[yellow]PID {pid} не существует — устаревший PID-файл.[/yellow]")
+        _remove_pid_file()
+        raise typer.Exit(code=1)
+
+    _, log_path, fifo_path = _native_paths()
+    if not log_path.is_file():
+        console.print(f"[red]Ошибка: лог не найден ({log_path}).[/red]")
+        raise typer.Exit(code=1)
+
+    has_fifo = fifo_path.is_file() and sys.platform != "win32"
+    if has_fifo:
+        console.print(
+            f"[dim]Attached to PID {pid}. "
+            "Ввод пробрасывается в процесс. Ctrl+C для detach.[/dim]\n"
+        )
+    else:
+        console.print(
+            f"[dim]Attached to PID {pid} (read-only). Ctrl+C для detach.[/dim]\n"
+        )
+
+    stop_event = threading.Event()
+
+    def _stdin_forwarder() -> None:
+        """Читать stdin и писать в FIFO."""
+        try:
+            fifo_fd = os.open(str(fifo_path), os.O_WRONLY)
+        except OSError:
+            return
+        try:
+            while not stop_event.is_set():
+                try:
+                    chunk = sys.stdin.buffer.read1(256)  # type: ignore[attr-defined]
+                    if not chunk:
+                        break
+                    os.write(fifo_fd, chunk)
+                except OSError:
+                    break
+        finally:
+            try:
+                os.close(fifo_fd)
+            except OSError:
+                pass
+
+    if has_fifo:
+        fwd = threading.Thread(target=_stdin_forwarder, daemon=True)
+        fwd.start()
+
+    try:
+        _tail_follow(console, log_path, tail_lines=tail)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        console.print("\n[dim]Detached. Core продолжает работать.[/dim]")
 
 
 def native_signal(console: Console, sig: str) -> None:

@@ -114,7 +114,9 @@ def _pick_services_interactive(
 
 
 
-def _pick_db_interactive(running: set[str], *, preferred_db: str | None = None) -> _DbOption:
+def _pick_db_interactive(
+    running: set[str], *, preferred_db: str | None = None, first_run: bool = False,
+) -> _DbOption:
     """Radio-button выбор бэкенда БД."""
     try:
         import questionary
@@ -127,6 +129,14 @@ def _pick_db_interactive(running: set[str], *, preferred_db: str | None = None) 
         )
 
     style = QStyle(list(QUESTIONARY_STYLE_KWARGS.items()))
+
+    if first_run:
+        Console().print(
+            "[dim]Первый запуск: выбор ниже настроит ВЕСЬ стек хранения (core + vault) — "
+            "PostgreSQL значит обе части на Postgres (схемы public/vault), "
+            "SQLite значит обе на SQLite. Сменить backend позже можно через "
+            "`hc env vault-migrate`.[/dim]"
+        )
 
     choices = []
     for opt in _DB_OPTIONS:
@@ -216,6 +226,7 @@ def _resolve_db(
     needs_db: bool,
     running: set[str],
     console: Console,
+    first_run: bool = False,
 ) -> _DbOption:
     """Resolve DB option: flag → interactive → default sqlite."""
     if db_flag:
@@ -229,13 +240,30 @@ def _resolve_db(
     if needs_db and sys.stdin.isatty():
         last = load_last_env()
         preferred_db = last.db if last and last.mode == mode else None
-        return _pick_db_interactive(running, preferred_db=preferred_db)
+        return _pick_db_interactive(running, preferred_db=preferred_db, first_run=first_run)
 
     last = load_last_env()
     if needs_db and last and last.mode == mode and last.db in _DB_KEY_MAP:
         return _DB_KEY_MAP[last.db]
     return _DB_KEY_MAP["sqlite"]
 
+
+
+def _read_dotenv_value(env_path: Path, key: str, default: str) -> str:
+    """Прочитать одно значение из .env без полного парсинга (best-effort)."""
+    if not env_path.exists():
+        return default
+    try:
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k, _, v = s.partition("=")
+            if k.strip() == key:
+                return v.strip()
+    except OSError:
+        pass
+    return default
 
 
 def _resolve_mode(mode: str | None, profile: str | None) -> str:
@@ -254,6 +282,7 @@ def _resolve_env_up_plan(
     profile: str | None,
     db: str | None,
     src: CoreSource,
+    first_run: bool = False,
 ) -> EnvUpPlan:
     project = compose_project_from_source(console, src, mode=mode)
     running = _get_running_services(project.compose_file, project.cwd)
@@ -270,6 +299,7 @@ def _resolve_env_up_plan(
         needs_db=needs_db,
         running=running,
         console=console,
+        first_run=first_run,
     )
 
     if needs_db and db_option.service:
@@ -277,6 +307,22 @@ def _resolve_env_up_plan(
             compose_profiles.append(db_option.compose_profile)
         if db_option.service not in service_names:
             service_names.append(db_option.service)
+
+    # Guard: если .env настроен на vault через postgres, контейнер postgres
+    # обязателен независимо от выбора --db / radio выше — иначе core-runtime
+    # не сможет подключиться к своему vault-backend.
+    if needs_db:
+        vault_type = _read_dotenv_value(src.path / ".env", "RUNTIME_VAULT_STORAGE_TYPE", "sqlite")
+        if vault_type.strip().lower() == "postgresql" and "postgres" not in service_names:
+            pg_opt = _DB_KEY_MAP["postgres"]
+            if pg_opt.compose_profile and pg_opt.compose_profile not in compose_profiles:
+                compose_profiles.append(pg_opt.compose_profile)
+            if pg_opt.service:
+                service_names.append(pg_opt.service)
+            console.print(
+                "[dim]→ .env: RUNTIME_VAULT_STORAGE_TYPE=postgresql — добавляю контейнер postgres "
+                "(нужен vault-backend'у)[/dim]"
+            )
 
     return EnvUpPlan(
         mode=mode,

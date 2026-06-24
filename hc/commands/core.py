@@ -24,7 +24,7 @@ from hc.core_ops import (
 )
 from hc.env_bootstrap import core_env_path, ensure_core_env
 from hc.hints import CORE_DOTENV_HELP, ENV_VS_CORE_DOTENV
-from hc.native_core import native_down, native_logs, native_ps, native_signal, native_up
+from hc.native_core import native_attach, native_down, native_logs, native_ps, native_signal, native_up
 
 def register(app: typer.Typer) -> None:
     core_app = typer.Typer(
@@ -221,6 +221,21 @@ def register(app: typer.Typer) -> None:
         console.print("[dim]Запускаю CoreRuntime…[/dim]")
         core_up(console, project, no_ui=no_ui)
         console.print("[green]✓[/green] CoreRuntime перезапущен.")
+
+    @core_app.command("attach")
+    def attach(
+        tail: int = typer.Option(40, "--tail", "-n", help="Строк лога показать перед follow"),
+    ) -> None:
+        """Подключиться к stdout/stderr уже запущенного native Core.
+
+        Показывает последние N строк лога и следит за новыми в реальном времени.
+        Если Core запущен с stdin-FIFO, ввод с клавиатуры пробрасывается в процесс.
+        Ctrl+C — отключиться (Core продолжает работать).
+
+        Только для --mode native.
+        """
+        console = Console()
+        native_attach(console, tail=tail)
 
     @core_app.command("signal")
     def sig(

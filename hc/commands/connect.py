@@ -48,6 +48,14 @@ def connect_and_save(host: str, port: int, token: str, auth: str = "auto") -> di
     cfg.core.token = token
     cfg.core.auth = auth
     cfg.save()
+
+    # Обновить кеш CLI-команд плагинов
+    try:
+        from hc.plugin_cli_loader import refresh_cache
+        refresh_cache(client)
+    except Exception:
+        pass
+
     return health
 
 

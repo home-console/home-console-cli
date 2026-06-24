@@ -22,6 +22,9 @@ AUTH_USERS_NS = "auth_users"
 AUTH_SESSIONS_NS = "auth_sessions"
 AUTH_API_KEYS_NS = "auth_api_keys"
 
+MARKETPLACE_NS = "marketplace"
+MARKETPLACE_INSTALLED_KEY = "installed"
+
 
 def resolve_db_path(core_root: Path) -> Path:
     """Найти файл БД: RUNTIME_DB_PATH из .env или дефолт data/runtime.db."""
@@ -164,6 +167,84 @@ def reset_password(db_path: Path, user_id: str, new_password: str) -> None:
         data["emergency_reset_at"] = time.time()
 
         _set(conn, AUTH_USERS_NS, user_id, data)
+
+
+def list_marketplace_plugins(db_path: Path) -> dict[str, Any]:
+    """Вернуть словарь установленных плагинов из marketplace storage.
+
+    Ключ — имя плагина, значение — dict с полями name, version, enabled, …
+    Пробует оба формата хранилища:
+      - namespace='marketplace', key='installed'  (новый формат)
+      - namespace='marketplace.installed', key=<plugin_name>  (legacy)
+    """
+    with _connect(db_path, readonly=True) as conn:
+        data = _get(conn, MARKETPLACE_NS, MARKETPLACE_INSTALLED_KEY)
+        if isinstance(data, dict) and data:
+            return data
+        # Legacy: все строки namespace='marketplace.installed'
+        rows = conn.execute(
+            "SELECT key, value FROM storage WHERE namespace=?",
+            (f"{MARKETPLACE_NS}.{MARKETPLACE_INSTALLED_KEY}",),
+        ).fetchall()
+        if rows:
+            result: dict[str, Any] = {}
+            for row in rows:
+                try:
+                    result[row["key"]] = json.loads(row["value"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return result
+        return {}
+
+
+def disable_plugin(db_path: Path, plugin_name: str) -> None:
+    """Пометить плагин как disabled в marketplace storage (emergency, без API).
+
+    После этого при следующем запуске Core не загрузит плагин.
+    """
+    with _connect(db_path) as conn:
+        # Новый формат: одна строка namespace='marketplace', key='installed'
+        data = _get(conn, MARKETPLACE_NS, MARKETPLACE_INSTALLED_KEY)
+        if isinstance(data, dict) and data:
+            if plugin_name not in data:
+                raise ValueError(
+                    f"Плагин {plugin_name!r} не найден. "
+                    f"Установленные: {', '.join(sorted(data)) or '(нет)'}"
+                )
+            data[plugin_name]["enabled"] = False
+            data[plugin_name]["disabled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            data[plugin_name]["emergency_disabled"] = True
+            _set(conn, MARKETPLACE_NS, MARKETPLACE_INSTALLED_KEY, data)
+            return
+
+        # Legacy: отдельная строка на плагин
+        legacy_ns = f"{MARKETPLACE_NS}.{MARKETPLACE_INSTALLED_KEY}"
+        plugin_data = _get(conn, legacy_ns, plugin_name)
+        if plugin_data is None:
+            raise ValueError(
+                f"Плагин {plugin_name!r} не найден ни в новом, ни в legacy формате хранилища."
+            )
+        if not isinstance(plugin_data, dict):
+            raise ValueError(f"Повреждённые данные плагина {plugin_name!r}.")
+        plugin_data["enabled"] = False
+        plugin_data["disabled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        plugin_data["emergency_disabled"] = True
+        _set(conn, legacy_ns, plugin_name, plugin_data)
+
+
+def unlock_db(db_path: Path) -> dict[str, bool]:
+    """Удалить WAL/SHM файлы SQLite (только когда Core остановлен!).
+
+    Нужно когда процесс завис и оставил БД в locked/WAL-режиме.
+    Возвращает dict с именами удалённых файлов.
+    """
+    removed: dict[str, bool] = {}
+    for suffix in ("-wal", "-shm"):
+        extra = Path(str(db_path) + suffix)
+        if extra.exists():
+            extra.unlink()
+            removed[extra.name] = True
+    return removed
 
 
 def revoke_all_user_sessions(db_path: Path, user_id: str) -> int:

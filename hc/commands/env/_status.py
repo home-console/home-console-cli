@@ -12,6 +12,10 @@ from hc.commands.env._catalog import (
     EnvUpPlan, _DbOption, _STATE_COLOR, KNOWN_ENDPOINTS,
 )
 from hc.commands.env import _compose
+from hc.commands.env._diagnostics import (
+    detect_compose_stack_split_for_project,
+    _warn_compose_stack_split,
+)
 from hc.env_state import load_last_env
 from hc.hints import ENV_VS_CORE_DOTENV
 from hc.json_output import print_json
@@ -114,6 +118,11 @@ def _print_env_status_dashboard(console: Console, project: "ComposeProject") -> 
                 f"[cyan]hc env logs {svc} --tail 200[/cyan]"
             )
         console.print("[dim]Полная диагностика:[/dim] [cyan]hc doctor[/cyan]")
+
+    project_name = _compose.compose_project_name_from_compose(project)
+    split_issue = detect_compose_stack_split_for_project(project_name)
+    if split_issue:
+        _warn_compose_stack_split(console, split_issue)
 
     console.print(f"\n[dim]compose:[/dim] {project.compose_file}")
 

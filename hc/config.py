@@ -87,12 +87,19 @@ class DeployConfig:
 
 
 @dataclass(slots=True)
+class PluginsConfig:
+    """URL адреса standalone-плагинов (не проксируемых через Core)."""
+    client_manager_url: str = "http://localhost:41200"
+
+
+@dataclass(slots=True)
 class Config:
     core: CoreConfig = field(default_factory=CoreConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     deploy: DeployConfig = field(default_factory=DeployConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
+    plugins: PluginsConfig = field(default_factory=PluginsConfig)
 
     @classmethod
     def load(cls) -> Self:

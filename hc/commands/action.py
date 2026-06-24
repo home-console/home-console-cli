@@ -10,47 +10,47 @@ from rich.pretty import Pretty
 
 from hc.commands._client_helpers import require_client
 
-skill_app = typer.Typer(
-    help="Platform skills registry (plugin.json skills)",
+action_app = typer.Typer(
+    help="Platform actions registry (plugin.json actions)",
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 
 
 def register(app: typer.Typer) -> None:
-    app.add_typer(skill_app, name="skill")
+    app.add_typer(action_app, name="action")
 
 
-@skill_app.command("list")
-def list_skills(
+@action_app.command("list")
+def list_actions(
     plugin: Optional[str] = typer.Option(None, "--plugin", help="Filter by plugin name"),
 ) -> None:
     console = Console()
     client = require_client(console)
-    data = anyio.run(client.list_skills, plugin)
+    data = anyio.run(client.list_actions, plugin)
     if not data:
         raise typer.Exit(code=1)
     payload = data.get("result") if isinstance(data.get("result"), dict) else data
     items = payload.get("items") if isinstance(payload, dict) else None
     if not isinstance(items, list):
-        console.print("[red]Ошибка:[/red] не удалось получить список skills.")
+        console.print("[red]Ошибка:[/red] не удалось получить список actions.")
         raise typer.Exit(code=1)
     console.print(Pretty(items))
 
 
-@skill_app.command("get")
-def get_skill(skill_id: str) -> None:
+@action_app.command("get")
+def get_action(action_id: str) -> None:
     console = Console()
     client = require_client(console)
-    data = anyio.run(client.get_skill, skill_id)
+    data = anyio.run(client.get_action, action_id)
     if not data:
         raise typer.Exit(code=1)
     payload = data.get("result") if isinstance(data.get("result"), dict) else data
     console.print(Pretty(payload))
 
 
-@skill_app.command("invoke")
-def invoke_skill(
-    skill_id: str,
+@action_app.command("invoke")
+def invoke_action(
+    action_id: str,
     json_params: str = typer.Option("{}", "--json-params", help="JSON object of invoke params"),
 ) -> None:
     console = Console()
@@ -63,7 +63,7 @@ def invoke_skill(
     if not isinstance(params, dict):
         console.print("[red]Ошибка:[/red] --json-params должен быть JSON-объектом")
         raise typer.Exit(code=2)
-    data = anyio.run(client.invoke_skill, skill_id, params)
+    data = anyio.run(client.invoke_action, action_id, params)
     if not data:
         raise typer.Exit(code=1)
     payload = data.get("result") if isinstance(data.get("result"), dict) else data

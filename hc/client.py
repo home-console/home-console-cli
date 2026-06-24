@@ -492,23 +492,23 @@ class HCClient:
         )
         return data if isinstance(data, dict) else None
 
-    async def list_skills(self, plugin: str | None = None) -> dict[str, Any] | None:
+    async def list_actions(self, plugin: str | None = None) -> dict[str, Any] | None:
         params = {"plugin": plugin} if plugin else None
         data = await self._request_json_absolute(
-            "GET", endpoints.SKILLS_LIST, params=params
+            "GET", endpoints.ACTIONS_LIST, params=params
         )
         return data if isinstance(data, dict) else None
 
-    async def get_skill(self, skill_id: str) -> dict[str, Any] | None:
+    async def get_action(self, action_id: str) -> dict[str, Any] | None:
         data = await self._request_json_absolute(
-            "GET", endpoints.SKILLS_GET.format(skill_id=skill_id)
+            "GET", endpoints.ACTIONS_GET.format(action_id=action_id)
         )
         return data if isinstance(data, dict) else None
 
-    async def invoke_skill(self, skill_id: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    async def invoke_action(self, action_id: str, params: dict[str, Any]) -> dict[str, Any] | None:
         data = await self._request_json_absolute(
             "POST",
-            endpoints.SKILLS_INVOKE.format(skill_id=skill_id),
+            endpoints.ACTIONS_INVOKE.format(action_id=action_id),
             json={"params": params},
         )
         return data if isinstance(data, dict) else None

@@ -21,13 +21,16 @@ from hc.core_source import (
     resolve_workspace_root,
 )
 from hc.emergency_db import (
+    disable_plugin,
     inspect_storage,
     list_api_keys,
+    list_marketplace_plugins,
     list_sessions,
     list_users,
     reset_password,
     resolve_db_path,
     revoke_all_user_sessions,
+    unlock_db,
 )
 
 
@@ -295,5 +298,133 @@ def register(app: typer.Typer) -> None:
             console.print(f"[green]✓[/green] Удалено сессий: {removed}.")
         else:
             console.print(f"[yellow]Активных сессий для {user_id!r} не найдено.[/yellow]")
+
+    @emergency_app.command("disable-plugin")
+    def cmd_disable_plugin(
+        plugin_name: str = typer.Argument(..., help="Имя плагина (напр. yandex_smart_home)"),
+        core_path: Path | None = core_path_opt,
+        yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение"),
+    ) -> None:
+        """Пометить плагин disabled в БД (без API, когда Core остановлен).
+
+        После следующего запуска Core не загрузит этот плагин.
+        Используй когда плагин роняет Core при старте и нормальный disable недоступен.
+        """
+        console = Console()
+        _, db_path = _get_db(console, core_path)
+
+        # Показываем что найдено
+        try:
+            installed = list_marketplace_plugins(db_path)
+        except FileNotFoundError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(code=1)
+
+        if not installed:
+            console.print("[yellow]Нет установленных плагинов в marketplace storage.[/yellow]")
+            raise typer.Exit(code=1)
+
+        if plugin_name not in installed:
+            table = Table(title="Установленные плагины")
+            table.add_column("Имя", style="bold")
+            table.add_column("Версия")
+            table.add_column("Enabled")
+            for name, info in sorted(installed.items()):
+                enabled = info.get("enabled", True)
+                table.add_row(
+                    name,
+                    str(info.get("version", "?")),
+                    "[green]yes[/green]" if enabled else "[red]no[/red]",
+                )
+            console.print(table)
+            console.print(f"[red]Плагин {plugin_name!r} не найден.[/red]")
+            raise typer.Exit(code=1)
+
+        info = installed[plugin_name]
+        if not info.get("enabled", True):
+            console.print(f"[yellow]Плагин {plugin_name!r} уже отключён.[/yellow]")
+            raise typer.Exit(code=0)
+
+        console.print(
+            Panel(
+                f"[bold]Плагин:[/bold] {plugin_name}\n"
+                f"[bold]Версия:[/bold] {info.get('version', '?')}\n"
+                f"[bold]БД:[/bold] {db_path}",
+                title="[yellow]Emergency disable плагина[/yellow]",
+                expand=False,
+            )
+        )
+
+        if not yes:
+            confirmed = typer.confirm(
+                f"Отключить {plugin_name!r}? Core должен быть ОСТАНОВЛЕН.",
+                default=False,
+            )
+            if not confirmed:
+                console.print("[dim]Отменено.[/dim]")
+                raise typer.Exit(code=0)
+
+        try:
+            disable_plugin(db_path, plugin_name)
+        except (ValueError, FileNotFoundError) as e:
+            console.print(f"[red]Ошибка: {e}[/red]")
+            raise typer.Exit(code=1)
+
+        console.print(f"[green]✓[/green] Плагин [bold]{plugin_name}[/bold] отмечен как disabled в БД.")
+        console.print("[dim]Запусти Core (`hc core up`) — плагин не будет загружен.[/dim]")
+
+    @emergency_app.command("unlock-db")
+    def cmd_unlock_db(
+        core_path: Path | None = core_path_opt,
+        yes: bool = typer.Option(False, "--yes", "-y", help="Не спрашивать подтверждение"),
+    ) -> None:
+        """Снять WAL/SHM lock с SQLite БД (только когда Core ОСТАНОВЛЕН).
+
+        Нужно когда Core завис и оставил БД заблокированной.
+        Удаляет файлы -wal и -shm рядом с runtime.db.
+
+        Примеры:
+          hc emergency unlock-db
+          hc emergency unlock-db --core-path /path/to/core-runtime-service
+        """
+        console = Console()
+        _, db_path = _get_db(console, core_path)
+
+        if not db_path.is_file():
+            console.print(f"[red]БД не найдена: {db_path}[/red]")
+            raise typer.Exit(code=1)
+
+        wal = Path(str(db_path) + "-wal")
+        shm = Path(str(db_path) + "-shm")
+        targets = [f for f in [wal, shm] if f.exists()]
+
+        if not targets:
+            console.print("[green]✓[/green] WAL/SHM файлы отсутствуют — БД не заблокирована.")
+            raise typer.Exit(code=0)
+
+        console.print(Panel(
+            "\n".join(f"  {f.name}  ({f.stat().st_size} bytes)" for f in targets) + f"\n\n[bold]БД:[/bold] {db_path}",
+            title="[yellow]Файлы к удалению[/yellow]",
+            expand=False,
+        ))
+
+        if not yes:
+            confirmed = typer.confirm(
+                "Удалить WAL/SHM файлы? Core должен быть ОСТАНОВЛЕН!",
+                default=False,
+            )
+            if not confirmed:
+                console.print("[dim]Отменено.[/dim]")
+                raise typer.Exit(code=0)
+
+        try:
+            removed = unlock_db(db_path)
+        except OSError as e:
+            console.print(f"[red]Ошибка удаления: {e}[/red]")
+            raise typer.Exit(code=1)
+
+        for name in removed:
+            console.print(f"[green]✓[/green] Удалён: {name}")
+        console.print("[dim]БД разблокирована. Можно запускать Core.[/dim]")
 
     app.add_typer(emergency_app, name="emergency")

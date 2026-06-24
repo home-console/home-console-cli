@@ -81,27 +81,29 @@ class _DbOption:
     compose_profile: str | None = None  # docker compose --profile flag for that service
 
 
+# NOTE: эта опция управляет ТОЛЬКО тем, поднимается ли контейнер postgres.
+# Она НЕ переключает RUNTIME_VAULT_STORAGE_TYPE / какой backend использует vault —
+# это делает `hc env vault-migrate --to sqlite|postgres` (меняет .env осознанно,
+# с переносом данных). Если .env уже настроен на postgres-vault, контейнер
+# postgres будет добавлен автоматически независимо от выбора здесь
+# (см. _resolve_env_up_plan).
 _DB_OPTIONS: list[_DbOption] = [
     _DbOption(
         key="sqlite",
-        label="SQLite      (файлы /data/*.db, встроенная, без контейнера)",
-        env={"RUNTIME_VAULT_STORAGE_TYPE": "sqlite"},
+        label="SQLite      (без доп. контейнера; vault-backend берётся из .env)",
     ),
     _DbOption(
         key="postgres",
-        label="PostgreSQL  (контейнер postgres, dev порт :15432)",
-        env={
-            "RUNTIME_VAULT_STORAGE_TYPE": "postgresql",
-            # sslmode=disable: skip SSL negotiation for local dev container
-            "RUNTIME_VAULT_PG_DSN": (
-                "postgresql://homeconsole:homeconsole@postgres:5432/homeconsole"
-                "?sslmode=disable"
-            ),
-        },
+        label="PostgreSQL  (контейнер postgres, dev порт :15432; нужен для vault-migrate --to postgres)",
         service="postgres",
         compose_profile="postgres",
     ),
 ]
+
+# Vault DSN по умолчанию: отдельная роль/схема `vault` (search_path=vault),
+# физически изолирована от основной схемы `public`.
+# См. deploy/dev/postgres-initdb/01-init-vault.sh
+VAULT_PG_DSN_DEFAULT = "postgresql://vault:vault@postgres:5432/homeconsole?sslmode=disable"
 
 _DB_KEY_MAP: dict[str, _DbOption] = {o.key: o for o in _DB_OPTIONS}
 
@@ -152,7 +154,7 @@ _FRONTEND_VITE_OVERRIDE = "frontend-vite.hc.yml"
 # Re-export from constants for backward compat
 __all__ = [
     "_Svc", "_SERVICES", "_PROFILE_DEFAULT_MODE", "_PROFILES",
-    "_DbOption", "_DB_OPTIONS", "_DB_KEY_MAP", "EnvUpPlan",
+    "_DbOption", "_DB_OPTIONS", "_DB_KEY_MAP", "EnvUpPlan", "VAULT_PG_DSN_DEFAULT",
     "_MODE_DEFAULT", "_MODE_HELP", "_PROFILE_HELP", "_DB_HELP",
     "_STATE_COLOR", "_REBUILD_HINT_RE", "_MIGRATION_HINT_RE",
     "KNOWN_ENDPOINTS",
